@@ -1,0 +1,487 @@
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+enum UserRole {
+  ADMIN
+  MANAGER
+  EMPLOYEE
+  GAMER
+}
+
+enum AccountStatus {
+  ACTIVE
+  SUSPENDED
+  INACTIVE
+  DELETED
+}
+
+enum EmploymentStatus {
+  ACTIVE
+  INACTIVE
+  ON_LEAVE
+  TERMINATED
+}
+
+enum MachineEnrollmentStatus {
+  PENDING
+  ENROLLED
+  INACTIVE
+  DEACTIVATED
+}
+
+enum TransactionType {
+  PAYMENT
+  REFUND
+  ADJUSTMENT
+  CREDIT
+  DEBIT
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  CANCELLED
+  REFUNDED
+}
+
+enum ReservationStatus {
+  PENDING
+  CONFIRMED
+  ACTIVE
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+enum SessionStatus {
+  PENDING
+  ACTIVE
+  PAUSED
+  COMPLETED
+  CANCELLED
+}
+
+enum MembershipStatus {
+  ACTIVE
+  EXPIRED
+  CANCELLED
+  SUSPENDED
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  EXPIRED
+  CANCELLED
+  SUSPENDED
+  PENDING
+}
+
+enum TelemetryAlertType {
+  CPU_USAGE
+  MEMORY_USAGE
+  DISK_SPACE
+  NETWORK_ERROR
+  HARDWARE_FAILURE
+  TEMPERATURE_WARNING
+  CONNECTION_LOST
+}
+
+enum AlertSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum AuditAction {
+  CREATE
+  READ
+  UPDATE
+  DELETE
+  LOGIN
+  LOGOUT
+  AUTHENTICATE
+}
+
+// ============================================================================
+// DATASOURCE & GENERATOR
+// ============================================================================
+
+datasource db {
+  provider = "postgresql"
+  //url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ============================================================================
+// MODELS
+// ============================================================================
+
+// --- Branch & Location ---
+
+model Branch {
+  id       String @id @default(uuid()) @db.Uuid
+  name     String
+  location String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  pricing           Pricing[]
+  employeeProfiles  EmployeeProfile[]
+  machines          Machine[]
+
+  @@index([name])
+  @@map("branches")
+}
+
+model Pricing {
+  id           String  @id @default(uuid()) @db.Uuid
+  branchId     String  @map("branch_id") @db.Uuid
+  paygRate     Decimal @map("payg_rate") @db.Decimal(10, 2)
+  bookingRate  Decimal @map("booking_rate") @db.Decimal(10, 2)
+  currency     String  @default("USD")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@index([branchId])
+  @@map("pricing")
+}
+
+// --- User Management ---
+
+model User {
+  id            String         @id @default(uuid()) @db.Uuid
+  username      String         @unique
+  role          UserRole       @default(GAMER)
+  accountStatus AccountStatus  @default(ACTIVE) @map("account_status")
+  createdAt     DateTime       @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime       @updatedAt @map("updated_at") @db.Timestamptz
+
+  employeeProfile    EmployeeProfile?
+  gamerProfile       GamerProfile?
+  auditLogs          AuditLog[]
+  acknowledgedAlerts TelemetryAlert[]
+
+  @@index([username])
+  @@index([role])
+  @@index([accountStatus])
+  @@map("users")
+}
+
+model EmployeeProfile {
+  id               String           @id @default(uuid()) @db.Uuid
+  userId           String           @unique @map("user_id") @db.Uuid
+  managedBranchId  String?          @map("managed_branch_id") @db.Uuid
+  employmentStatus EmploymentStatus @default(ACTIVE) @map("employment_status")
+  hireDate         DateTime         @map("hire_date") @db.Date
+  createdAt        DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime         @updatedAt @map("updated_at") @db.Timestamptz
+
+  user          User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  managedBranch Branch?       @relation(fields: [managedBranchId], references: [id], onDelete: SetNull)
+  transactions  Transaction[]
+
+  @@index([userId])
+  @@index([managedBranchId])
+  @@index([employmentStatus])
+  @@map("employee_profiles")
+}
+
+model GamerProfile {
+  id     String @id @default(uuid()) @db.Uuid
+  userId String @unique @map("user_id") @db.Uuid
+  xp     Int    @default(0) 
+  level  Int    @default(1) 
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  wallet        Wallet?
+  reservations  Reservation[]
+  memberships   Membership[]
+  subscriptions Subscription[]
+
+  @@index([userId])
+  @@map("gamer_profiles")
+}
+
+// --- Wallet & Transactions ---
+
+model Wallet {
+  id             String  @id @default(uuid()) @db.Uuid
+  gamerProfileId String  @unique @map("gamer_profile_id") @db.Uuid
+  balance        Decimal @default(0) @db.Decimal(10, 2)
+  currency       String  @default("USD")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  gamerProfile GamerProfile  @relation(fields: [gamerProfileId], references: [id], onDelete: Cascade)
+  transactions Transaction[]
+
+  @@index([gamerProfileId])
+  @@map("wallets")
+}
+
+model Transaction {
+  id                String            @id @default(uuid()) @db.Uuid
+  walletId          String            @map("wallet_id") @db.Uuid
+  sessionId         String?           @map("session_id") @db.Uuid
+  employeeProfileId String?           @map("employee_profile_id") @db.Uuid
+  amount            Decimal           @db.Decimal(10, 2)
+  type              TransactionType   @default(PAYMENT)
+  status            TransactionStatus @default(PENDING)
+  createdAt         DateTime          @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt         DateTime          @updatedAt @map("updated_at") @db.Timestamptz
+
+  wallet          Wallet            @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  session         Session?          @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  employeeProfile EmployeeProfile?  @relation(fields: [employeeProfileId], references: [id], onDelete: SetNull)
+
+  @@index([walletId])
+  @@index([sessionId])
+  @@index([employeeProfileId])
+  @@index([type])
+  @@index([status])
+  @@index([createdAt])
+  @@map("transactions")
+}
+
+// --- Machines & Games ---
+
+model Machine {
+  id               String                  @id @default(uuid()) @db.Uuid
+  serialNumber     String                  @unique @map("serial_number")
+  branchId         String                  @map("branch_id") @db.Uuid
+  agentPublicKey   String                  @map("agent_public_key")
+  enrollmentStatus MachineEnrollmentStatus @default(PENDING) @map("enrollment_status")
+  createdAt        DateTime                @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime                @updatedAt @map("updated_at") @db.Timestamptz
+
+  branch          Branch           @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  machineGames    MachineGame[]
+  nodeTelemetry   NodeTelemetry[]
+  telemetryAlerts TelemetryAlert[]
+  reservations    Reservation[]
+
+  @@index([branchId])
+  @@index([serialNumber])
+  @@index([enrollmentStatus])
+  @@map("machines")
+}
+
+model Game {
+  id             String @id @default(uuid()) @db.Uuid
+  title          String @unique
+  executablePath String @map("executable_path")
+  genre          String
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  machineGames MachineGame[]
+
+  @@index([title])
+  @@index([genre])
+  @@map("games")
+}
+
+model MachineGame {
+  machineId String  @map("machine_id") @db.Uuid
+  gameId    String  @map("game_id") @db.Uuid
+  installed Boolean @default(false)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  machine Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  game    Game    @relation(fields: [gameId], references: [id], onDelete: Cascade)
+
+  @@id([machineId, gameId])
+  @@index([machineId])
+  @@index([gameId])
+  @@map("machine_games")
+}
+
+// --- Telemetry ---
+
+model NodeTelemetry {
+  id        String   @id @default(uuid()) @db.Uuid
+  machineId String   @map("machine_id") @db.Uuid
+  metric    String
+  value     Decimal  @db.Decimal(15, 4)
+  sampledAt DateTime @map("sampled_at") @db.Timestamptz
+
+  machine Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
+
+  @@index([machineId])
+  @@index([metric])
+  @@index([sampledAt])
+  @@map("node_telemetry")
+}
+
+model TelemetryAlert {
+  id                   String          @id @default(uuid()) @db.Uuid
+  machineId            String          @map("machine_id") @db.Uuid
+  type                 TelemetryAlertType
+  severity             AlertSeverity
+  acknowledged         Boolean         @default(false)
+  acknowledgedByUserId String?         @map("acknowledged_by_user_id") @db.Uuid
+  createdAt            DateTime        @default(now()) @map("created_at") @db.Timestamptz
+  acknowledgedAt       DateTime?       @map("acknowledged_at") @db.Timestamptz
+
+  machine            Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  acknowledgedByUser User?   @relation(fields: [acknowledgedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([machineId])
+  @@index([type])
+  @@index([severity])
+  @@index([acknowledged])
+  @@index([createdAt])
+  @@map("telemetry_alerts")
+}
+
+// --- Reservations & Sessions ---
+
+model Reservation {
+  id             String           @id @default(uuid()) @db.Uuid
+  gamerProfileId String           @map("gamer_profile_id") @db.Uuid
+  machineId      String           @map("machine_id") @db.Uuid
+  startTime      DateTime         @map("start_time") @db.Timestamptz
+  endTime        DateTime         @map("end_time") @db.Timestamptz
+  status         ReservationStatus @default(PENDING)
+  createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime         @updatedAt @map("updated_at") @db.Timestamptz
+
+  gamerProfile GamerProfile @relation(fields: [gamerProfileId], references: [id], onDelete: Cascade)
+  machine      Machine      @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  sessions     Session[]
+
+  @@index([gamerProfileId])
+  @@index([machineId])
+  @@index([status])
+  @@index([startTime])
+  @@index([createdAt])
+  @@map("reservations")
+}
+
+model Session {
+  id                  String        @id @default(uuid()) @db.Uuid
+  reservationId       String        @map("reservation_id") @db.Uuid
+  appliedMembershipId String?       @map("applied_membership_id") @db.Uuid
+  startTime           DateTime      @map("start_time") @db.Timestamptz
+  endTime             DateTime      @map("end_time") @db.Timestamptz
+  status              SessionStatus @default(PENDING)
+  createdAt           DateTime      @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt           DateTime      @updatedAt @map("updated_at") @db.Timestamptz
+
+  reservation       Reservation  @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+  appliedMembership Membership?  @relation(fields: [appliedMembershipId], references: [id], onDelete: SetNull)
+  transactions      Transaction[]
+
+  @@index([reservationId])
+  @@index([appliedMembershipId])
+  @@index([status])
+  @@index([startTime])
+  @@map("sessions")
+}
+
+// --- Memberships & Plans ---
+
+model MembershipPlan {
+  id                 String  @id @default(uuid()) @db.Uuid
+  name               String  @unique
+  price              Decimal @db.Decimal(10, 2)
+  durationDays       Int     @map("duration_days")
+  discountPercent    Decimal @map("discount_percent") @db.Decimal(5, 2)
+  bookingAdvanceDays Int     @map("booking_advance_days") @default(7)
+  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt          DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  memberships Membership[]
+
+  @@index([name])
+  @@map("membership_plans")
+}
+
+model Membership {
+  id               String           @id @default(uuid()) @db.Uuid
+  gamerProfileId   String           @map("gamer_profile_id") @db.Uuid
+  membershipPlanId String           @map("membership_plan_id") @db.Uuid
+  startDate        DateTime         @map("start_date") @db.Date
+  endDate          DateTime         @map("end_date") @db.Date
+  status           MembershipStatus @default(ACTIVE)
+  createdAt        DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime         @updatedAt @map("updated_at") @db.Timestamptz
+
+  gamerProfile   GamerProfile   @relation(fields: [gamerProfileId], references: [id], onDelete: Cascade)
+  membershipPlan MembershipPlan @relation(fields: [membershipPlanId], references: [id], onDelete: Restrict)
+  sessions       Session[]
+
+  @@index([gamerProfileId])
+  @@index([membershipPlanId])
+  @@index([status])
+  @@index([startDate])
+  @@index([endDate])
+  @@map("memberships")
+}
+
+// --- Subscriptions & Plans ---
+
+model SubscriptionPlan {
+  id           String  @id @default(uuid()) @db.Uuid
+  name         String  @unique
+  price        Decimal @db.Decimal(10, 2)
+  durationDays Int     @map("duration_days")
+  benefits     Json    @default("{}")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  subscriptions Subscription[]
+
+  @@index([name])
+  @@map("subscription_plans")
+}
+
+model Subscription {
+  id                 String           @id @default(uuid()) @db.Uuid
+  gamerProfileId     String           @map("gamer_profile_id") @db.Uuid
+  subscriptionPlanId String           @map("subscription_plan_id") @db.Uuid
+  startDate          DateTime         @map("start_date") @db.Date
+  endDate            DateTime         @map("end_date") @db.Date
+  status             SubscriptionStatus @default(ACTIVE)
+  createdAt          DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt          DateTime         @updatedAt @map("updated_at") @db.Timestamptz
+
+  gamerProfile     GamerProfile     @relation(fields: [gamerProfileId], references: [id], onDelete: Cascade)
+  subscriptionPlan SubscriptionPlan @relation(fields: [subscriptionPlanId], references: [id], onDelete: Restrict)
+
+  @@index([gamerProfileId])
+  @@index([subscriptionPlanId])
+  @@index([status])
+  @@index([startDate])
+  @@index([endDate])
+  @@map("subscriptions")
+}
+
+// --- Audit & Logging ---
+
+model AuditLog {
+  id        String      @id @default(uuid()) @db.Uuid
+  userId    String      @map("user_id") @db.Uuid
+  action    AuditAction
+  target    String
+  metadata  Json?       @default("{}")
+  timestamp DateTime    @default(now()) @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([action])
+  @@index([target])
+  @@index([timestamp])
+  @@map("audit_logs")
+}
