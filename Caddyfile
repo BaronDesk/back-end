@@ -1,0 +1,24 @@
+{
+	log {
+		output stdout
+		format console
+	}
+}
+
+# Every name listed here goes into the SAN list of the cert Caddy's internal CA
+# issues. Agents pin that cert, so the name they dial has to be in this list —
+# add your LAN hostname or IP before enrollment, not after.
+https://localhost, https://cstam-server.local {
+	tls internal
+
+	# WebSocket upgrades (agent-gateway, dashboard-gateway) need no extra config:
+	# Caddy sees the Upgrade header and hijacks the connection itself.
+	reverse_proxy backend:3000 {
+		header_up X-Real-IP {remote_host}
+	}
+}
+
+# Plain HTTP exists only to bounce people to TLS.
+http://localhost, http://cstam-server.local {
+	redir https://{host}{uri} permanent
+}

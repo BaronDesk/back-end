@@ -1,0 +1,97 @@
+name: cstam-ninety-backend
+
+x-backend-build: &backend-build
+  build:
+    context: .
+    dockerfile: Dockerfile
+    target: runtime
+  image: cstam-backend:latest
+  env_file: .env
+  networks: [internal]
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [internal]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [internal]
+
+  # One-shot: applies Prisma migrations, then exits. `backend` waits for this
+  # to succeed rather than migrating on its own boot — matters the moment
+  # there's more than one backend replica, so it's worth doing this way now.
+  migrate:
+    <<: *backend-build
+    command: ["npx", "prisma", "migrate", "deploy"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  backend:
+    <<: *backend-build
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 20s  # giving BullMQ time to finish jobs
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    expose:
+      - "3000"
+
+  # Terminates TLS for both the REST API and the two WS upgrade paths
+  # (agent-gateway, dashboard-gateway) — they all sit behind the same
+  # NestJS HTTP server on :3000, so one proxy rule covers all three.
+  reverse-proxy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks: [internal]
+
+volumes:
+  pgdata:
+  redisdata:
+  caddy_data:
+  caddy_config:
+
+networks:
+  internal:
+    driver: bridge
