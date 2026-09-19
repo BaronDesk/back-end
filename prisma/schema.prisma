@@ -111,11 +111,11 @@ enum AuditAction {
 
 datasource db {
   provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 generator client {
   provider = "prisma-client-js"
-  output   = "../src/generated/prisma"
 }
 
 // ============================================================================
@@ -159,6 +159,7 @@ model Pricing {
 model User {
   id            String         @id @default(uuid()) @db.Uuid
   username      String         @unique
+  passwordHash  String         @map("password_hash")
   role          UserRole       @default(GAMER)
   accountStatus AccountStatus  @default(ACTIVE) @map("account_status")
   createdAt     DateTime       @default(now()) @map("created_at") @db.Timestamptz
@@ -168,11 +169,31 @@ model User {
   gamerProfile       GamerProfile?
   auditLogs          AuditLog[]
   acknowledgedAlerts TelemetryAlert[]
+  refreshTokens      RefreshToken[]
 
   @@index([username])
   @@index([role])
   @@index([accountStatus])
   @@map("users")
+}
+
+// Tracks issued refresh tokens by jti so /auth/logout and refresh-rotation
+// can revoke a specific session without invalidating every device (ADR-003).
+model RefreshToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  jti       String    @unique
+  userId    String    @map("user_id") @db.Uuid
+  revoked   Boolean   @default(false)
+  replacedByJti String? @map("replaced_by_jti")
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([jti])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
 }
 
 model EmployeeProfile {
@@ -197,8 +218,8 @@ model EmployeeProfile {
 model GamerProfile {
   id     String @id @default(uuid()) @db.Uuid
   userId String @unique @map("user_id") @db.Uuid
-  xp     Int    @default(0) 
-  level  Int    @default(1) 
+  xp     Int    @default(0)
+  level  Int    @default(1)
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
 

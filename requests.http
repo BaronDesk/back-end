@@ -1,0 +1,81 @@
+### Manual API walkthrough — works with the VS Code "REST Client" extension
+### (or JetBrains' built-in HTTP client). Start the server first: npm run dev
+###
+### Prereqs: DB migrated + seeded (npm run prisma:seed) -> admin / ChangeMe123!
+### For the /employees calls, put a REAL branch UUID from your DB in @branchId.
+
+@baseUrl = http://localhost:4000/api/v1
+@branchId = 00000000-0000-4000-8000-000000000000
+
+### 0. Health
+GET http://localhost:4000/health
+
+### 1. Login as the seeded ADMIN
+# @name adminLogin
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{ "username": "admin", "password": "ChangeMe123!" }
+
+###
+@adminToken = {{adminLogin.response.body.accessToken}}
+@adminRefresh = {{adminLogin.response.body.refreshToken}}
+
+### 2. Who am I?
+GET {{baseUrl}}/auth/me
+Authorization: Bearer {{adminToken}}
+
+### 3. Sign up a gamer (public)
+POST {{baseUrl}}/users
+Content-Type: application/json
+
+{ "username": "demo_gamer", "password": "Password123!" }
+
+### 4. Login as that gamer
+# @name gamerLogin
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{ "username": "demo_gamer", "password": "Password123!" }
+
+###
+@gamerToken = {{gamerLogin.response.body.accessToken}}
+@gamerId = {{gamerLogin.response.body.user.id}}
+
+### 5. Gamer reads own profile -> 200
+GET {{baseUrl}}/users/{{gamerId}}
+Authorization: Bearer {{gamerToken}}
+
+### 6. Gamer tries to create an employee -> 403 FORBIDDEN
+POST {{baseUrl}}/employees
+Authorization: Bearer {{gamerToken}}
+Content-Type: application/json
+
+{ "branchId": "{{branchId}}", "username": "demo_emp", "password": "Password123!", "role": "EMPLOYEE" }
+
+### 7. Admin creates a MANAGER -> 201
+POST {{baseUrl}}/employees
+Authorization: Bearer {{adminToken}}
+Content-Type: application/json
+
+{ "branchId": "{{branchId}}", "username": "demo_manager", "password": "Password123!", "role": "MANAGER" }
+
+### 8. Admin promotes the gamer -> 200
+PATCH {{baseUrl}}/users/{{gamerId}}/role
+Authorization: Bearer {{adminToken}}
+Content-Type: application/json
+
+{ "role": "EMPLOYEE" }
+
+### 9. Refresh (rotates the token; run it twice to see REFRESH_TOKEN_REVOKED)
+POST {{baseUrl}}/auth/refresh
+Content-Type: application/json
+
+{ "refreshToken": "{{adminRefresh}}" }
+
+### 10. Logout (revokes the refresh token) -> 204
+POST {{baseUrl}}/auth/logout
+Authorization: Bearer {{adminToken}}
+Content-Type: application/json
+
+{ "refreshToken": "{{adminRefresh}}" }

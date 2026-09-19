@@ -1,9 +1,2 @@
-node_modules/
-dist/
-coverage/
-src/generated/
-
+/node_modules
 .env
-*.local
-caddy-root.crt
-*.tsbuildinfo
