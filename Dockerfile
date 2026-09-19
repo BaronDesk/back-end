@@ -9,7 +9,7 @@ WORKDIR /app
 # ---- deps ----
 FROM base AS deps
 COPY package.json package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm npm ci --ignore-script
+RUN --mount=type=cache,target=/root/.npm npm ci --ignore-scripts
 
 # ---- dev ----
 FROM deps AS dev

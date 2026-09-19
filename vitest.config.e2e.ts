@@ -4,7 +4,7 @@ import swc from 'unplugin-swc';
 export default defineConfig({
   test: {
     root: './',
-    include: ['src/**/*.spec.ts'],
+    include: ['test/**/*.e2e-spec.ts'],
     environment: 'node',
     globals: true,
   },

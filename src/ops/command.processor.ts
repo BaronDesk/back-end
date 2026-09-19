@@ -17,8 +17,9 @@ export class CommandProcessor extends WorkerHost {
     // Stand-in for the agent-gateway round trip.
     await new Promise((r) => setTimeout(r, 200));
 
-    // Whatever you return here is stored as the job's returnvalue and is what
-    // job.waitUntilFinished() resolves to in a test.
+    if (job.data.type == 'fail')
+      throw new Error(`simulated failure ID: ${job.data.machineId}`);
+
     return { ackedAt: new Date().toISOString() };
   }
 

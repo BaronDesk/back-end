@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { INestApplication } from '@nestjs/common';
+import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
 import { getQueueToken } from '@nestjs/bullmq';
 import { Queue, QueueEvents } from 'bullmq';
 import { Redis } from 'ioredis';
@@ -8,7 +8,7 @@ import { AppModule } from '../src/app.module.js';
 import { COMMANDS_QUEUE } from '../src/ops/commands.constants.js';
 
 describe('agent-commands queue', () => {
-    let app: INestApplication;
+    let app: NestFastifyApplication;
     let queue: Queue;
     let events: QueueEvents;
 
@@ -17,8 +17,9 @@ describe('agent-commands queue', () => {
             imports: [AppModule],
         }).compile();
 
-        app = fixture.createNestApplication();
-        await app.init();                 // <- starts the worker
+        app = fixture.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+        await app.init();                 // start worker
+        await app.getHttpAdapter().getInstance().ready();
 
         queue = app.get<Queue>(getQueueToken(COMMANDS_QUEUE));
         await queue.obliterate({ force: true });   // clean slate
@@ -51,7 +52,7 @@ describe('agent-commands queue', () => {
     it('retries a failing job the configured number of times', async () => {
         const job = await queue.add(
             'command',
-            { machineId: 'boom', type: 'explode', payload: {} },
+            { machineId: 'killer', type: 'fail', payload: {} },
             { attempts: 2, backoff: { type: 'fixed', delay: 50 } },
         );
 

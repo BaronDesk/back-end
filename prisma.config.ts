@@ -8,8 +8,5 @@ export default defineConfig({
   },
   datasource: {
     url: env('DATABASE_URL'),
-  },
-  skills: {
-    agents: ['claude', 'cursor', 'agents', 'devin'],
-  },
+  }
 });

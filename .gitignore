@@ -6,3 +6,4 @@ src/generated/
 .env
 *.local
 caddy-root.crt
+*.tsbuildinfo
