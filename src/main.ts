@@ -1,5 +1,7 @@
+import 'reflect-metadata';
+
 import { NestFactory } from '@nestjs/core';
-import { ValidationPipe, Logger } from '@nestjs/common';
+import { Logger } from '@nestjs/common';
 import {
   FastifyAdapter,
   NestFastifyApplication,
@@ -15,12 +17,8 @@ async function bootstrap() {
     new FastifyAdapter({ trustProxy: true }),
   );
 
-  app.useGlobalPipes(
-    new ValidationPipe({ whitelist: true, transform: true }),
-  );
-
-  // Without this, SIGTERM kills the process before BullMQ drains and Prisma
-  // disconnects — you get stalled jobs on every `docker compose restart`.
+  // Without this, SIGTERM kills the process before Prisma disconnects
+  // cleanly on every `docker compose restart`.
   app.enableShutdownHooks();
 
   if (process.env.NODE_ENV !== 'production') {

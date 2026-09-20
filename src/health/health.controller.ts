@@ -1,19 +1,18 @@
-import { Controller, Get, Logger, ServiceUnavailableException } from '@nestjs/common';
-import { InjectQueue } from '@nestjs/bullmq';
-import { Queue } from 'bullmq';
+import { Controller, Get, ServiceUnavailableException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { Redis } from 'ioredis';
 
-import { PrismaService } from '../prisma/prisma.service.js';
-import { COMMANDS_QUEUE } from '../ops/commands.constants.js';
+import { Public } from '../common/decorators/public.decorator.js';
+import { PrismaService } from '../infra/prisma/prisma.service.js';
 
 @Controller('health')
 export class HealthController {
-  private readonly logger = new Logger(HealthController.name);
-
   constructor(
     private readonly prisma: PrismaService,
-    @InjectQueue(COMMANDS_QUEUE) private readonly queue: Queue,
+    private readonly config: ConfigService,
   ) {}
 
+  @Public()
   @Get()
   async check() {
     const [postgres, redis] = await Promise.all([
@@ -21,11 +20,7 @@ export class HealthController {
         .$queryRaw`SELECT 1`
         .then(() => 'up' as const)
         .catch((e: Error) => `down: ${e.message}`),
-      this.queue
-        .getBackend().client
-        .then((c: any) => c.ping())
-        .then(() => 'up' as const)
-        .catch((e: Error) => `down: ${e.message}`),
+      this.pingRedis(),
     ]);
 
     const body = {
@@ -36,5 +31,22 @@ export class HealthController {
 
     if (body.status !== 'ok') throw new ServiceUnavailableException(body);
     return body;
+  }
+
+  private async pingRedis(): Promise<'up' | `down: ${string}`> {
+    const client = new Redis(this.config.getOrThrow('REDIS_URL'), {
+      maxRetriesPerRequest: 1,
+      lazyConnect: true,
+      connectTimeout: 2000,
+    });
+    try {
+      await client.connect();
+      await client.ping();
+      return 'up';
+    } catch (e) {
+      return `down: ${(e as Error).message}`;
+    } finally {
+      client.disconnect();
+    }
   }
 }
