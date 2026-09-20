@@ -1,176 +1,244 @@
-# cstam-identity-service — Member A: Auth + RBAC (Fastify + JWT)
+# cstam backend
+This document highlights the architecture used, each piece's role, and outliens the development workflow.
 
-Implements the `identity/` slice of Step 0's frozen contract: login/refresh/logout/me,
-user + employee creation, role updates, and the **shared RBAC middleware** that B
-(`wallet/` + `session/`) and C (`station/` + `ops/`) should import as-is rather than
-reimplement.
+## Table of content
+* [Tech Stack & Structure](#tech-stack-and-structure)
+* [Usage & Diagnostics](#usage-and-diagnostics)
 
-## What's here
+## Tech Stack and Structure
+* Node 24
+* NestJS 12
+* Fastify 5
+* Prisma 7
+* Redis 7
+* BullMQ 6
+* Postgres 16
+* Caddy 2
 
-```
-prisma/schema.prisma        # your V4 schema + 2 additions (see below)
-prisma/seed.ts               # bootstraps one hq ADMIN account
-src/config/env.ts            # typed env loader
-src/lib/
-  prisma.ts                  # PrismaClient singleton
-  password.ts                # bcrypt hash/verify
-  jwt.ts                     # @fastify/jwt setup (access + refresh namespaces), sign/verify helpers
-  app-error.ts                # AppError + subclasses -> {error, code} + status
-src/shared/
-  types/auth.ts               # Scope, SCOPE_RANK, ROLE_SCOPE, JWT claim shapes
-  types/fastify.d.ts           # req.auth typing
-  schemas/*.schemas.ts         # Zod request schemas (single source of truth)
-src/middleware/                # Fastify preHandler hooks (file names kept for stable imports)
-  validate.middleware.ts       # generic Zod body/params/query validator
-  auth.middleware.ts           # authenticate / authenticateFresh
-  rbac.middleware.ts           # requireScope / allowAny  <-- the RBAC gate
-  error.middleware.ts          # setErrorHandler / setNotFoundHandler
-src/modules/identity/
-  auth.{service,controller,routes}.ts   # routes are Fastify plugins
-  users.{service,controller,routes}.ts
-src/routes/index.ts            # plugin mounting everything under /api/v1
-src/app.ts, src/server.ts
-```
+### Topology
+The agents/browser, acts from outside and only sees Caddy. \
+Containers communicate together by Compose service name and everything runs on a network called `internal`.
 
-## Two additions to your `schema.prisma`
+```mermaid
+architecture-beta
+    group api[TOPOLOGY]
 
-Auth needs somewhere to store a password and to track refresh-token
-sessions for logout/rotation, neither of which existed in V4:
+    service ab(internet)[Agents/Browser]
+    service rp(server)[Reverse-Proxy (:443 TLS)] in api
+    service be(server)[Backend (:3000)] in api
+    service pg(database)[Postgres (:5432)] in api
+    service rd(disk)[Redis (:6379)] in api
 
-1. **`User.passwordHash`** — new required `String` field.
-2. **`RefreshToken` model** — `{ jti, userId, revoked, replacedByJti, expiresAt }`,
-   one row per issued refresh token. `/auth/logout` revokes by `jti`;
-   `/auth/refresh` rotates (marks the old row revoked, links it to the new one).
-   This is what lets you invalidate *one* device's session without logging
-   everyone out (ADR-003).
+    ab:R --> L:rp
+    rp:B --> T:be
+    be:R -- L:pg
+    be:R -- L:rd
 
-Everything else in the schema is untouched. Diff is isolated to the `User` model
-and one new model, so it shouldn't conflict with B/C's work on the rest of V4.
-
-> **Assumption flagged for review:** the contract's JWT claims include
-> `branchId`, but V4 only has `EmployeeProfile.managedBranchId` (nullable,
-> presumably manager-only). I used it as *the* branch for both EMPLOYEE and
-> MANAGER accounts — i.e. `POST /employees` writes the assigned branch there
-> regardless of role. If `branch_id` semantics get finalized differently
-> (it's flagged parked in Step 0), this is the one place to revisit.
-
-## The scope model (ADR-002)
-
-```
-public (0) < self (1) < staff (2) < admin (3) < hq (4)
+    align column rd pg
+    align row ab rp rd
+    align row be pg
+    align column rp be
 ```
 
-| UserRole | Scope   |
-|----------|---------|
-| GAMER    | self    |
-| EMPLOYEE | staff   |
-| MANAGER  | admin   |
-| ADMIN    | hq      |
+|service      |image      |role     |state|
+|:---         |:---       |:---    |:---:|
+|reverse-proxy|caddy:2-alpine|TLS certificates from internal CA, REST/WS proxy|caddy_data, caddy_config|
+|backend      |cstam-backend|REST API, Swagger, WS gateways, queue worker|-|
+|migrate      |cstam-backend|Runs `prisma migrate deploy` once|-|
+|postgres     |postgres:16-alpine|Database, checked with `pg_isready`|pgdata|
+|redis        |redis:7-alpine|BullMQ broker with AOF for logging|redisdata|
 
-`src/shared/types/auth.ts` is the single source of truth for this mapping —
-import `Scope`, `SCOPE_RANK`, `ROLE_SCOPE` from there rather than hardcoding
-role checks anywhere else in the codebase.
+The migration is its own container, and `backend` doesn't start until it's finished successfully (avoids race condition).
 
-## Using the RBAC hooks in B's / C's routes
+> [!CAUTION]
+> inside a container, `localhost` means _this container_. To refer to services, you may use `postgres:5432`, `redis:6379`, `backend:3000`.
+> To keep in mind when setting up a new env file.
 
-Hooks are plain async functions used in a route's `preHandler` array. Order matters — they run left to right.
+### Boot order
+1. `postgres` and `redis` start
+2. Migration doesn't start until `postgres` is healthy, then runs `prisma migrate deploy` and exits
+3. `backend` doesn't start until `migrate` service completed successfully and `redis` is healthy (passed healthcheck), then boots Nest.
+4. `backend` keeps polling itself over HTTP until it gets an answer (checking for health)
+5. `reverse-proxy` doesn't start until `backend` is healthy  and binds itself to :443
 
-```ts
-import { FastifyInstance } from "fastify";
-import { authenticate } from "../../middleware/auth.middleware";
-import { requireScope } from "../../middleware/rbac.middleware";
-import { validate } from "../../middleware/validate.middleware";
+`backend` shutdown was made graceful with a grace period of 20s to give BullMQ time to handle in-flight jobs and Prisma time to disconnect, instead of SIGTERM killing mid-job.
 
-export async function walletRoutes(app: FastifyInstance) {
-  // staff/self: a gamer can top up their own wallet; any staff can do it for them
-  app.post("/wallet/:id/topup", {
-    preHandler: [authenticate, requireScope("self", { ownerParam: "id" }), validate(topupSchema)],
-  }, topupHandler);
+### Stages
+|stage|from|purpose|
+|:--- |:---|:---:|
+|`base`|`node:24-bookworm-slim`|Necessary for every next stage (OpenSSL, WORKDIR /app)|
+|`deps`|`base`|Single stage to hit npm registry with cache mount (changed lockfile re-resolves)|
+|`dev`|`deps`|Runnable environment, entrypoint to regenerate Prisma client, then `nest start --watch`|
+|`builder`|`deps`|Produces artifacts for runtime|
+|`runtime`|`base`|Production, copies out of `builder` stage, runs as `node`|
 
-  // admin(branch): only a branch's own MANAGER (or hq) can approve a station enrollment.
-  // resolveBranchId may be async.
-  app.post("/enrollment/:machineId/approve", {
-    preHandler: [
-      authenticate,
-      requireScope("admin", {
-        resolveBranchId: async (req) => getMachineBranch((req.params as { machineId: string }).machineId),
-      }),
-    ],
-  }, approveHandler);
-}
+The `dev` stage overwrites `/app` to not bake sources. It's also the reason why Prisma generation with `dev-entrypoint.sh` was moved out to be used by every container at its start.
+
+`node_modules` is set as an anonymous volume so it wouldn't use the host's binaries (important since the platforms may not match).
+
+### Dev vs production builds
+
+The base `docker-compose.yml` is production-shaped. \
+`docker-compose.dev.yml` is an override layer on top.
+
+|               |base       |dev override   |reason            |
+|:---           |:---:      |:---:          |:---              |
+|build target   |`runtime`  |`dev`          |watch mode, source over bind mount|
+|NODE_ENV       |`production`|`development` |unlock swagger at `/docs` and `/ops/commands` controller|
+|backend ports  |`3000`     |`3000`, `9229` |door to Nest, anther for `node --inspect`|
+|postgres,redis |not published|`5432`, `6379`|TablePlus, `psql`, `redis-cli` from host for debugging|
+|Caddy ports    |`443`      |`443`, `80`     |HTTP->HTTPS redirect|
+|volumes        |-          |`.:./app`, `/app/node_modules`|live source, new migration files land on host|
+|healthcheck `start_period`|15s|120s, 12 retries|first in-container compile is slow|
+|file watching  |-          |`CHOKIDAR_USEPOLLING`|for Docker Desktop only (only Windows); inotify events don't cross VM. Not needed on Linux|
+
+
+> [!TIP]
+> For dev build, we may either access our backend directly from Nest `:3000` or through Caddy `:443`.
+> If there is a difference, we know to blame `reverse-proxy`
+
+## Usage and Diagnostics
+
+### Spinning up the project
+
+#### First time
+```bash
+# Make a local copy and fill it with relevant values
+cp .env.example .env
+
+# Build + migrate + start, takes a while for the first time
+npm run docker:dev
+
+# Wait till the reverse-proxy starts
+# it means all previous steps were sucessful
+# open another terminal, check that all good
+curl -s localhost:3000/health | jq
+open http://localhost:3000/docs # to open http://localhost:3000/docs on your browser
 ```
 
-Register your plugin in `src/routes/index.ts` with `app.register(walletRoutes)`.
+#### Every subsequent run
+```bash
+npm run docker:up # wait a tiny bit
+# work, edit files, see changes live
+npm run docker:down # containers gone; pgdata + redisdata lingers
+```
+#### Other scripts...
+|script             |role                               |
+|:---               |:---                               |
+|`docker:rebuild`   |replaces stale `node_modules` volume|
+|`docker:logs`   |last 100 lines fromm all servivces|
+|`docker:ps`   |status and health of each container|
+|`docker:sh`   |shell inside the running backend|
+|`db:migrate`/`db:deploy`|create migration/apply existing ones|
+|`db:generate`/`db:reset`/`db:studio`/`db:psql`   |client codegen, destructive reset, prisma studio on `:5555`, `psql` prompt|
+|`redis:cli`   |`redis-cli` inside redis container|
+|`caddy:validate`/`caddy:reload`/`caddy:ca`|parse-check, hot reload, export root CA cert|
+|`test:int`   |integration tests inside container, against real Postgres and REdis|
 
-`requireScope(min, opts)`:
-- **rank check** — caller's scope must be `>= min` (hq passes everything).
-- **`ownerParam` / `ownerBody`** — only enforced when the caller's *actual*
-  scope is exactly `self`; makes "self/staff"-style endpoints work in one
-  line instead of writing an if/else per route.
-- **`branchParam` / `resolveBranchId`** — only enforced for `staff`/`admin`
-  callers (not `hq`, not `self`); makes "staff(branch)"/"admin(branch)"
-  endpoints reject cross-branch access automatically.
+### Changes and what to run with them
+This is a table that tells you "if I change X, what do I run?"
 
-Every route still re-validates ownership/branch-membership again wherever the
-service logic depends on data the middleware can't see cheaply (e.g. "does
-this session belong to this user's branch") — the contract's "every powerful
-action re-checked server-side" applies at both layers.
+|change     |run    |reason|
+|:---       |:---   |:---|
+|anything under `src/`|nothing|tsc recompiles and Nest restarts itself, live editing|
+|`prisma/schema.prisma`|`npm run db:migrate -- --name MIGRATION_NAME` then `npm run db:generate`|Generate writes into `src/`, recompilation follows automatically|
+|Migration by a teammate|`npm run db:deploy`|Applies without prompting|
+|`package.json`/lockfile|`npm run docker:rebuild`|Throw away stale `node_modules` volume|
+|`Dockerfile`|`npm run docker:dev`|Rebuild|
+|`docker-compose*.yml`/`.env`|`npm run docker:up`|Compose recreates what only changed, and env is read at container create|
+|`Caddyfile`|`npm run caddy:reload`|No downtime or container restart, and open WebSockets survive|
 
-## Endpoints implemented (identity/ slice of the contract)
+> [!TIP]
+> If it becomes wedged, you may run `npm run dc -- down -v` then `npm run docker:dev` to drop `pgdata`, `redisdata` and `caddy_data`, removing local data and invalidating pinned certs.
 
-| Method / Path | Scope | Notes |
-|---|---|---|
-| `POST /auth/login` | public | `{username,password}` → `{accessToken,refreshToken,user}` |
-| `POST /auth/refresh` | public | rotates the refresh token, revokes the old one |
-| `POST /auth/logout` | self | revokes one refresh-token session by `jti` |
-| `GET /auth/me` | self | `{user:{id,role,branchId}}` |
-| `POST /users` | public/staff | creates a GAMER account |
-| `POST /employees` | admin/hq | creates EMPLOYEE/MANAGER; MANAGER can't create MANAGERs or cross-branch |
-| `PATCH /users/:id/role` | admin/hq | MANAGER can't grant MANAGER/ADMIN or touch other branches |
-| `GET /users/:id` | self/staff | |
+### Prisma client
+How schema changes are done:
+```bash
+# 1.edit prisma/schema.prisma
+# 2.create and apply migration
+npm run db:migrate -- --name migration_name
 
-## Running it
+# 3.regenerate the client into src/generated/prisma
+npm run db:generate
+```
+
+The `DATABASE_URL` is read from `prisma.config.ts` for migrations.
+
+### Queue, how a command flows
+Here, the `CommandService` is the producer, `CommandProcessor` is the consumer, and the queue is `agent-commands`.
+1. `POST /ops/commands` through CommandController, dev only and 404s on production
+2. `CommandService.issue()` calls queue.add('command', {machineId, type, payload})
+3. redis — bull:agent-commands:*
+4. `CommandProcessor.process()` stands in for the agent-gateway round trip
+
+Here is how to see it in action:
+```bash
+# TERMINAL 1
+npm run docker:logs
+
+# TERMINAL 2
+curl -X POST localhost:3000/ops/commands \
+  -H 'content-type: application/json' \
+  -d '{"machineId":"01","type":"shutdown","payload":{}}'
+  
+# Back on TERMINAL 1, should show:
+#   [CommandService]   queued job 1 (shutdown -> 01)
+#   [CommandProcessor] active 1
+#   [CommandProcessor] processing 1 attempt 1: shutdown -> m-001
+#   [CommandProcessor] completed 1
+```
+`@OnWorkerEvent` handlers on the processor makes this readable.
+
+We can as well look at Redis directly via `redis-cli`:
+```bash
+npm run redis:cli --scan --pattern 'bull:agent-commands:*'
+npm run redis:cli LLEN  bull:agent-commands:wait
+npm run redis:cli ZCARD bull:agent-commands:failed
+npm run redis:cli HGETALL bull:agent-commands:1
+npm run redis:cli ZREVRANGE bull:agent-commands:failed 0 4
+```
+
+Integration test against Redis can be ran with `npm run test:int` with `test/commands.e2e-spec.ts` which asserts a completed job and a retried failed job.
+
+### Caddy
+It acts as our public door, terminating TLS and proxying everything to the backend on `:3000`, the REST API and WS gateways. \
+WebSocket upgrades (from normal HTTP request) don't need extra config, Caddy can hijack the connection when it sees `Upgrade: websocket`. \
+The `cstam-server.local` isn't a real DNS name and would need to be added to hosts file pointing to 127.0.0.1. The hostnames define the SAN list on the cert Caddy's internal CA issues. Agents pin on the _pre-existing_ cert, otherwise it'd mean re-enrolling. \
+The CAès root lives in `caddy_data` volume, surviving downs, but not with `-v` flag.
 
 ```bash
-cp .env.example .env      # fill in DATABASE_URL and real JWT secrets
-npm install               # package-lock.json was removed during the Fastify migration; this regenerates it
-npx prisma generate
-npx prisma migrate dev --name init
-npm run prisma:seed       # creates one hq ADMIN — SEED_ADMIN_USERNAME/PASSWORD env vars, or defaults
-npm run dev                # http://localhost:4000/api/v1
+# 1.check for parsing
+npm run caddy:validate
+
+# 2.apply without dropping connection (WS survive)
+npm run caddy:reload
+
+# 3.names the the cert actually cover?
+openssl s_client -connect localhost:443 -servername localhost </dev/null 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -ext subjectAltName
+
+# 4.we can curl Caddy's root without using "--insecure" flag
+npm run caddy:ca # copies cert to root
+curl --cacert ./caddy-root.crt https://localhost/health
+
+# 5.is WS upgrade surviving the proxy?
+npx wscat -n -c wss://localhost/agent-gateway
 ```
 
-## Not in this slice
+It is important to validate before reloading
 
-- `membership/` module (also Member A's, per Step 0 §5's split) — not built here,
-  scope was auth + RBAC only per this request.
-- Station credential auth for the `/agent-ws` channel (ADR-003: "MAC is not
-  auth") is a separate, non-JWT auth path that's C's `agent-gateway` concern —
-  `authenticate`/`requireScope` here are for user-facing REST + `/dashboard-io` only.
-
-## JWT setup (Fastify)
-
-`@fastify/jwt` is registered twice in `src/lib/jwt.ts`, under the `access` and `refresh`
-namespaces, each with its own secret (`JWT_ACCESS_SECRET` / `JWT_REFRESH_SECRET`), issuer and TTL.
-Claims, refresh-token rotation and revocation are unchanged from the Express version.
-
-## Testing
-
-**Automated tests (no database needed)** — Vitest drives the real Fastify app through
-`app.inject()`, with Prisma swapped for an in-memory fake (`tests/helpers/fake-prisma.ts`).
-
+### Reaching the stack
 ```bash
-npm install
-npx prisma generate     # needed once: the code imports the generated UserRole enum
-npm test                # or: npm run test:watch
+# straight to Nest, dev only
+curl -s localhost:3000/health | jq
+curl -s localhost:3000/ops/commands/counts | jq
+
+# through Caddy, the way an agent will
+curl -sk https://localhost/health | jq
+
+# from inside the network
+npm run docker:sh
+wget -qO- http://backend:3000/health
+nc -z postgres 5432 && echo "pg reachable"
+getent hosts postgres redis backend
 ```
-
-| File | Covers |
-|---|---|
-| `tests/rbac.test.ts` | `requireScope` / `allowAny` in isolation: rank, ownership, branch, hq bypass, async resolver |
-| `tests/auth.test.ts` | login, token claims, expiry/tampering, refresh rotation + reuse detection, logout, suspended accounts, audit log |
-| `tests/users.test.ts` | signup, role-escalation rules, cross-branch blocking, `/employees`, `/users/:id/role`, `/users/:id` |
-
-**Manual / demo testing against a real DB** — start the server (`npm run dev`) and open
-`requests.http` (VS Code "REST Client" extension). It walks login → gamer signup → 403 → admin
-creates a manager → role change → refresh → logout.
