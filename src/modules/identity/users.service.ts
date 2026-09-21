@@ -1,5 +1,5 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { UserRole } from "@prisma/client";
+import { UserRole } from "../../generated/prisma";
 import { IdentityRepository } from "./identity.repository";
 import { hashPassword } from "../../lib/password";
 import { ConflictError, ForbiddenError, NotFoundError } from "../../lib/app-error";

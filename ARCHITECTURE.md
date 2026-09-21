@@ -3,7 +3,7 @@
 This is the `identity/` slice of the CSTAM eSports Venue Management Platform:
 authentication, RBAC, user/employee management, and the real-time transport layer
 (`ops/`) that machine agents and the dashboard connect through. **NestJS 11 on the
-Fastify adapter** + TypeScript (CommonJS, strict) + Prisma 5 + Zod.
+Fastify adapter** + TypeScript (CommonJS, strict) + Prisma 7 (driver adapter) + Zod.
 
 This doc explains what each part of the codebase does, how the pieces fit together,
 and the rules to follow when adding to it. Read it before adding a new module or
@@ -12,10 +12,19 @@ touching `common/`, `security/`, `prisma/`, `lib/` or `shared/`.
 ## Stack
 
 - **NestJS 11** (`@nestjs/common`, `@nestjs/core`) — modules, dependency injection,
-  controllers, guards, pipes, exception filters.
+  controllers, guards, pipes, exception filters. Built with `nest build`
+  (`@nestjs/cli`), matching this repo's `Dockerfile`/`docker-compose` — don't
+  switch it back to a bare `tsc` script.
 - **Fastify 5** via `@nestjs/platform-fastify` — the HTTP server underneath Nest.
-- **Prisma 5** — single `schema.prisma`, one Postgres database, one owner per table
-  (see "Module DB privacy" below). Wrapped in an injectable `PrismaService`.
+  `fastify` is pinned to the exact version `@nestjs/platform-fastify` bundles
+  (`5.11.3`); a looser `^5.0.0` range lets npm hoist a second, incompatible
+  copy and `app.setup.ts`'s `helmet` registration stops type-checking.
+- **Prisma 7**, driver adapter (`@prisma/adapter-pg` + `pg`), single
+  `schema.prisma`, one Postgres database, one owner per table (see "Module DB
+  privacy" below). Client generates to `src/generated/prisma` (see
+  `generator client` in `schema.prisma`) rather than the `@prisma/client`
+  default — that's the path `nest-cli.json`'s `assets` and the `Dockerfile`'s
+  builder stage both expect. Wrapped in an injectable `PrismaService`.
 - **Zod** — request validation and static types (`z.infer`), applied with
   `ZodValidationPipe`. (Not class-validator.)
 - **@nestjs/jwt** — signs/verifies access and refresh tokens with **separate
@@ -44,7 +53,11 @@ src/
     env.ts                 # typed env loader — the only file allowed to read process.env directly
   prisma/
     prisma.module.ts       # @Global — exports PrismaService
-    prisma.service.ts      # PrismaClient as an injectable (connect/disconnect lifecycle)
+    prisma.service.ts      # PrismaClient (adapter-pg driver adapter) as an
+                           #   injectable, connect/disconnect lifecycle
+  generated/
+    prisma/                 # `prisma generate` output (gitignored) — import
+                           #   from here, never from "@prisma/client" directly
   security/
     security.module.ts     # @Global — exports TokenService
     token.service.ts       # sign/verify access + refresh JWTs, decodeExpiry, Authorization header parsing
@@ -53,8 +66,11 @@ src/
       auth.guard.ts        # Bearer JWT -> req.auth (no DB hit)
       fresh-auth.guard.ts  # same, plus a DB check of accountStatus
       scope.guard.ts       # enforces the rule set by @RequireScope / @AllowAny
+      deny-by-default.guard.ts  # global APP_GUARD: rejects any route with no
+                                 #   @Public()/@Auth()/@RequireScope()/@AllowAny() marker
     decorators/
       access.decorators.ts # @Auth, @RequireScope, @AllowAny — the public API for protecting routes
+      public.decorator.ts  # @Public() — opts a route out of DenyByDefaultGuard
       current-auth.decorator.ts  # @CurrentAuth() -> the caller's AuthContext
     rbac/
       scope-rules.ts       # checkScope / checkAnyScope — the RBAC rules as plain, unit-testable functions
@@ -203,11 +219,20 @@ hardcode a role-to-permission mapping anywhere else.
 
 ### Protecting a route
 
-Three decorators from `common/decorators/access.decorators.ts`, plus `@CurrentAuth()`:
+**Every route must carry one of `@Public()`, `@Auth()`, `@RequireScope()` or
+`@AllowAny()`.** `DenyByDefaultGuard` (`common/guards/deny-by-default.guard.ts`)
+is a global `APP_GUARD` that rejects (403 `NO_ACCESS_POLICY`) any route
+carrying none of the four — a forgotten decorator fails closed instead of
+silently becoming public.
 
 ```ts
 @Controller("wallet")
 export class WalletController {
+  // deliberately open, no auth at all
+  @Get("ping")
+  @Public()
+  ping() {}
+
   // any logged-in user
   @Get("me")
   @Auth()
@@ -240,6 +265,8 @@ export class WalletController {
     `hq`, not `self`) — blocks cross-branch access automatically.
   - `fresh: true`: use the DB-checking auth guard.
 - **`@AllowAny(...scopes)`** — for allowed sets that aren't a minimum rank. Also authenticates.
+- **`@Public()`** — the *only* other way to satisfy `DenyByDefaultGuard`. Use it
+  for genuinely unauthenticated routes (login, signup, health, refresh).
 - **`@CurrentAuth()`** — parameter decorator returning the caller's `AuthContext`.
 
 The rules themselves live in `common/rbac/scope-rules.ts` as plain functions
@@ -345,6 +372,9 @@ identical to production.
 - `tests/agent-gateway.test.ts` / `tests/dashboard-gateway.test.ts` — real `ws`
   / `socket.io-client` connections against a real listening app on an
   ephemeral port (`startTestServer()`).
+- `tests/deny-by-default.test.ts` — `DenyByDefaultGuard` against a throwaway
+  controller (AppModule's own routes are all already decorated, so this is
+  the only way to prove an undecorated route is rejected).
 
 Helpers: `buildTestApp()` (HTTP via `app.inject()`), `startTestServer()` (real port),
 `seedUser()`, `loginAs()`, `setupWorld()` (one logged-in user per role/branch),
@@ -361,8 +391,10 @@ Run: `npm test` (once) or `npm run test:watch` (watch mode).
 - Use `@Inject(Class)` on every constructor parameter (see above).
 - Give every module its own `<name>.repository.ts` and route all DB access
   through it.
-- Protect routes with `@Auth` / `@RequireScope` / `@AllowAny`; validate input with
-  `ZodValidationPipe`; throw `AppError` subclasses.
+- Protect routes with `@Auth` / `@RequireScope` / `@AllowAny`, or mark them
+  `@Public()` if they genuinely need no auth — `DenyByDefaultGuard` rejects
+  anything with none of the four.
+- Validate input with `ZodValidationPipe`; throw `AppError` subclasses.
 - Add cross-module Zod/types to `shared/` only when more than one module
   genuinely needs them.
 - Use relative imports (`../../common/...`) everywhere — `tsconfig.json` has no

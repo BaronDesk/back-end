@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { Inject, Injectable } from "@nestjs/common";
 import { JwtService, JwtSignOptions } from "@nestjs/jwt";
-import { UserRole } from "@prisma/client";
+import { UserRole } from "../generated/prisma";
 import { env } from "../config/env";
 import { UnauthorizedError } from "../lib/app-error";
 import { AccessTokenClaims, AuthContext, RefreshTokenClaims, ROLE_SCOPE } from "../shared/types/auth";

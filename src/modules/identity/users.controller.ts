@@ -2,6 +2,7 @@ import { Body, Controller, Get, Inject, Param, Patch, Post } from "@nestjs/commo
 import { UsersService } from "./users.service";
 import { RequireScope } from "../../common/decorators/access.decorators";
 import { CurrentAuth } from "../../common/decorators/current-auth.decorator";
+import { Public } from "../../common/decorators/public.decorator";
 import { ZodValidationPipe } from "../../common/pipes/zod-validation.pipe";
 import { AuthContext } from "../../shared/types/auth";
 import {
@@ -21,6 +22,7 @@ export class UsersController {
   constructor(@Inject(UsersService) private readonly users: UsersService) {}
 
   // POST /users — public/staff (self-serve signup or front-desk account creation)
+  @Public()
   @Post("users")
   createGamer(@Body(new ZodValidationPipe(createGamerSchema)) body: CreateGamerInput) {
     return this.users.createGamer(body);

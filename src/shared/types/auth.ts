@@ -1,4 +1,4 @@
-import { UserRole } from "@prisma/client";
+import { UserRole } from "../../generated/prisma";
 
 /**
  * Auth scopes per ADR-002 (roles × scope):

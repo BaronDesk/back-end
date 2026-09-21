@@ -5,6 +5,14 @@ import { ACCESS_RULE_KEY, AccessRule, ScopeGuard } from "../guards/scope.guard";
 import { ScopeOptions } from "../rbac/scope-rules";
 import { Scope } from "../../shared/types/auth";
 
+/**
+ * Set by `@Auth()` so `DenyByDefaultGuard` can tell "this route authenticates,
+ * just without a scope rule" apart from "nobody decorated this route at all".
+ * `@RequireScope()`/`@AllowAny()` don't need it — `ACCESS_RULE_KEY` already
+ * marks those.
+ */
+export const AUTHENTICATED_KEY = "cstam:authenticated";
+
 interface FreshOption {
   /** Re-check the account against the DB instead of trusting the JWT alone. */
   fresh?: boolean;
@@ -17,7 +25,10 @@ interface FreshOption {
  *   @Auth({ fresh: true })   // also re-checks accountStatus in the DB
  */
 export function Auth(opts: FreshOption = {}) {
-  return applyDecorators(UseGuards(opts.fresh ? FreshAuthGuard : AuthGuard));
+  return applyDecorators(
+    SetMetadata(AUTHENTICATED_KEY, true),
+    UseGuards(opts.fresh ? FreshAuthGuard : AuthGuard)
+  );
 }
 
 /**

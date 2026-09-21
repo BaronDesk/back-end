@@ -2,6 +2,7 @@ import { Body, Controller, Get, HttpCode, Inject, Post } from "@nestjs/common";
 import { AuthService } from "./auth.service";
 import { Auth } from "../../common/decorators/access.decorators";
 import { CurrentAuth } from "../../common/decorators/current-auth.decorator";
+import { Public } from "../../common/decorators/public.decorator";
 import { ZodValidationPipe } from "../../common/pipes/zod-validation.pipe";
 import { AuthContext } from "../../shared/types/auth";
 import {
@@ -18,6 +19,7 @@ export class AuthController {
   constructor(@Inject(AuthService) private readonly auth: AuthService) {}
 
   // POST /auth/login — public
+  @Public()
   @Post("login")
   @HttpCode(200)
   login(@Body(new ZodValidationPipe(loginSchema)) body: LoginInput) {
@@ -25,6 +27,7 @@ export class AuthController {
   }
 
   // POST /auth/refresh — public (the refresh token itself is the credential)
+  @Public()
   @Post("refresh")
   @HttpCode(200)
   refresh(@Body(new ZodValidationPipe(refreshSchema)) body: RefreshInput) {

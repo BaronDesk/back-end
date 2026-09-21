@@ -1,7 +1,7 @@
 import { test, expect } from "vitest";
 import { randomUUID } from "node:crypto";
 import { io as ioClient, Socket as ClientSocket } from "socket.io-client";
-import { UserRole } from "@prisma/client";
+import { UserRole } from "../src/generated/prisma";
 import { DashboardGateway } from "../src/modules/ops/dashboard-gateway";
 import { startTestServer, tokensOf } from "./helpers/app";
 
