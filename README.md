@@ -1,7 +1,7 @@
-# cstam-identity-service — Member A: Auth + RBAC (Fastify + JWT)
+# cstam-identity-service — Member A: Auth + RBAC (NestJS on Fastify + JWT)
 
 Implements the `identity/` slice of Step 0's frozen contract: login/refresh/logout/me,
-user + employee creation, role updates, and the **shared RBAC middleware** that B
+user + employee creation, role updates, and the **shared RBAC guards and decorators** that B
 (`wallet/` + `session/`) and C (`station/` + `ops/`) should import as-is rather than
 reimplement.
 
@@ -10,27 +10,19 @@ reimplement.
 ```
 prisma/schema.prisma        # your V4 schema + 2 additions (see below)
 prisma/seed.ts               # bootstraps one hq ADMIN account
+src/main.ts, app.module.ts, app.setup.ts   # bootstrap, root module, shared app config
 src/config/env.ts            # typed env loader
-src/lib/
-  prisma.ts                  # PrismaClient singleton
-  password.ts                # bcrypt hash/verify
-  jwt.ts                     # @fastify/jwt setup (access + refresh namespaces), sign/verify helpers
-  app-error.ts                # AppError + subclasses -> {error, code} + status
-src/shared/
-  types/auth.ts               # Scope, SCOPE_RANK, ROLE_SCOPE, JWT claim shapes
-  types/fastify.d.ts           # req.auth typing
-  schemas/*.schemas.ts         # Zod request schemas (single source of truth)
-src/middleware/                # Fastify preHandler hooks (file names kept for stable imports)
-  validate.middleware.ts       # generic Zod body/params/query validator
-  auth.middleware.ts           # authenticate / authenticateFresh
-  rbac.middleware.ts           # requireScope / allowAny  <-- the RBAC gate
-  error.middleware.ts          # setErrorHandler / setNotFoundHandler
-src/modules/identity/
-  auth.{service,controller,routes}.ts   # routes are Fastify plugins
-  users.{service,controller,routes}.ts
-src/routes/index.ts            # plugin mounting everything under /api/v1
-src/app.ts, src/server.ts
+src/prisma/                  # PrismaService (injectable PrismaClient)
+src/security/                # TokenService: access + refresh JWTs (separate secrets)
+src/common/                  # guards, decorators, pipe, exception filter, RBAC rules
+  decorators/access.decorators.ts   # @Auth / @RequireScope / @AllowAny  <-- the RBAC gate
+src/lib/                     # password.ts (Argon2id), app-error.ts, realtime helpers
+src/shared/types/auth.ts     # Scope, SCOPE_RANK, ROLE_SCOPE, JWT claim shapes
+src/modules/identity/        # auth + users: module, repository, schemas, services, controllers
+src/modules/ops/             # /agent-ws (ws) + /dashboard-io (Socket.IO)
 ```
+
+See `ARCHITECTURE.md` for the full layout and the rules for adding modules.
 
 ## Two additions to your `schema.prisma`
 
@@ -71,38 +63,47 @@ public (0) < self (1) < staff (2) < admin (3) < hq (4)
 import `Scope`, `SCOPE_RANK`, `ROLE_SCOPE` from there rather than hardcoding
 role checks anywhere else in the codebase.
 
-## Using the RBAC hooks in B's / C's routes
+## Using the RBAC decorators in B's / C's controllers
 
-Hooks are plain async functions used in a route's `preHandler` array. Order matters — they run left to right.
+Put a decorator on the route handler. `@RequireScope` and `@AllowAny` already
+authenticate (Bearer JWT), so don't add `@Auth()` next to them. Guards run before
+validation pipes, so callers get 401/403 before a 400.
 
 ```ts
-import { FastifyInstance } from "fastify";
-import { authenticate } from "../../middleware/auth.middleware";
-import { requireScope } from "../../middleware/rbac.middleware";
-import { validate } from "../../middleware/validate.middleware";
+import { Body, Controller, Inject, Param, Post } from "@nestjs/common";
+import { RequireScope } from "../../common/decorators/access.decorators";
+import { CurrentAuth } from "../../common/decorators/current-auth.decorator";
+import { ZodValidationPipe } from "../../common/pipes/zod-validation.pipe";
 
-export async function walletRoutes(app: FastifyInstance) {
-  // staff/self: a gamer can top up their own wallet; any staff can do it for them
-  app.post("/wallet/:id/topup", {
-    preHandler: [authenticate, requireScope("self", { ownerParam: "id" }), validate(topupSchema)],
-  }, topupHandler);
+@Controller("wallet")
+export class WalletController {
+  constructor(@Inject(WalletService) private readonly wallet: WalletService) {}
+
+  // self/staff: a gamer can top up their own wallet; any staff can do it for them
+  @Post(":id/topup")
+  @RequireScope("self", { ownerParam: "id" })
+  topUp(
+    @Param(new ZodValidationPipe(idParamSchema)) params: IdParam,
+    @Body(new ZodValidationPipe(topUpSchema)) body: TopUpInput
+  ) {
+    return this.wallet.topUp(params.id, body);
+  }
 
   // admin(branch): only a branch's own MANAGER (or hq) can approve a station enrollment.
   // resolveBranchId may be async.
-  app.post("/enrollment/:machineId/approve", {
-    preHandler: [
-      authenticate,
-      requireScope("admin", {
-        resolveBranchId: async (req) => getMachineBranch((req.params as { machineId: string }).machineId),
-      }),
-    ],
-  }, approveHandler);
+  @Post("enrollment/:machineId/approve")
+  @RequireScope("admin", {
+    resolveBranchId: (req) => getMachineBranch((req.params as { machineId: string }).machineId),
+  })
+  approve(@CurrentAuth() auth: AuthContext) {}
 }
 ```
 
-Register your plugin in `src/routes/index.ts` with `app.register(walletRoutes)`.
+Add your controller and providers to your own `@Module`, and import that module in
+`AppModule`. Constructor parameters need an explicit `@Inject(Class)` (see
+`ARCHITECTURE.md` for why).
 
-`requireScope(min, opts)`:
+`@RequireScope(min, opts)`:
 - **rank check** — caller's scope must be `>= min` (hq passes everything).
 - **`ownerParam` / `ownerBody`** — only enforced when the caller's *actual*
   scope is exactly `self`; makes "self/staff"-style endpoints work in one
@@ -112,7 +113,7 @@ Register your plugin in `src/routes/index.ts` with `app.register(walletRoutes)`.
   endpoints reject cross-branch access automatically.
 
 Every route still re-validates ownership/branch-membership again wherever the
-service logic depends on data the middleware can't see cheaply (e.g. "does
+service logic depends on data the guard can't see cheaply (e.g. "does
 this session belong to this user's branch") — the contract's "every powerful
 action re-checked server-side" applies at both layers.
 
@@ -133,7 +134,7 @@ action re-checked server-side" applies at both layers.
 
 ```bash
 cp .env.example .env      # fill in DATABASE_URL and real JWT secrets
-npm install               # package-lock.json was removed during the Fastify migration; this regenerates it
+npm install               # after the NestJS migration this also updates package-lock.json — commit it
 npx prisma generate
 npx prisma migrate dev --name init
 npm run prisma:seed       # creates one hq ADMIN — SEED_ADMIN_USERNAME/PASSWORD env vars, or defaults
@@ -148,16 +149,18 @@ npm run dev                # http://localhost:4000/api/v1
   auth") is a separate, non-JWT auth path that's C's `agent-gateway` concern —
   `authenticate`/`requireScope` here are for user-facing REST + `/dashboard-io` only.
 
-## JWT setup (Fastify)
+## JWT setup
 
-`@fastify/jwt` is registered twice in `src/lib/jwt.ts`, under the `access` and `refresh`
-namespaces, each with its own secret (`JWT_ACCESS_SECRET` / `JWT_REFRESH_SECRET`), issuer and TTL.
-Claims, refresh-token rotation and revocation are unchanged from the Express version.
+`TokenService` (`src/security/token.service.ts`) wraps `@nestjs/jwt`. Access and
+refresh tokens use separate secrets (`JWT_ACCESS_SECRET` / `JWT_REFRESH_SECRET`);
+issuer, expiry and secret are passed on every sign/verify call. Claims,
+refresh-token rotation and revocation are unchanged from the Fastify version.
 
 ## Testing
 
-**Automated tests (no database needed)** — Vitest drives the real Fastify app through
-`app.inject()`, with Prisma swapped for an in-memory fake (`tests/helpers/fake-prisma.ts`).
+**Automated tests (no database needed)** — Vitest boots the real Nest app
+(`@nestjs/testing`) and drives it through `app.inject()`, with `PrismaService`
+overridden by an in-memory fake (`tests/helpers/fake-prisma.ts`).
 
 ```bash
 npm install
@@ -167,9 +170,11 @@ npm test                # or: npm run test:watch
 
 | File | Covers |
 |---|---|
-| `tests/rbac.test.ts` | `requireScope` / `allowAny` in isolation: rank, ownership, branch, hq bypass, async resolver |
+| `tests/rbac.test.ts` | `checkScope` / `checkAnyScope` in isolation: rank, ownership, branch, hq bypass, async resolver |
 | `tests/auth.test.ts` | login, token claims, expiry/tampering, refresh rotation + reuse detection, logout, suspended accounts, audit log |
 | `tests/users.test.ts` | signup, role-escalation rules, cross-branch blocking, `/employees`, `/users/:id/role`, `/users/:id` |
+| `tests/agent-gateway.test.ts` | real `ws` client: handshake, heartbeat, replay rejection, missing credentials |
+| `tests/dashboard-gateway.test.ts` | real `socket.io-client`: auth, branch room, published events |
 
 **Manual / demo testing against a real DB** — start the server (`npm run dev`) and open
 `requests.http` (VS Code "REST Client" extension). It walks login → gamer signup → 403 → admin

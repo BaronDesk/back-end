@@ -1,17 +1,14 @@
 import { test, expect } from "vitest";
 import { randomUUID } from "node:crypto";
-import type { AddressInfo } from "node:net";
 import WebSocket from "ws";
-import { createApp } from "../src/app";
+import { startTestServer } from "./helpers/app";
 
 function send(ws: WebSocket, type: string, payload: unknown, seq: number) {
   ws.send(JSON.stringify({ type, id: randomUUID(), ts: new Date().toISOString(), seq, payload }));
 }
 
 test("agent gateway: handshake_ack, heartbeat_ack, and replayed seq is nacked", async () => {
-  const app = await createApp();
-  await app.listen({ port: 0, host: "127.0.0.1" });
-  const port = (app.server.address() as AddressInfo).port;
+  const { app, port } = await startTestServer();
 
   const machineId = randomUUID();
   const ws = new WebSocket(`ws://127.0.0.1:${port}/agent-ws?machineId=${machineId}&token=dev-token`);
@@ -54,8 +51,21 @@ test("agent gateway: handshake_ack, heartbeat_ack, and replayed seq is nacked", 
 
   const nack = received.find((f) => f.type === "command_nack");
   expect(nack).toBeTruthy();
-  expect(nack.payload.reason).toBe("SEQ_REPLAYED");
+  expect(nack!.payload.reason).toBe("SEQ_REPLAYED");
 
   ws.close();
+  await app.close();
+});
+
+test("agent gateway: a connection without machineId/token is closed with 4401", async () => {
+  const { app, port } = await startTestServer();
+
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/agent-ws`);
+  const closeCode = await new Promise<number>((resolve, reject) => {
+    ws.on("close", (code) => resolve(code));
+    ws.on("error", reject);
+  });
+
+  expect(closeCode).toBe(4401);
   await app.close();
 });

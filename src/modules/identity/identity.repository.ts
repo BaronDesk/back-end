@@ -1,113 +1,115 @@
+import { Inject, Injectable } from "@nestjs/common";
 import { Prisma, UserRole } from "@prisma/client";
-import { prisma } from "../../lib/prisma";
+import { PrismaService } from "../../prisma/prisma.service";
 
 /**
  * Sole entry point onto the identity tables (users, employee/gamer profiles,
- * refresh_tokens). Other modules must not import `lib/prisma` to touch these
- * tables directly — they call into `auth.service`/`users.service`, which call
- * this repository.
+ * refresh_tokens, audit_logs). Other modules must not inject PrismaService to
+ * touch these tables directly — they call into `AuthService`/`UsersService`
+ * (exported by IdentityModule), which call this repository.
  */
+@Injectable()
+export class IdentityRepository {
+  constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
 
-export function findUserByUsername(username: string) {
-  return prisma.user.findUnique({ where: { username } });
-}
+  findUserByUsername(username: string) {
+    return this.prisma.user.findUnique({ where: { username } });
+  }
 
-export function findUserById(id: string) {
-  return prisma.user.findUnique({ where: { id } });
-}
+  findUserById(id: string) {
+    return this.prisma.user.findUnique({ where: { id } });
+  }
 
-export function findUserWithProfiles(id: string) {
-  return prisma.user.findUnique({
-    where: { id },
-    select: {
-      id: true,
-      username: true,
-      role: true,
-      accountStatus: true,
-      createdAt: true,
-      employeeProfile: { select: { managedBranchId: true, employmentStatus: true } },
-      gamerProfile: { select: { xp: true, level: true } },
-    },
-  });
-}
+  findUserWithProfiles(id: string) {
+    return this.prisma.user.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        username: true,
+        role: true,
+        accountStatus: true,
+        createdAt: true,
+        employeeProfile: { select: { managedBranchId: true, employmentStatus: true } },
+        gamerProfile: { select: { xp: true, level: true } },
+      },
+    });
+  }
 
-export function findEmployeeProfileByUserId(userId: string) {
-  return prisma.employeeProfile.findUnique({
-    where: { userId },
-    select: { managedBranchId: true },
-  });
-}
+  findEmployeeProfileByUserId(userId: string) {
+    return this.prisma.employeeProfile.findUnique({
+      where: { userId },
+      select: { managedBranchId: true },
+    });
+  }
 
-export function createGamerUser(data: { username: string; passwordHash: string }) {
-  return prisma.user.create({
-    data: {
-      username: data.username,
-      passwordHash: data.passwordHash,
-      role: UserRole.GAMER,
-      gamerProfile: { create: {} },
-    },
-    select: { id: true, username: true, role: true, accountStatus: true, createdAt: true },
-  });
-}
+  createGamerUser(data: { username: string; passwordHash: string }) {
+    return this.prisma.user.create({
+      data: {
+        username: data.username,
+        passwordHash: data.passwordHash,
+        role: UserRole.GAMER,
+        gamerProfile: { create: {} },
+      },
+      select: { id: true, username: true, role: true, accountStatus: true, createdAt: true },
+    });
+  }
 
-export function createEmployeeUser(data: {
-  username: string;
-  passwordHash: string;
-  role: UserRole;
-  managedBranchId: string;
-  hireDate: Date;
-}) {
-  return prisma.user.create({
-    data: {
-      username: data.username,
-      passwordHash: data.passwordHash,
-      role: data.role,
-      employeeProfile: {
-        create: {
-          managedBranchId: data.managedBranchId,
-          hireDate: data.hireDate,
+  createEmployeeUser(data: {
+    username: string;
+    passwordHash: string;
+    role: UserRole;
+    managedBranchId: string;
+    hireDate: Date;
+  }) {
+    return this.prisma.user.create({
+      data: {
+        username: data.username,
+        passwordHash: data.passwordHash,
+        role: data.role,
+        employeeProfile: {
+          create: {
+            managedBranchId: data.managedBranchId,
+            hireDate: data.hireDate,
+          },
         },
       },
-    },
-    select: { id: true, username: true, role: true, accountStatus: true, createdAt: true },
-  });
-}
+      select: { id: true, username: true, role: true, accountStatus: true, createdAt: true },
+    });
+  }
 
-export function updateUserRole(id: string, role: UserRole) {
-  return prisma.user.update({
-    where: { id },
-    data: { role },
-    select: { id: true, username: true, role: true, accountStatus: true },
-  });
-}
+  updateUserRole(id: string, role: UserRole) {
+    return this.prisma.user.update({
+      where: { id },
+      data: { role },
+      select: { id: true, username: true, role: true, accountStatus: true },
+    });
+  }
 
-export function createRefreshToken(data: { jti: string; userId: string; expiresAt: Date }) {
-  return prisma.refreshToken.create({ data });
-}
+  createRefreshToken(data: { jti: string; userId: string; expiresAt: Date }) {
+    return this.prisma.refreshToken.create({ data });
+  }
 
-export function findRefreshTokenByJti(jti: string) {
-  return prisma.refreshToken.findUnique({ where: { jti } });
-}
+  findRefreshTokenByJti(jti: string) {
+    return this.prisma.refreshToken.findUnique({ where: { jti } });
+  }
 
-export function revokeRefreshToken(jti: string) {
-  return prisma.refreshToken.update({ where: { jti }, data: { revoked: true } });
-}
+  revokeRefreshToken(jti: string) {
+    return this.prisma.refreshToken.update({ where: { jti }, data: { revoked: true } });
+  }
 
-export function rotateRefreshToken(
-  oldJti: string,
-  next: { jti: string; userId: string; expiresAt: Date }
-) {
-  return prisma.$transaction([
-    prisma.refreshToken.update({
-      where: { jti: oldJti },
-      data: { revoked: true, replacedByJti: next.jti },
-    }),
-    prisma.refreshToken.create({
-      data: { jti: next.jti, userId: next.userId, expiresAt: next.expiresAt },
-    }),
-  ]);
-}
+  rotateRefreshToken(oldJti: string, next: { jti: string; userId: string; expiresAt: Date }) {
+    return this.prisma.$transaction([
+      this.prisma.refreshToken.update({
+        where: { jti: oldJti },
+        data: { revoked: true, replacedByJti: next.jti },
+      }),
+      this.prisma.refreshToken.create({
+        data: { jti: next.jti, userId: next.userId, expiresAt: next.expiresAt },
+      }),
+    ]);
+  }
 
-export function createAuditLog(data: Prisma.AuditLogUncheckedCreateInput) {
-  return prisma.auditLog.create({ data });
+  createAuditLog(data: Prisma.AuditLogUncheckedCreateInput) {
+    return this.prisma.auditLog.create({ data });
+  }
 }

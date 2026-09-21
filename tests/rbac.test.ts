@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { FastifyRequest } from "fastify";
-import { allowAny, requireScope } from "../src/middleware/rbac.middleware";
+import { checkAnyScope, checkScope, ScopeOptions } from "../src/common/rbac/scope-rules";
 import { ForbiddenError, UnauthorizedError } from "../src/lib/app-error";
 import type { AuthContext, Scope } from "../src/shared/types/auth";
+
+// The rules behind @RequireScope / @AllowAny, tested without Nest.
+const requireScope = (min: Scope, opts: ScopeOptions = {}) => (req: FastifyRequest) => checkScope(req, min, opts);
+const allowAny = (...scopes: Scope[]) => (req: FastifyRequest) => checkAnyScope(req, scopes);
 
 const ctx = (scope: Scope, sub = "user-1", branchId: string | null = null): AuthContext => ({
   sub,

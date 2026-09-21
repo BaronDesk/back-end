@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import type { FastifyInstance } from "fastify";
+import type { NestFastifyApplication } from "@nestjs/platform-fastify";
 import {
   API,
   BRANCH_A,
@@ -14,7 +14,7 @@ import {
   setupWorld,
 } from "./helpers/app";
 
-let app: FastifyInstance;
+let app: NestFastifyApplication;
 let w: Awaited<ReturnType<typeof setupWorld>>;
 
 beforeAll(async () => {

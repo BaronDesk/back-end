@@ -1,14 +1,9 @@
-import { beforeEach, vi } from "vitest";
+import "reflect-metadata";
+import { beforeEach } from "vitest";
+import { fakePrisma } from "./helpers/db";
 
-// Replace the real Prisma client with the in-memory fake for every test file.
-vi.mock("../src/lib/prisma", async () => {
-  const { createFakePrisma } = await import("./helpers/fake-prisma");
-  return { prisma: createFakePrisma() };
-});
-
-import { prisma } from "../src/lib/prisma";
-import type { FakePrisma } from "./helpers/fake-prisma";
-
+// The app under test gets `fakePrisma` via overrideProvider(PrismaService)
+// (see tests/helpers/app.ts); here we only wipe it between tests.
 beforeEach(() => {
-  (prisma as unknown as FakePrisma).__reset();
+  fakePrisma.__reset();
 });

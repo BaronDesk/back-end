@@ -1,33 +1,60 @@
-import { FastifyReply, FastifyRequest } from "fastify";
-import { UserRole } from "@prisma/client";
-import * as usersService from "./users.service";
-import { UnauthorizedError } from "../../lib/app-error";
-import { CreateEmployeeInput, CreateGamerInput } from "./identity.schemas";
+import { Body, Controller, Get, Inject, Param, Patch, Post } from "@nestjs/common";
+import { UsersService } from "./users.service";
+import { RequireScope } from "../../common/decorators/access.decorators";
+import { CurrentAuth } from "../../common/decorators/current-auth.decorator";
+import { ZodValidationPipe } from "../../common/pipes/zod-validation.pipe";
+import { AuthContext } from "../../shared/types/auth";
+import {
+  CreateEmployeeInput,
+  CreateGamerInput,
+  UpdateUserRoleInput,
+  UserIdParam,
+  createEmployeeSchema,
+  createGamerSchema,
+  updateUserRoleSchema,
+  userIdParamSchema,
+} from "./identity.schemas";
 
-export async function createGamerHandler(req: FastifyRequest<{ Body: CreateGamerInput }>, reply: FastifyReply) {
-  const result = await usersService.createGamer(req.body);
-  return reply.status(201).send(result);
-}
+// Routes live at the /api/v1 root: /users, /employees, /users/:id, /users/:id/role
+@Controller()
+export class UsersController {
+  constructor(@Inject(UsersService) private readonly users: UsersService) {}
 
-export async function createEmployeeHandler(
-  req: FastifyRequest<{ Body: CreateEmployeeInput }>,
-  reply: FastifyReply
-) {
-  if (!req.auth) throw new UnauthorizedError();
-  const result = await usersService.createEmployee(req.body, req.auth);
-  return reply.status(201).send(result);
-}
+  // POST /users — public/staff (self-serve signup or front-desk account creation)
+  @Post("users")
+  createGamer(@Body(new ZodValidationPipe(createGamerSchema)) body: CreateGamerInput) {
+    return this.users.createGamer(body);
+  }
 
-export async function updateUserRoleHandler(
-  req: FastifyRequest<{ Params: { id: string }; Body: { role: UserRole } }>,
-  reply: FastifyReply
-) {
-  if (!req.auth) throw new UnauthorizedError();
-  const result = await usersService.updateUserRole(req.params.id, req.body.role, req.auth);
-  return reply.status(200).send(result);
-}
+  // POST /employees — admin/hq. A MANAGER may only target their own branch;
+  // resolveBranchId reads the branch the caller is trying to create staff in.
+  @Post("employees")
+  @RequireScope("admin", {
+    resolveBranchId: (req) => (req.body as { branchId?: string } | undefined)?.branchId,
+  })
+  createEmployee(
+    @CurrentAuth() auth: AuthContext,
+    @Body(new ZodValidationPipe(createEmployeeSchema)) body: CreateEmployeeInput
+  ) {
+    return this.users.createEmployee(body, auth);
+  }
 
-export async function getUserHandler(req: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) {
-  const result = await usersService.getUserById(req.params.id);
-  return reply.status(200).send(result);
+  // PATCH /users/:id/role — admin/hq. Cross-branch/role-escalation rules are
+  // enforced in the service layer since they depend on the *target* user.
+  @Patch("users/:id/role")
+  @RequireScope("admin")
+  updateUserRole(
+    @CurrentAuth() auth: AuthContext,
+    @Param(new ZodValidationPipe(userIdParamSchema)) params: UserIdParam,
+    @Body(new ZodValidationPipe(updateUserRoleSchema)) body: UpdateUserRoleInput
+  ) {
+    return this.users.updateUserRole(params.id, body.role, auth);
+  }
+
+  // GET /users/:id — self/staff
+  @Get("users/:id")
+  @RequireScope("self", { ownerParam: "id" })
+  getUser(@Param(new ZodValidationPipe(userIdParamSchema)) params: UserIdParam) {
+    return this.users.getUserById(params.id);
+  }
 }

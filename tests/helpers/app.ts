@@ -1,23 +1,55 @@
 import { randomUUID } from "node:crypto";
+import type { AddressInfo } from "node:net";
 import { expect } from "vitest";
-import type { FastifyInstance } from "fastify";
-import { createApp } from "../../src/app";
-import { prisma } from "../../src/lib/prisma";
+import { Test } from "@nestjs/testing";
+import { FastifyAdapter, NestFastifyApplication } from "@nestjs/platform-fastify";
+import { AppModule } from "../../src/app.module";
+import { configureApp } from "../../src/app.setup";
+import { PrismaService } from "../../src/prisma/prisma.service";
+import { TokenService } from "../../src/security/token.service";
 import { hashPassword } from "../../src/lib/password";
-import type { FakePrisma } from "./fake-prisma";
+import { db, fakePrisma } from "./db";
+
+export { db };
 
 export const BRANCH_A = "11111111-1111-4111-8111-111111111111";
 export const BRANCH_B = "22222222-2222-4222-8222-222222222222";
 export const PASSWORD = "Password123!";
 export const API = "/api/v1";
 
-export const db = () => (prisma as unknown as FakePrisma).__db;
+/**
+ * Boots the real AppModule (guards, pipes, filters, gateways) with Prisma
+ * swapped for the in-memory fake. Same configureApp() as main.ts.
+ */
+async function createTestApp(): Promise<NestFastifyApplication> {
+  const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+    .overrideProvider(PrismaService)
+    .useValue(fakePrisma)
+    .compile();
 
-export async function buildTestApp(): Promise<FastifyInstance> {
-  const app = await createApp();
-  await app.ready();
+  const app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter(), { logger: false });
+  await configureApp(app);
+  await app.init();
   return app;
 }
+
+/** For HTTP tests via `app.inject()` — no port is opened. */
+export async function buildTestApp(): Promise<NestFastifyApplication> {
+  const app = await createTestApp();
+  await app.getHttpAdapter().getInstance().ready();
+  return app;
+}
+
+/** For WebSocket / Socket.IO tests — listens on an ephemeral port. */
+export async function startTestServer(): Promise<{ app: NestFastifyApplication; port: number }> {
+  const app = await createTestApp();
+  await app.listen(0, "127.0.0.1");
+  const port = (app.getHttpServer().address() as AddressInfo).port;
+  return { app, port };
+}
+
+/** The app's TokenService, for tests that need to read or sign tokens directly. */
+export const tokensOf = (app: NestFastifyApplication) => app.get(TokenService);
 
 export interface SeedOptions {
   username: string;
@@ -58,7 +90,7 @@ export interface Session {
 }
 
 export async function loginAs(
-  app: FastifyInstance,
+  app: NestFastifyApplication,
   user: { id: string; username: string; password: string }
 ): Promise<Session> {
   const res = await app.inject({
@@ -74,7 +106,7 @@ export async function loginAs(
 export const bearer = (token: string) => ({ authorization: `Bearer ${token}` });
 
 /** One user per role/branch, all logged in. Used by the RBAC integration tests. */
-export async function setupWorld(app: FastifyInstance) {
+export async function setupWorld(app: NestFastifyApplication) {
   const mk = async (opts: SeedOptions) => loginAs(app, await seedUser(opts));
   return {
     gamer: await mk({ username: "gamer_one", role: "GAMER" }),

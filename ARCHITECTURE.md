@@ -2,26 +2,30 @@
 
 This is the `identity/` slice of the CSTAM eSports Venue Management Platform:
 authentication, RBAC, user/employee management, and the real-time transport layer
-(`ops/`) that machine agents and the dashboard connect through. Fastify 5 + TypeScript
-(CommonJS, strict) + Prisma 5 + Zod.
+(`ops/`) that machine agents and the dashboard connect through. **NestJS 11 on the
+Fastify adapter** + TypeScript (CommonJS, strict) + Prisma 5 + Zod.
 
 This doc explains what each part of the codebase does, how the pieces fit together,
 and the rules to follow when adding to it. Read it before adding a new module or
-touching `lib/`, `middleware/`, or `shared/`.
+touching `common/`, `security/`, `prisma/`, `lib/` or `shared/`.
 
 ## Stack
 
-- **Fastify 5** — HTTP server, plugin-based routing.
-- **Prisma 5** — single `schema.prisma`, one Postgres database, one owner (see
-  "Module DB privacy" below).
-- **Zod** — request validation and static types (`z.infer`).
-- **@fastify/jwt** — two independent namespaces (`access`, `refresh`), separate
-  secrets, so a refresh token can never be replayed as an access token.
+- **NestJS 11** (`@nestjs/common`, `@nestjs/core`) — modules, dependency injection,
+  controllers, guards, pipes, exception filters.
+- **Fastify 5** via `@nestjs/platform-fastify` — the HTTP server underneath Nest.
+- **Prisma 5** — single `schema.prisma`, one Postgres database, one owner per table
+  (see "Module DB privacy" below). Wrapped in an injectable `PrismaService`.
+- **Zod** — request validation and static types (`z.infer`), applied with
+  `ZodValidationPipe`. (Not class-validator.)
+- **@nestjs/jwt** — signs/verifies access and refresh tokens with **separate
+  secrets**, so a refresh token can never be replayed as an access token.
 - **@node-rs/argon2** — password hashing (Argon2id).
-- **raw `ws`** (via `@fastify/websocket`) — machine-agent transport.
+- **raw `ws`** — machine-agent transport.
 - **Socket.IO** — dashboard transport.
-- **Vitest** — the only test runner. All tests live in `tests/`, one flat folder,
-  run with `npm test`.
+- **@fastify/helmet** — security headers (CORS via `app.enableCors()`).
+- **Vitest** + **@nestjs/testing** — the only test runner. All tests live in `tests/`,
+  one flat folder, run with `npm test`.
 - **tsx** — dev server (`npm run dev`) and one-off script execution.
 
 ## Directory layout
@@ -32,60 +36,74 @@ prisma/
   seed.ts                  # bootstraps one hq ADMIN account
 
 src/
-  app.ts                   # createApp(): builds and configures the Fastify instance
-  server.ts                # main(): createApp() + app.listen() + graceful shutdown
+  main.ts                  # bootstrap(): NestFactory + FastifyAdapter + listen
+  app.module.ts            # root module: wires every feature module together
+  app.setup.ts             # configureApp(app): /api/v1 prefix, helmet, CORS, exception filter
+                           #   (shared by main.ts and the tests)
   config/
     env.ts                 # typed env loader — the only file allowed to read process.env directly
-  lib/                     # cross-cutting singletons, shared by every module
-    prisma.ts              # PrismaClient singleton
-    jwt.ts                 # @fastify/jwt setup + sign/verify/decode helpers
-    password.ts             # Argon2id hash/verify
-    app-error.ts            # AppError + subclasses -> {error, code} + HTTP status
+  prisma/
+    prisma.module.ts       # @Global — exports PrismaService
+    prisma.service.ts      # PrismaClient as an injectable (connect/disconnect lifecycle)
+  security/
+    security.module.ts     # @Global — exports TokenService
+    token.service.ts       # sign/verify access + refresh JWTs, decodeExpiry, Authorization header parsing
+  common/                  # Nest building blocks shared by every module
+    guards/
+      auth.guard.ts        # Bearer JWT -> req.auth (no DB hit)
+      fresh-auth.guard.ts  # same, plus a DB check of accountStatus
+      scope.guard.ts       # enforces the rule set by @RequireScope / @AllowAny
+    decorators/
+      access.decorators.ts # @Auth, @RequireScope, @AllowAny — the public API for protecting routes
+      current-auth.decorator.ts  # @CurrentAuth() -> the caller's AuthContext
+    rbac/
+      scope-rules.ts       # checkScope / checkAnyScope — the RBAC rules as plain, unit-testable functions
+    pipes/
+      zod-validation.pipe.ts     # ZodValidationPipe(schema) for @Body/@Param/@Query
+    filters/
+      all-exceptions.filter.ts   # every error -> { error, code } + HTTP status
+  lib/                     # framework-free helpers
+    app-error.ts           # AppError + subclasses -> {error, code} + HTTP status
+    password.ts            # Argon2id hash/verify
     realtime/
-      envelope.ts           # makeFrame / parseFrame / SeqGuard (anti-replay)
-      registry.ts            # in-memory machineId -> ws connection map
-  middleware/                # shared Fastify preHandler hooks
-    validate.middleware.ts    # generic Zod body/params/query validator
-    auth.middleware.ts        # authenticate / authenticateFresh (JWT -> req.auth)
-    rbac.middleware.ts        # requireScope / allowAny — the RBAC gate
-    error.middleware.ts       # setErrorHandler / setNotFoundHandler
+      envelope.ts          # makeFrame / parseFrame / SeqGuard (anti-replay)
+      registry.ts          # MachineRegistry provider: in-memory machineId -> ws connection map
+  health/
+    health.controller.ts   # GET /health (outside the /api/v1 prefix)
   shared/
     types/
-      auth.ts                 # Scope, SCOPE_RANK, ROLE_SCOPE, JWT claim shapes, AuthContext
-      realtime.ts              # Envelope<T>, AGENT_MESSAGES, COMMANDS, DASHBOARD_EVENTS
-      fastify.d.ts              # augments FastifyRequest with `auth?: AuthContext`
+      auth.ts              # Scope, SCOPE_RANK, ROLE_SCOPE, JWT claim shapes, AuthContext
+      realtime.ts          # Envelope<T>, AGENT_MESSAGES, COMMANDS, DASHBOARD_EVENTS
+      fastify.d.ts         # augments FastifyRequest with `auth?: AuthContext`
     schemas/
-      realtime.schemas.ts       # Zod envelope/handshake/heartbeat schemas
+      realtime.schemas.ts  # Zod envelope/handshake/heartbeat schemas
   modules/
-    identity/                    # auth + user/employee management (this module owns User, EmployeeProfile, GamerProfile, RefreshToken, AuditLog)
-      identity.repository.ts      # the ONLY file that may import lib/prisma for these tables
-      identity.schemas.ts          # all Zod request schemas for this module
-      auth.service.ts               # login/refresh/logout/me business logic
-      auth.controller.ts             # thin HTTP handlers, calls auth.service
-      auth.routes.ts                  # registers /auth/* routes + preHandlers
-      users.service.ts                 # signup/employee-creation/role-update logic
-      users.controller.ts               # thin HTTP handlers, calls users.service
-      users.routes.ts                    # registers /users, /employees routes
-    ops/                          # real-time transport (no DB access yet)
-      agent-gateway.ts             # GET /agent-ws — raw ws, machine agents
-      dashboard-gateway.ts          # Socket.IO on /dashboard-io — dashboard clients
-      REALTIME.md                    # install/wiring/testing notes for this module
-  routes/
-    index.ts                    # composition root — mounts every module's routes under /api/v1
+    identity/              # auth + user/employee management (owns User, EmployeeProfile, GamerProfile, RefreshToken, AuditLog)
+      identity.module.ts        # declares controllers/providers, exports AuthService + UsersService
+      identity.repository.ts    # the ONLY provider that may inject PrismaService for these tables
+      identity.schemas.ts       # all Zod request schemas for this module
+      auth.service.ts / auth.controller.ts    # login/refresh/logout/me
+      users.service.ts / users.controller.ts  # signup/employee-creation/role-update/get
+    ops/                   # real-time transport (no DB access yet)
+      ops.module.ts
+      agent-gateway.ts     # ws on /agent-ws — machine agents
+      dashboard-gateway.ts # Socket.IO on /dashboard-io — dashboard clients
+      REALTIME.md          # wiring/testing notes for this module
 
-tests/                         # ALL tests live here, one folder, one runner (vitest)
-  setup.ts                      # global vi.mock("lib/prisma") -> fake-prisma, beforeEach reset
+tests/                     # ALL tests live here, one folder, one runner (vitest)
+  setup.ts                 # reflect-metadata + reset the fake DB before every test
   helpers/
-    app.ts                       # buildTestApp, seedUser, loginAs, setupWorld
-    fake-prisma.ts                 # in-memory Prisma stand-in — no real DB in tests
-  rbac.test.ts                  # requireScope/allowAny in isolation
-  auth.test.ts                  # login, token claims/expiry, refresh rotation, logout
-  users.test.ts                 # signup, role rules, cross-branch blocking
-  agent-gateway.test.ts          # real ws client against a real listening app
-  dashboard-gateway.test.ts       # real socket.io-client, real signed JWT
+    app.ts                 # buildTestApp, startTestServer, seedUser, loginAs, setupWorld
+    db.ts                  # the shared in-memory fake Prisma instance
+    fake-prisma.ts         # in-memory Prisma stand-in — no real DB in tests
+  rbac.test.ts             # checkScope/checkAnyScope in isolation
+  auth.test.ts             # login, token claims/expiry, refresh rotation, logout
+  users.test.ts            # signup, role rules, cross-branch blocking
+  agent-gateway.test.ts    # real ws client against a real listening app
+  dashboard-gateway.test.ts  # real socket.io-client, real signed JWT
 
-vitest.config.ts               # include: ["tests/**/*.test.ts"], fake env vars for tests
-tsconfig.json                  # relative imports only — no baseUrl/paths
+vitest.config.ts           # include: ["tests/**/*.test.ts"], fake env vars for tests
+tsconfig.json              # relative imports only — no baseUrl/paths; decorators enabled
 ```
 
 ## The module pattern
@@ -93,39 +111,51 @@ tsconfig.json                  # relative imports only — no baseUrl/paths
 Every feature module under `src/modules/<name>/` follows the same shape:
 
 ```
-<name>.repository.ts   # the only file in the module allowed to import lib/prisma
-<name>.schemas.ts       # all Zod schemas + inferred types for this module's routes
-<name>.service.ts        # business logic — depends on the repository, not on prisma directly
-<name>.controller.ts      # thin: parses req, calls the service, sets the reply
-<name>.routes.ts           # registers Fastify routes + preHandler chains
+<name>.module.ts       # @Module: controllers, providers, exports
+<name>.repository.ts   # @Injectable — the only provider in the module allowed to inject PrismaService
+<name>.schemas.ts      # all Zod schemas + inferred types for this module's routes
+<name>.service.ts      # @Injectable — business logic; depends on the repository, not on Prisma
+<name>.controller.ts   # @Controller — thin: validates input, calls the service
 ```
 
-`identity/` currently has two service/controller/route triples (`auth.*` and
-`users.*`) sharing one `identity.repository.ts` and one `identity.schemas.ts`,
-because they both operate on the same tables (`User`, `EmployeeProfile`,
-`GamerProfile`, `RefreshToken`). A module with unrelated concerns should still
-get one `<name>.repository.ts` per module, not per file.
+Register the module in `app.module.ts`'s `imports`.
+
+`identity/` has two service/controller pairs (`auth.*` and `users.*`) sharing one
+`identity.repository.ts` and one `identity.schemas.ts`, because they operate on the
+same tables (`User`, `EmployeeProfile`, `GamerProfile`, `RefreshToken`). A module
+with unrelated concerns should still get one `<name>.repository.ts` per module,
+not per file.
+
+### Dependency injection: always `@Inject(Class)` explicitly
+
+```ts
+constructor(@Inject(TokenService) private readonly tokens: TokenService) {}
+```
+
+Never rely on the bare `constructor(private readonly tokens: TokenService)` form.
+Nest normally reads constructor types from `emitDecoratorMetadata`, but **tsx (dev
+server) and Vitest both compile with esbuild, which does not emit that metadata** —
+implicit injection would work under `tsc` and fail everywhere else with "Nest can't
+resolve dependencies". The explicit `@Inject(...)` works in all three. Import the
+class as a value (not `import type`), since it is used at runtime.
 
 ### Module DB privacy — the important rule
 
 **A module may only touch its own tables, and only through its own repository.**
 
-- `import { prisma } from "../../lib/prisma"` is only allowed inside a module's
-  own `<name>.repository.ts`.
-- Services call the repository's exported functions — they never import
-  `lib/prisma` directly.
-- If module B needs data owned by module A, it calls into A's exported
-  `<name>.service` — it does not read A's tables directly, even read-only.
+- `PrismaService` may only be injected into a module's own `<name>.repository.ts`.
+- Services call the repository's methods — they never inject `PrismaService`.
+- If module B needs data owned by module A, it imports A's module and calls A's
+  exported service (e.g. `UsersService`) — it does not read A's tables, even read-only.
 
 This is what lets multiple people work on different modules without merge
 conflicts in each other's queries, and keeps each table's invariants enforced
 in exactly one place.
 
-**Grandfathered exception:** `middleware/auth.middleware.ts`'s
-`authenticateFresh()` queries `prisma.user` directly (for the "is this account
-still active" re-check on sensitive endpoints). Middleware is shared
-infrastructure, not a module, and predates this rule — leave it as-is, don't
-use it as precedent for a module to import `lib/prisma` itself.
+**Grandfathered exception:** `common/guards/fresh-auth.guard.ts` injects
+`PrismaService` directly (for the "is this account still active" re-check on
+sensitive endpoints). It is shared infrastructure, not a module, and predates
+this rule — leave it as-is, don't use it as precedent.
 
 ### Cross-module contracts live in `shared/`
 
@@ -140,8 +170,18 @@ needs to agree on:
 - `shared/types/fastify.d.ts` — the `req.auth` ambient type augmentation.
 
 Everything else — a module's request/response shapes, its own DTOs — belongs
-in that module's `<name>.schemas.ts`, not in `shared/`. If you're adding a Zod
-schema and only one module will ever import it, it does not belong in `shared/`.
+in that module's `<name>.schemas.ts`, not in `shared/`.
+
+## Request lifecycle
+
+```
+request -> Fastify (JSON parse) -> guards -> pipes -> controller -> service -> repository -> Prisma
+                                     |         |
+                                  401 / 403   400          any error -> AllExceptionsFilter -> { error, code }
+```
+
+Guards run **before** pipes, so an unauthenticated or unauthorized caller gets
+401/403 rather than a validation error.
 
 ## Auth & RBAC
 
@@ -161,62 +201,88 @@ public (0) < self (1) < staff (2) < admin (3) < hq (4)
 Import `Scope` / `SCOPE_RANK` / `ROLE_SCOPE` from `shared/types/auth.ts` — never
 hardcode a role-to-permission mapping anywhere else.
 
-### Middleware chain
+### Protecting a route
 
-Hooks are plain async functions used in a route's `preHandler` array, run left
-to right:
+Three decorators from `common/decorators/access.decorators.ts`, plus `@CurrentAuth()`:
 
 ```ts
-app.post(
-  "/wallet/:id/topup",
-  { preHandler: [authenticate, requireScope("self", { ownerParam: "id" }), validate(topupSchema)] },
-  topupHandler
-);
+@Controller("wallet")
+export class WalletController {
+  // any logged-in user
+  @Get("me")
+  @Auth()
+  mine(@CurrentAuth() auth: AuthContext) {}
+
+  // a gamer may top up their own wallet; any staff+ can do it for them
+  @Post(":id/topup")
+  @RequireScope("self", { ownerParam: "id" })
+  topUp(@Param(new ZodValidationPipe(idParam)) params: IdParam, @Body(new ZodValidationPipe(topUpSchema)) body: TopUp) {}
+
+  // only the machine's own branch manager (or hq); resolveBranchId may be async
+  @Post("enrollment/:machineId/approve")
+  @RequireScope("admin", { resolveBranchId: (req) => lookupBranch((req.params as any).machineId) })
+  approve() {}
+
+  // not a clean "minimum rank": only self and hq
+  @Delete(":id")
+  @AllowAny("self", "hq")
+  remove() {}
+}
 ```
 
-- **`authenticate`** (`auth.middleware.ts`) — verifies the Bearer access token,
-  sets `req.auth`. Does not hit the DB (the JWT is the source of truth for
-  identity/role/scope/branch on the hot path).
-- **`authenticateFresh()`** — like `authenticate`, but re-checks `accountStatus`
-  against the DB. Use only on sensitive, low-traffic endpoints.
-- **`requireScope(min, opts)`** (`rbac.middleware.ts`) — the RBAC gate:
-  - rank check: caller's scope must be `>= min` (`hq` passes everything).
-  - `ownerParam`/`ownerBody`: only enforced when the caller's scope is exactly
-    `self` — lets a "self or staff" endpoint be one line.
-  - `branchParam`/`resolveBranchId`: only enforced for `staff`/`admin` callers
-    (not `hq`, not `self`) — blocks cross-branch access automatically.
-- **`allowAny(...scopes)`** — for endpoints whose allowed set isn't a clean
-  "minimum rank" (e.g. only `self` and `hq`).
-- **`validate(schema)`** (`validate.middleware.ts`) — parses `{body, params,
-  query}` against a Zod object schema, writes the coerced values back onto the
-  request, throws `BadRequestError` (`VALIDATION_ERROR`) on failure.
+- **`@Auth()`** — verifies the Bearer access token, sets `req.auth`. No DB hit (the
+  JWT is the source of truth on the hot path). `@Auth({ fresh: true })` also
+  re-checks `accountStatus` in the DB — use only on sensitive, low-traffic endpoints.
+- **`@RequireScope(min, opts)`** — the RBAC gate. **Already authenticates — don't add
+  `@Auth()`.** Caller's scope must be `>= min` (`hq` passes everything).
+  - `ownerParam`/`ownerBody`: only enforced when the caller's scope is exactly `self`.
+  - `branchParam`/`resolveBranchId`: only enforced for `staff`/`admin` callers (not
+    `hq`, not `self`) — blocks cross-branch access automatically.
+  - `fresh: true`: use the DB-checking auth guard.
+- **`@AllowAny(...scopes)`** — for allowed sets that aren't a minimum rank. Also authenticates.
+- **`@CurrentAuth()`** — parameter decorator returning the caller's `AuthContext`.
 
-Even after `requireScope` passes, service logic re-checks anything the
-middleware can't see cheaply (e.g. "does this session belong to this user's
-branch") — every powerful action is checked at both layers.
+The rules themselves live in `common/rbac/scope-rules.ts` as plain functions
+(`checkScope`, `checkAnyScope`) so they are unit-tested without Nest.
 
-### JWT — a known library gotcha
+Even after a guard passes, service logic re-checks anything the guard can't see
+cheaply (e.g. "does this session belong to this user's branch") — every powerful
+action is checked at both layers.
 
-`@fastify/jwt`'s `sign(payload, options)` does **not merge** `options` with the
-plugin's registration-level defaults (`sign: { iss, expiresIn }`) — internally
-it's `options || defaultOptions`, i.e. pick one, not merge. Since every real
-call site needs to pass `{ sub, jti }` as the second argument, the registration
-defaults get silently dropped unless you repeat them.
+### Validation
 
-**Every `sign()` call site must explicitly pass `expiresIn` and `iss`.** See
-`signAccessToken`/`signRefreshToken` in `lib/jwt.ts` for the pattern. Forgetting
-this produces a token that verifies successfully forever (no `exp` claim at
-all) — this bit us once already; don't reintroduce it.
+Zod, one schema per request part, attached with a pipe:
 
-For the same reason, `decodeExpiry()` does not use `@fastify/jwt`'s `.decode()`
-— it decodes the JWT payload by hand (base64url + `JSON.parse`) to avoid the
-same options-merging trap.
+```ts
+create(@Body(new ZodValidationPipe(createGamerSchema)) body: CreateGamerInput) {}
+```
 
-If you ever manually craft a token in a test to simulate expiry: `fast-jwt`
-(the library `@fastify/jwt` v9 uses under the hood) reads a custom `iat`
-override from the **payload** (first argument), in **seconds**, not from the
-`options` argument and not in milliseconds. Getting this wrong produces a
-token that looks freshly issued instead of expired.
+The handler receives the parsed, sanitized value (unknown keys stripped, coercions
+applied). Failure -> `BadRequestError` with code `VALIDATION_ERROR`.
+
+### Errors
+
+Throw `AppError` subclasses (`BadRequestError`, `UnauthorizedError`, `ForbiddenError`,
+`NotFoundError`, `ConflictError`) from services and guards. `AllExceptionsFilter`
+renders them as `{ error, code }` with the right status. Unknown routes become
+`404 ROUTE_NOT_FOUND`; unexpected errors become `500 INTERNAL_ERROR` (message hidden
+in production).
+
+### JWT
+
+`TokenService` (`security/token.service.ts`) wraps `@nestjs/jwt`'s `JwtService`. Access
+and refresh tokens are signed with different secrets (`JWT_ACCESS_SECRET` /
+`JWT_REFRESH_SECRET`), and `JwtModule` is registered with no defaults: **the secret,
+issuer and expiry are passed on every `sign()`/`verify()` call**, so a call site
+can't silently fall back to a missing default. Verification also pins
+`algorithms: ["HS256"]` and checks the issuer.
+
+`decodeExpiry()` reads the `exp` claim of a token just signed (stored as the refresh
+token's `expiresAt`).
+
+If a test needs an expired token, don't forge one — log in normally, then move the
+clock: `vi.useFakeTimers({ toFake: ["Date"] })` + `vi.setSystemTime(...)` (see
+`tests/auth.test.ts`).
 
 ### Passwords
 
@@ -227,10 +293,9 @@ hashPassword(plain: string): Promise<string>
 verifyPassword(storedHash: string, plainText: string): Promise<boolean>
 ```
 
-Note the argument order on `verifyPassword`: `(storedHash, plainText)`,
-matching the underlying `argon2.verify(hash, password)` convention — the
-opposite order from `bcrypt.compare(plain, hash)`, which this module used to
-use. Don't flip it back.
+Note the argument order on `verifyPassword`: `(storedHash, plainText)`, matching the
+underlying `argon2.verify(hash, password)` convention — the opposite order from
+`bcrypt.compare(plain, hash)`. Don't flip it back.
 
 ## Real-time layer (`modules/ops/`)
 
@@ -238,45 +303,53 @@ Two independent transports, both framed with the same `Envelope<T>` shape
 (`type`, `id`, `ts`, `seq`, `payload`) so replay/ordering is checked
 identically on both sides:
 
-- **`agent-gateway.ts`** — `GET /agent-ws`, raw `ws` (via `@fastify/websocket`,
-  registered by this plugin itself). Machine agents connect with
+- **`AgentGateway`** — raw `ws` on `/agent-ws`. Machine agents connect with
   `?machineId&token`. Per-connection `SeqGuard` rejects a replayed/out-of-order
-  `seq` or a `ts` more than 30s from server time. Registered in-memory in
-  `lib/realtime/registry.ts` (`machineId -> ws`).
-- **`dashboard-gateway.ts`** — Socket.IO on path `/dashboard-io`. `io.use`
-  verifies `handshake.auth.token` via `verifyAccessToken` (the same access
-  token as the REST API), joins the caller's `branch:<branchId>` room (`hq` or
-  a `null` branchId joins `branch:all`). `publishToBranch(io, branchId, event,
-  payload)` is the one function business logic should call to push a
-  `DashboardEvent` out.
+  `seq` or a `ts` more than 30s from server time. Connections are tracked in the
+  injectable `MachineRegistry` (`machineId -> ws`).
+- **`DashboardGateway`** — Socket.IO on `/dashboard-io`. Verifies
+  `handshake.auth.token` with `TokenService.verifyAccessToken` (the same access token
+  as the REST API), joins the caller's `branch:<branchId>` room (`hq` or a `null`
+  branchId joins `branch:all`). Business logic pushes a `DashboardEvent` with
+  `dashboardGateway.publishToBranch(branchId, event, payload)` — inject
+  `DashboardGateway` (exported by `OpsModule`).
+
+Why these are plain providers and not `@WebSocketGateway` classes: Nest supports one
+WebSocket adapter per app, and this project needs two different transports. Each
+gateway attaches to the HTTP server in `onModuleInit` (the agent one handles the
+`upgrade` event for its own path; Socket.IO attaches itself) and cleans up in
+`onModuleDestroy`.
 
 Neither gateway touches the database yet — when one needs to, it gets its own
 `ops.repository.ts` per the module DB privacy rule above.
 
-`verifyStation()` in `agent-gateway.ts` is a stub: it only checks that
+The agent gateway's `verifyStation()` is a stub: it only checks that
 `machineId`/`token` are present, not that they're valid against
-`Machine.agentPublicKey`. See `modules/ops/REALTIME.md` for wiring and testing
-details specific to this module.
+`Machine.agentPublicKey`. See `modules/ops/REALTIME.md`.
 
 ## Testing
 
 **All tests live in `tests/`, one folder, run with `npm test` (Vitest).** No
-per-module `*.spec.ts` files, no second test runner, no real database —
-`tests/setup.ts` mocks `lib/prisma` globally with an in-memory fake
-(`tests/helpers/fake-prisma.ts`), reset before every test.
+per-module `*.spec.ts` files, no second test runner, no real database.
 
-- `tests/rbac.test.ts` — `requireScope`/`allowAny` in isolation.
+`tests/helpers/app.ts` builds the real `AppModule` with `@nestjs/testing`, overriding
+`PrismaService` with an in-memory fake (`tests/helpers/fake-prisma.ts`, one shared
+instance in `tests/helpers/db.ts`, wiped before every test by `tests/setup.ts`).
+It applies the same `configureApp()` as `main.ts`, so prefix, filter and helmet are
+identical to production.
+
+- `tests/rbac.test.ts` — `checkScope`/`checkAnyScope` in isolation.
 - `tests/auth.test.ts` — login, token claims/expiry (via `vi.useFakeTimers`),
   refresh rotation + reuse detection, logout, suspended accounts, audit log.
-- `tests/users.test.ts` — signup, role-escalation rules, cross-branch
-  blocking.
+- `tests/users.test.ts` — signup, role-escalation rules, cross-branch blocking.
 - `tests/agent-gateway.test.ts` / `tests/dashboard-gateway.test.ts` — real `ws`
   / `socket.io-client` connections against a real listening app on an
-  ephemeral port (no HTTP mocking for these two — they need a real socket).
+  ephemeral port (`startTestServer()`).
 
-`tests/helpers/app.ts` exports `buildTestApp()`, `seedUser()`, `loginAs()`,
-`setupWorld()` (one logged-in user per role/branch) — reuse these instead of
-re-deriving fixtures in a new test file.
+Helpers: `buildTestApp()` (HTTP via `app.inject()`), `startTestServer()` (real port),
+`seedUser()`, `loginAs()`, `setupWorld()` (one logged-in user per role/branch),
+`tokensOf(app)` (the app's `TokenService`) — reuse these instead of re-deriving
+fixtures in a new test file.
 
 Run: `npm test` (once) or `npm run test:watch` (watch mode).
 
@@ -284,33 +357,37 @@ Run: `npm test` (once) or `npm run test:watch` (watch mode).
 
 **Do:**
 - Put a new feature under `src/modules/<name>/`, following the
-  repository/schemas/service/controller/routes shape.
+  module/repository/schemas/service/controller shape, and add it to `AppModule`.
+- Use `@Inject(Class)` on every constructor parameter (see above).
 - Give every module its own `<name>.repository.ts` and route all DB access
   through it.
+- Protect routes with `@Auth` / `@RequireScope` / `@AllowAny`; validate input with
+  `ZodValidationPipe`; throw `AppError` subclasses.
 - Add cross-module Zod/types to `shared/` only when more than one module
   genuinely needs them.
-- Use relative imports (`../../lib/...`) everywhere — `tsconfig.json` has no
+- Use relative imports (`../../common/...`) everywhere — `tsconfig.json` has no
   `baseUrl`/`paths`, so `@/*`-style imports will not resolve.
 - Add new tests to `tests/`, named after what they cover
   (`<subject>.test.ts`), using Vitest's `test`/`expect`/`vi`.
-- Explicitly pass `expiresIn`/`iss` at every `@fastify/jwt` `.sign()` call
-  site (see the JWT gotcha above).
 - Run `npm test` and `npx tsc --noEmit` before considering a change done.
 
 **Don't:**
-- Don't `import { prisma } from "../../lib/prisma"` outside a module's own
-  `<name>.repository.ts` (exception: `middleware/auth.middleware.ts`'s
-  `authenticateFresh`, grandfathered — don't extend that pattern elsewhere).
+- Don't inject `PrismaService` outside a module's own `<name>.repository.ts`
+  (exception: `FreshAuthGuard`, grandfathered — don't extend that pattern).
+- Don't rely on implicit constructor injection (missing `@Inject`) — it breaks
+  under tsx and Vitest.
+- Don't add `@Auth()` on top of `@RequireScope()`/`@AllowAny()` — they already
+  authenticate. And don't stack extra `@UseGuards(...)` around them without checking
+  the order: guards run in the order they are listed, and a scope check must come
+  after authentication.
 - Don't put a feature-specific Zod schema in `shared/schemas/` — it belongs in
   the module that owns it.
 - Don't hardcode a role/permission check — import `Scope`/`SCOPE_RANK`/
   `ROLE_SCOPE` from `shared/types/auth.ts`.
 - Don't add a second test folder or a second test runner — everything goes
   through Vitest in `tests/`.
-- Don't call `@fastify/jwt`'s `.sign()` with a call-level `options` argument
-  that omits `expiresIn`/`iss` — it silently produces a non-expiring token
-  (see the JWT gotcha above).
-- Don't run `bcrypt`-style `(plain, hash)` argument order on `verifyPassword`
+- Don't call `jwt.sign()`/`verify()` yourself — go through `TokenService`.
+- Don't use bcrypt-style `(plain, hash)` argument order on `verifyPassword`
   — it's `(storedHash, plainText)` here.
 - Don't hand-edit `tsconfig.json`'s `ignoreDeprecations` to `"6.0"` — the
   project's installed compiler (check `node_modules/typescript/package.json`)

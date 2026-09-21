@@ -1,36 +1,84 @@
-import type { FastifyPluginAsync, FastifyRequest } from "fastify";
-import type { WebSocket } from "ws";
-import websocketPlugin from "@fastify/websocket";
+import type { IncomingMessage, Server as HttpServer } from "node:http";
+import type { Duplex } from "node:stream";
+import { Inject, Injectable, Logger, OnModuleDestroy, OnModuleInit } from "@nestjs/common";
+import { HttpAdapterHost } from "@nestjs/core";
+import { WebSocket, WebSocketServer } from "ws";
 import { makeFrame, parseFrame, SeqGuard } from "../../lib/realtime/envelope";
-import { machineRegistry } from "../../lib/realtime/registry";
+import { MachineRegistry } from "../../lib/realtime/registry";
 import { AGENT_MESSAGES, AgentMessageType } from "../../shared/types/realtime";
 import { AppError } from "../../lib/app-error";
 
-interface StationQuery {
-  machineId?: string;
-  token?: string;
-}
+const AGENT_PATH = "/agent-ws";
 
-/**
- * Stub: real implementation should verify `token` against the machine's
- * enrolled agent credentials (see Machine.agentPublicKey) and confirm
- * `machineId` matches. For now it only checks both params are present.
- */
-function verifyStation(req: FastifyRequest): { machineId: string } | null {
-  const { machineId, token } = req.query as StationQuery;
-  if (!machineId || !token) return null;
-  return { machineId };
+interface Station {
+  machineId: string;
 }
 
 function isAgentMessageType(type: string): type is AgentMessageType {
   return (AGENT_MESSAGES as readonly string[]).includes(type);
 }
 
-export const agentGateway: FastifyPluginAsync = async (app) => {
-  await app.register(websocketPlugin);
+/**
+ * Raw-`ws` transport for machine agents: `GET /agent-ws?machineId&token`.
+ *
+ * Nest allows only one WebSocket adapter per app and this project has two
+ * transports (this one + Socket.IO for dashboards), so the agent socket is a
+ * plain provider that handles the HTTP `upgrade` event for its own path.
+ * Everything else (envelope framing, SeqGuard anti-replay) is unchanged.
+ */
+@Injectable()
+export class AgentGateway implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger(AgentGateway.name);
+  private httpServer?: HttpServer;
+  private wss?: WebSocketServer;
+  private upgradeListener?: (req: IncomingMessage, socket: Duplex, head: Buffer) => void;
 
-  app.get("/agent-ws", { websocket: true }, (socket: WebSocket, req: FastifyRequest) => {
-    const station = verifyStation(req);
+  constructor(
+    @Inject(HttpAdapterHost) private readonly adapterHost: HttpAdapterHost,
+    @Inject(MachineRegistry) private readonly registry: MachineRegistry
+  ) {}
+
+  onModuleInit(): void {
+    const httpServer = this.adapterHost.httpAdapter.getHttpServer() as HttpServer;
+    const wss = new WebSocketServer({ noServer: true });
+
+    wss.on("connection", (socket, req) => this.onConnection(socket, req));
+
+    this.upgradeListener = (req, socket, head) => {
+      if (this.pathOf(req) !== AGENT_PATH) return; // not ours (e.g. Socket.IO's /dashboard-io)
+      wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+    };
+    httpServer.on("upgrade", this.upgradeListener);
+
+    this.httpServer = httpServer;
+    this.wss = wss;
+  }
+
+  onModuleDestroy(): void {
+    if (this.upgradeListener) this.httpServer?.off("upgrade", this.upgradeListener);
+    this.wss?.clients.forEach((client) => client.terminate());
+    this.wss?.close();
+  }
+
+  private pathOf(req: IncomingMessage): string {
+    return new URL(req.url ?? "/", "http://localhost").pathname;
+  }
+
+  /**
+   * Stub: real implementation should verify `token` against the machine's
+   * enrolled agent credentials (see Machine.agentPublicKey) and confirm
+   * `machineId` matches. For now it only checks both params are present.
+   */
+  private verifyStation(req: IncomingMessage): Station | null {
+    const query = new URL(req.url ?? "/", "http://localhost").searchParams;
+    const machineId = query.get("machineId");
+    const token = query.get("token");
+    if (!machineId || !token) return null;
+    return { machineId };
+  }
+
+  private onConnection(socket: WebSocket, req: IncomingMessage): void {
+    const station = this.verifyStation(req);
     if (!station) {
       socket.close(4401, "Missing machineId or token");
       return;
@@ -39,54 +87,49 @@ export const agentGateway: FastifyPluginAsync = async (app) => {
     const { machineId } = station;
     const guard = new SeqGuard();
     let outboundSeq = 0;
+    const reply = (type: string, payload: unknown) =>
+      socket.send(JSON.stringify(makeFrame(type, payload, outboundSeq++)));
 
-    machineRegistry.add(machineId, socket);
-    app.log.info({ machineId }, "agent connected");
+    this.registry.add(machineId, socket);
+    this.logger.log(`agent connected machineId=${machineId}`);
 
     socket.on("message", (raw) => {
       let envelope;
       try {
         envelope = parseFrame(raw.toString());
       } catch (err) {
-        const message = err instanceof AppError ? err.message : "Invalid frame";
-        socket.send(JSON.stringify(makeFrame("error", { message }, outboundSeq++)));
+        reply("error", { message: err instanceof AppError ? err.message : "Invalid frame" });
         return;
       }
 
       const guardResult = guard.check(envelope);
       if (!guardResult.ok) {
-        socket.send(
-          JSON.stringify(
-            makeFrame("command_nack", { reason: guardResult.reason, of: envelope.id }, outboundSeq++)
-          )
-        );
+        reply("command_nack", { reason: guardResult.reason, of: envelope.id });
         return;
       }
 
       if (!isAgentMessageType(envelope.type)) {
-        socket.send(
-          JSON.stringify(makeFrame("command_nack", { reason: "UNKNOWN_TYPE", of: envelope.id }, outboundSeq++))
-        );
+        reply("command_nack", { reason: "UNKNOWN_TYPE", of: envelope.id });
         return;
       }
 
       switch (envelope.type) {
         case "handshake":
-          socket.send(JSON.stringify(makeFrame("handshake_ack", { of: envelope.id }, outboundSeq++)));
+          reply("handshake_ack", { of: envelope.id });
           break;
         case "heartbeat":
-          socket.send(JSON.stringify(makeFrame("heartbeat_ack", { of: envelope.id }, outboundSeq++)));
+          reply("heartbeat_ack", { of: envelope.id });
           break;
         default:
           // telemetry / alert / command_ack / command_nack / state_report:
           // no business logic yet, just acknowledge receipt.
-          socket.send(JSON.stringify(makeFrame("ack", { of: envelope.id }, outboundSeq++)));
+          reply("ack", { of: envelope.id });
       }
     });
 
     socket.on("close", () => {
-      machineRegistry.remove(machineId, socket);
-      app.log.info({ machineId }, "agent disconnected");
+      this.registry.remove(machineId, socket);
+      this.logger.log(`agent disconnected machineId=${machineId}`);
     });
-  });
-};
+  }
+}

@@ -1,9 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import type { FastifyInstance } from "fastify";
-import { verifyAccessToken } from "../src/lib/jwt";
-import { API, BRANCH_A, PASSWORD, bearer, buildTestApp, db, loginAs, seedUser } from "./helpers/app";
+import type { NestFastifyApplication } from "@nestjs/platform-fastify";
+import { API, BRANCH_A, PASSWORD, bearer, buildTestApp, db, loginAs, seedUser, tokensOf } from "./helpers/app";
 
-let app: FastifyInstance;
+let app: NestFastifyApplication;
 beforeAll(async () => {
   app = await buildTestApp();
 });
@@ -92,7 +91,7 @@ describe("JWT contents", () => {
     const u = await seedUser({ username: "mgr", role: "MANAGER", branchId: BRANCH_A });
     const { accessToken } = await loginAs(app, u);
 
-    const claims = verifyAccessToken(accessToken);
+    const claims = tokensOf(app).verifyAccessToken(accessToken);
     expect(claims).toMatchObject({ sub: u.id, role: "MANAGER", scope: "admin", branchId: BRANCH_A });
     expect(claims.jti).toEqual(expect.any(String));
 
@@ -104,7 +103,7 @@ describe("JWT contents", () => {
   it("gamers get branchId null and scope self", async () => {
     const u = await seedUser({ username: "gam", role: "GAMER" });
     const { accessToken } = await loginAs(app, u);
-    expect(verifyAccessToken(accessToken)).toMatchObject({ scope: "self", branchId: null });
+    expect(tokensOf(app).verifyAccessToken(accessToken)).toMatchObject({ scope: "self", branchId: null });
   });
 });
 

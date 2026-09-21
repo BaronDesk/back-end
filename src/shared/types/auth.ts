@@ -51,7 +51,7 @@ export interface RefreshTokenClaims {
   exp: number;
 }
 
-/** What downstream middleware/handlers see on `req.auth` after authentication. */
+/** What downstream guards/handlers see on `req.auth` after authentication. */
 export interface AuthContext {
   sub: string;
   role: UserRole;

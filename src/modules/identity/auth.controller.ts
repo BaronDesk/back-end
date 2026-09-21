@@ -1,26 +1,51 @@
-import { FastifyReply, FastifyRequest } from "fastify";
-import * as authService from "./auth.service";
-import { UnauthorizedError } from "../../lib/app-error";
-import { LoginInput, LogoutInput, RefreshInput } from "./identity.schemas";
+import { Body, Controller, Get, HttpCode, Inject, Post } from "@nestjs/common";
+import { AuthService } from "./auth.service";
+import { Auth } from "../../common/decorators/access.decorators";
+import { CurrentAuth } from "../../common/decorators/current-auth.decorator";
+import { ZodValidationPipe } from "../../common/pipes/zod-validation.pipe";
+import { AuthContext } from "../../shared/types/auth";
+import {
+  LoginInput,
+  LogoutInput,
+  RefreshInput,
+  loginSchema,
+  logoutSchema,
+  refreshSchema,
+} from "./identity.schemas";
 
-export async function loginHandler(req: FastifyRequest<{ Body: LoginInput }>, reply: FastifyReply) {
-  const result = await authService.login(req.body);
-  return reply.status(200).send(result);
-}
+@Controller("auth")
+export class AuthController {
+  constructor(@Inject(AuthService) private readonly auth: AuthService) {}
 
-export async function refreshHandler(req: FastifyRequest<{ Body: RefreshInput }>, reply: FastifyReply) {
-  const result = await authService.refresh(req.body.refreshToken);
-  return reply.status(200).send(result);
-}
+  // POST /auth/login — public
+  @Post("login")
+  @HttpCode(200)
+  login(@Body(new ZodValidationPipe(loginSchema)) body: LoginInput) {
+    return this.auth.login(body);
+  }
 
-export async function logoutHandler(req: FastifyRequest<{ Body: LogoutInput }>, reply: FastifyReply) {
-  if (!req.auth) throw new UnauthorizedError();
-  await authService.logout(req.auth.sub, { jti: req.body.jti, refreshToken: req.body.refreshToken });
-  return reply.status(204).send();
-}
+  // POST /auth/refresh — public (the refresh token itself is the credential)
+  @Post("refresh")
+  @HttpCode(200)
+  refresh(@Body(new ZodValidationPipe(refreshSchema)) body: RefreshInput) {
+    return this.auth.refresh(body.refreshToken);
+  }
 
-export async function meHandler(req: FastifyRequest, reply: FastifyReply) {
-  if (!req.auth) throw new UnauthorizedError();
-  const result = await authService.me(req.auth.sub);
-  return reply.status(200).send(result);
+  // POST /auth/logout — self
+  @Post("logout")
+  @HttpCode(204)
+  @Auth()
+  async logout(
+    @CurrentAuth() auth: AuthContext,
+    @Body(new ZodValidationPipe(logoutSchema)) body: LogoutInput
+  ): Promise<void> {
+    await this.auth.logout(auth.sub, { jti: body.jti, refreshToken: body.refreshToken });
+  }
+
+  // GET /auth/me — self
+  @Get("me")
+  @Auth()
+  me(@CurrentAuth() auth: AuthContext) {
+    return this.auth.me(auth.sub);
+  }
 }

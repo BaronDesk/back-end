@@ -1,7 +1,9 @@
+import { Injectable } from "@nestjs/common";
 import type { WebSocket } from "ws";
 
 /** In-memory map of connected agent sockets, keyed by machineId. Single-process only. */
-class MachineRegistry {
+@Injectable()
+export class MachineRegistry {
   private readonly connections = new Map<string, WebSocket>();
 
   add(machineId: string, ws: WebSocket): void {
@@ -22,5 +24,3 @@ class MachineRegistry {
     return this.connections.get(machineId);
   }
 }
-
-export const machineRegistry = new MachineRegistry();
