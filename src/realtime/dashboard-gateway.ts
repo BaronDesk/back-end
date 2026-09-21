@@ -1,8 +1,7 @@
 import type { Server as HttpServer } from "node:http";
 import { Server as SocketIOServer, Socket } from "socket.io";
-import { verifyAccessToken } from "../../lib/jwt";
-import { AuthContext } from "../../shared/types/auth";
-import { DashboardEvent } from "../../shared/types/realtime";
+import { AccessTokenClaims, AuthContext } from "../common/auth/scope.js";
+import { DashboardEvent } from "./realtime.types.js";
 
 declare module "socket.io" {
   interface Socket {
@@ -14,7 +13,10 @@ function branchRoom(branchId: string | null): string {
   return branchId ? `branch:${branchId}` : "branch:all";
 }
 
-export function initDashboardGateway(httpServer: HttpServer): SocketIOServer {
+export function initDashboardGateway(
+  httpServer: HttpServer,
+  verifyAccessToken: (token: string) => AccessTokenClaims
+): SocketIOServer {
   const io = new SocketIOServer(httpServer, {
     path: "/dashboard-io",
   });

@@ -1,7 +1,7 @@
 /**
- * Real-time layer types (Step X). Two transports:
- *  - raw ws for machine agents (src/modules/ops/agent-gateway.ts)
- *  - Socket.IO for dashboards (src/modules/ops/dashboard-gateway.ts)
+ * Real-time layer types. Two transports:
+ *  - raw ws for machine agents (src/realtime/agent.gateway.ts)
+ *  - Socket.IO for dashboards (src/realtime/dashboard.gateway.ts)
  *
  * Both sides exchange `Envelope<T>` frames so replay/ordering (seq) and
  * causality (ts) can be checked the same way regardless of transport.

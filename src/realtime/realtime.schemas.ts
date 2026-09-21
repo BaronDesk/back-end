@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { AGENT_MESSAGES } from "../types/realtime";
+import { AGENT_MESSAGES } from "./realtime.types.js";
 
 export const envelopeSchema = z.object({
   type: z.string().min(1),

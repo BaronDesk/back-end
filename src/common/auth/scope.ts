@@ -1,4 +1,4 @@
-import { UserRole } from "@prisma/client";
+import { UserRole } from '../../generated/prisma/index.js';
 
 /**
  * Auth scopes per ADR-002 (roles × scope):
@@ -16,10 +16,10 @@ export type Scope = "public" | "self" | "staff" | "admin" | "hq";
 
 export const SCOPE_RANK: Record<Scope, number> = {
   public: 0,
-  self: 1,
-  staff: 2,
-  admin: 3,
-  hq: 4,
+    self: 1,
+    staff: 2,
+    admin: 3,
+    hq: 4,
 };
 
 /** Every UserRole maps to exactly one scope. */

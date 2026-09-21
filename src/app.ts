@@ -7,6 +7,9 @@ import { registerJwt } from "./lib/jwt";
 import { prisma } from "./lib/prisma";
 import { env } from "./config/env";
 import { agentGateway } from "./modules/ops/agent-gateway";
+import { AuthModule } from './auth/auth.module.js';
+import { UsersModule } from './users/users.module.js';
+import { RealtimeModule } from './realtime/realtime.module.js';
 
 export async function createApp() {
   const app = Fastify({ logger: env.nodeEnv !== "test" });
