@@ -2,32 +2,60 @@ import type { IncomingMessage } from 'node:http';
 
 import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
-import { WebSocketServer, type WebSocket } from 'ws';
+import type { Subscription } from 'rxjs';
+import { WebSocketServer, WebSocket } from 'ws';
 
-import { makeFrame, parseFrame } from '../../infra/realtime/frame.js';
+import {
+  AGENT_MESSAGE_TYPES,
+  DASHBOARD_EVENTS,
+  SERVER_MESSAGE_TYPES,
+} from '../../infra/realtime/constants.js';
+import { makeFrame, OutboundSequencer, parseFrame } from '../../infra/realtime/frame.js';
 import { AgentRegistry } from '../../infra/realtime/registry.js';
 import { SeqGuard } from '../../infra/realtime/seq-guard.js';
 import type { Envelope } from '../../infra/realtime/envelope.js';
+import {
+  handshakePayloadSchema,
+  heartbeatPayloadSchema,
+  stateReportPayloadSchema,
+} from '../station/schemas/presence.schemas.js';
+import { PresenceService, UnknownStationError } from '../station/services/presence.service.js';
+import { DashboardGateway } from './dashboard.gateway.js';
+
+const HANDSHAKE_TIMEOUT_MS = 10_000;
 
 interface AgentConnection {
-  machineId: string;
+  ip: string | null;
   seqGuard: SeqGuard;
+  outbound: OutboundSequencer;
+  /** Set once the handshake has been resolved to a MACHINE row. */
+  serialNumber?: string;
+  /** Resolves when the handshake completes; later frames wait on it. */
+  ready?: Promise<boolean>;
+  handshakeTimer?: NodeJS.Timeout;
 }
 
 /**
  * Raw `ws` server for machine agents, attached directly to Nest's underlying
  * HTTP server (no @nestjs/websockets — that would pull in socket.io for a
  * channel that must speak the plain agent wire protocol).
+ *
+ * Station identity is the `serialNumber` in the `handshake` frame, not a
+ * query parameter. Presence itself lives in the station module; this gateway
+ * only translates frames into PresenceService calls.
  */
 @Injectable()
 export class AgentGateway implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(AgentGateway.name);
   private wss?: WebSocketServer;
+  private statusSub?: Subscription;
   private readonly connections = new WeakMap<WebSocket, AgentConnection>();
 
   constructor(
     private readonly adapterHost: HttpAdapterHost,
     private readonly registry: AgentRegistry,
+    private readonly presence: PresenceService,
+    private readonly dashboard: DashboardGateway,
   ) {}
 
   onModuleInit(): void {
@@ -37,38 +65,57 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     this.wss.on('connection', (socket: WebSocket, request: IncomingMessage) =>
       this.handleConnection(socket, request),
     );
+
+    this.statusSub = this.presence.statusChanges.subscribe((event) =>
+      this.dashboard.publishToBranch(event.branchId, DASHBOARD_EVENTS.STATION_STATUS, event),
+    );
     this.logger.log('agent-ws attached at /agent-ws');
   }
 
   onModuleDestroy(): void {
+    this.statusSub?.unsubscribe();
     this.wss?.close();
   }
 
+  // STUB: verifyStation per ADR-003 goes here. The agent may send
+  // `Authorization: Bearer <stationToken>`; it is ignored until station
+  // credentials exist.
   private handleConnection(socket: WebSocket, request: IncomingMessage): void {
-    const url = new URL(request.url ?? '', 'http://internal');
-    const machineId = url.searchParams.get('machineId');
-    const token = url.searchParams.get('token');
+    const conn: AgentConnection = {
+      ip: remoteIp(request),
+      seqGuard: new SeqGuard(),
+      outbound: new OutboundSequencer(),
+    };
+    conn.handshakeTimer = setTimeout(() => socket.close(4408, 'handshake timeout'), HANDSHAKE_TIMEOUT_MS);
+    this.connections.set(socket, conn);
 
-    // STUB: verifyStation per ADR-003 goes here — a real station credential,
-    // not a MAC address, which is not authentication. Reject until wired up.
-    if (!machineId || !token) {
-      socket.close(4401, 'missing station credentials');
-      return;
-    }
-
-    this.connections.set(socket, { machineId, seqGuard: new SeqGuard() });
-    this.registry.register(machineId, socket);
-    this.logger.log(`agent connected: ${machineId}`);
-
-    socket.on('message', (data: Buffer) => this.handleMessage(socket, data));
-    socket.on('close', () => {
-      this.registry.deregister(machineId, socket);
-      this.logger.log(`agent disconnected: ${machineId}`);
-    });
-    socket.on('error', (err: Error) => this.logger.warn(`agent socket error (${machineId}): ${err.message}`));
+    socket.on('message', (data: Buffer) => void this.handleMessage(socket, data));
+    socket.on('close', () => void this.handleClose(socket));
+    socket.on('error', (err: Error) =>
+      this.logger.warn(`agent socket error (${conn.serialNumber ?? conn.ip}): ${err.message}`),
+    );
   }
 
-  private handleMessage(socket: WebSocket, data: Buffer): void {
+  private async handleClose(socket: WebSocket): Promise<void> {
+    const conn = this.connections.get(socket);
+    if (!conn) return;
+    clearTimeout(conn.handshakeTimer);
+
+    const serial = conn.serialNumber;
+    if (!serial) return;
+    this.logger.log(`agent disconnected: ${serial}`);
+
+    // A newer connection for the same station already replaced this one.
+    if (!this.registry.deregister(serial, socket)) return;
+
+    try {
+      await this.presence.disconnect(serial);
+    } catch (err) {
+      this.logger.error(`failed to mark ${serial} offline: ${(err as Error).message}`);
+    }
+  }
+
+  private async handleMessage(socket: WebSocket, data: Buffer): Promise<void> {
     const conn = this.connections.get(socket);
     if (!conn) return;
 
@@ -80,18 +127,124 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
+    // Checked synchronously on arrival so async handlers can't reorder seqs.
+    // No nack: the agent answers unknown frame types with its own nack.
     const result = conn.seqGuard.check(envelope);
     if (!result.ok) {
-      socket.send(makeFrame(this.reply(envelope, `${envelope.type}_nack`, { reason: result.reason })));
+      this.logger.warn(
+        `dropped ${envelope.type} from ${conn.serialNumber ?? conn.ip}: ${result.reason} (seq ${envelope.seq})`,
+      );
       return;
     }
 
-    // No business logic yet for any message type — every well-formed,
-    // non-replayed envelope gets a generic ack to keep the wire alive.
-    socket.send(makeFrame(this.reply(envelope, `${envelope.type}_ack`, {})));
+    try {
+      if (envelope.type === AGENT_MESSAGE_TYPES.HANDSHAKE) {
+        await this.onHandshake(socket, conn, envelope);
+        return;
+      }
+
+      if (!conn.ready || !(await conn.ready) || !conn.serialNumber) {
+        this.logger.warn(`ignored ${envelope.type} before handshake (${conn.ip})`);
+        return;
+      }
+
+      switch (envelope.type) {
+        case AGENT_MESSAGE_TYPES.HEARTBEAT:
+          await this.onHeartbeat(socket, conn, conn.serialNumber, envelope);
+          return;
+        case AGENT_MESSAGE_TYPES.STATE_REPORT:
+          await this.onStateReport(conn.serialNumber, envelope);
+          return;
+        default:
+          this.logger.debug(`ignored unhandled frame type '${envelope.type}' from ${conn.serialNumber}`);
+      }
+    } catch (err) {
+      this.logger.error(`error handling ${envelope.type} from ${conn.serialNumber ?? conn.ip}: ${(err as Error).message}`);
+    }
   }
 
-  private reply(envelope: Envelope, type: string, payload: unknown): Envelope {
-    return { type, id: envelope.id, ts: Date.now(), seq: envelope.seq, payload };
+  private async onHandshake(socket: WebSocket, conn: AgentConnection, envelope: Envelope): Promise<void> {
+    const parsed = handshakePayloadSchema.safeParse(envelope.payload);
+    if (!parsed.success) {
+      socket.close(4400, 'invalid handshake payload');
+      return;
+    }
+    const handshake = parsed.data;
+
+    if (conn.serialNumber && conn.serialNumber !== handshake.serialNumber) {
+      socket.close(4409, 'serial number changed mid-connection');
+      return;
+    }
+
+    const ready = this.presence.connect(handshake, conn.ip).then(
+      () => true,
+      (err: Error) => {
+        if (err instanceof UnknownStationError) {
+          this.logger.warn(`rejected agent: ${err.message} (${conn.ip})`);
+          socket.close(4403, 'unknown station');
+        } else {
+          this.logger.error(`handshake failed for ${handshake.serialNumber}: ${err.message}`);
+          socket.close(1011, 'handshake failed');
+        }
+        return false;
+      },
+    );
+    conn.ready = ready;
+    if (!(await ready)) return;
+
+    clearTimeout(conn.handshakeTimer);
+    if (socket.readyState !== WebSocket.OPEN) {
+      // Closed while we were resolving the machine; undo the ONLINE mark.
+      await this.presence.disconnect(handshake.serialNumber);
+      return;
+    }
+
+    conn.serialNumber = handshake.serialNumber;
+    this.registry.register(handshake.serialNumber, socket);
+    this.logger.log(
+      `agent connected: ${handshake.serialNumber} (${handshake.machineName ?? '?'}, v${handshake.agentVersion ?? '?'}) from ${conn.ip}`,
+    );
+    this.send(socket, conn, SERVER_MESSAGE_TYPES.HANDSHAKE_ACK, {});
   }
+
+  private async onHeartbeat(
+    socket: WebSocket,
+    conn: AgentConnection,
+    serialNumber: string,
+    envelope: Envelope,
+  ): Promise<void> {
+    const parsed = heartbeatPayloadSchema.safeParse(envelope.payload);
+    if (parsed.success) {
+      await this.presence.touch(serialNumber, parsed.data);
+    } else {
+      this.logger.warn(`malformed heartbeat payload from ${serialNumber}`);
+    }
+    // Always ack: the agent derives its session lease from heartbeat_ack
+    // (null => its default lease).
+    this.send(socket, conn, SERVER_MESSAGE_TYPES.HEARTBEAT_ACK, { leaseExpiresAt: null });
+  }
+
+  private async onStateReport(serialNumber: string, envelope: Envelope): Promise<void> {
+    const parsed = stateReportPayloadSchema.safeParse(envelope.payload);
+    if (!parsed.success) {
+      this.logger.warn(`malformed state_report payload from ${serialNumber}`);
+      return;
+    }
+    await this.presence.reportState(serialNumber, parsed.data);
+  }
+
+  private send(socket: WebSocket, conn: AgentConnection, type: string, payload: unknown): void {
+    if (socket.readyState !== WebSocket.OPEN) return;
+    socket.send(makeFrame(conn.outbound.next(type, payload)));
+  }
+}
+
+/** Caddy terminates TLS in front of us, so prefer the proxy's client-IP headers. */
+function remoteIp(request: IncomingMessage): string | null {
+  const header = (name: string) => {
+    const value = request.headers[name];
+    return (Array.isArray(value) ? value[0] : value)?.split(',')[0]?.trim() || undefined;
+  };
+  const ip = header('x-real-ip') ?? header('x-forwarded-for') ?? request.socket.remoteAddress ?? null;
+  return ip?.replace(/^::ffff:/, '') ?? null;
 }

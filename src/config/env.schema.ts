@@ -9,6 +9,10 @@ export const envSchema = z.object({
   JWT_REFRESH_SECRET: z.string().min(1),
   JWT_ACCESS_TTL: z.string().min(1).default('15m'),
   JWT_REFRESH_TTL: z.string().min(1).default('7d'),
+  // Node tracking. The agent heartbeats every 15s; OFFLINE after ~3 missed.
+  PRESENCE_OFFLINE_AFTER_MS: z.coerce.number().int().positive().default(45_000),
+  PRESENCE_WATCHDOG_INTERVAL_MS: z.coerce.number().int().positive().default(10_000),
+  PRESENCE_PERSIST_INTERVAL_MS: z.coerce.number().int().positive().default(15_000),
 });
 
 export type EnvConfig = z.infer<typeof envSchema>;

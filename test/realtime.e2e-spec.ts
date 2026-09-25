@@ -4,13 +4,20 @@ import { hash } from '@node-rs/argon2';
 import { Test, TestingModule } from '@nestjs/testing';
 import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
 import { io as ioClient } from 'socket.io-client';
+import type { Redis } from 'ioredis';
 import WebSocket from 'ws';
 
 import { AppModule } from '../src/app.module.js';
 import { PrismaService } from '../src/infra/prisma/prisma.service.js';
+import { REDIS } from '../src/infra/redis/redis.module.js';
 import { DashboardGateway } from '../src/modules/ops/dashboard.gateway.js';
 import { makeFrame } from '../src/infra/realtime/frame.js';
-import type { Envelope } from '../src/infra/realtime/envelope.js';
+import type { OutboundEnvelope } from '../src/infra/realtime/envelope.js';
+
+// Short presence timings so the watchdog case runs in seconds. Read by
+// ConfigModule when AppModule compiles in beforeAll.
+process.env.PRESENCE_OFFLINE_AFTER_MS = '1500';
+process.env.PRESENCE_WATCHDOG_INTERVAL_MS = '300';
 
 describe('realtime gateways (e2e)', () => {
   let app: NestFastifyApplication;
@@ -54,44 +61,162 @@ describe('realtime gateways (e2e)', () => {
 
   afterAll(async () => {
     await prisma.user.deleteMany({ where: { username } });
+    const machines = await prisma.machine.findMany({ where: { branchId } });
+    if (machines.length) await app.get<Redis>(REDIS).del(...machines.map((m) => `node:${m.serialNumber}`));
     await prisma.branch.delete({ where: { id: branchId } }).catch(() => undefined);
     await app.close();
   });
 
-  function envelope(type: string, seq: number, payload: unknown = {}): Envelope {
-    return { type, id: randomUUID(), ts: Date.now(), seq, payload };
+  // Agent frames carry an ISO-8601 ts, exactly like the .NET desktop agent.
+  function envelope(type: string, seq: number, payload: unknown = {}) {
+    return { type, id: randomUUID(), ts: new Date().toISOString(), seq, payload };
   }
 
-  it('acks handshake and heartbeat, nacks a replayed seq', async () => {
-    const wsUrl = `${baseUrl.replace('http', 'ws')}/agent-ws?machineId=m-1&token=stub`;
-    const socket = new WebSocket(wsUrl);
-    const messages: Envelope[] = [];
+  async function createMachine(serialNumber: string) {
+    return prisma.machine.create({ data: { serialNumber, branchId, agentPublicKey: '' } });
+  }
 
-    await new Promise<void>((resolve, reject) => {
-      socket.on('open', () => socket.send(makeFrame(envelope('handshake', 0))));
-      socket.on('error', reject);
-      socket.on('message', (data: Buffer) => {
-        messages.push(JSON.parse(data.toString()) as Envelope);
-        if (messages.length === 1) socket.send(makeFrame(envelope('heartbeat', 1)));
-        else if (messages.length === 2) socket.send(makeFrame(envelope('heartbeat', 1))); // replay
-        else resolve();
-      });
+  function openAgent(): Promise<{ socket: WebSocket; frames: OutboundEnvelope[]; next: () => Promise<OutboundEnvelope> }> {
+    const socket = new WebSocket(`${baseUrl.replace('http', 'ws')}/agent-ws`);
+    const frames: OutboundEnvelope[] = [];
+    const waiters: ((frame: OutboundEnvelope) => void)[] = [];
+    let read = 0;
+
+    socket.on('message', (data: Buffer) => {
+      frames.push(JSON.parse(data.toString()) as OutboundEnvelope);
+      const waiter = waiters.shift();
+      if (waiter) waiter(frames[read++]);
     });
-    socket.close();
+    const next = () =>
+      new Promise<OutboundEnvelope>((resolve) => {
+        if (read < frames.length) resolve(frames[read++]);
+        else waiters.push(resolve);
+      });
 
-    expect(messages[0].type).toBe('handshake_ack');
-    expect(messages[1].type).toBe('heartbeat_ack');
-    expect(messages[2].type).toBe('heartbeat_nack');
+    return new Promise((resolve, reject) => {
+      socket.on('open', () => resolve({ socket, frames, next }));
+      socket.on('error', reject);
+    });
+  }
+
+  function dashboard() {
+    const client = ioClient(baseUrl, {
+      path: '/dashboard-io',
+      reconnection: false,
+      forceNew: true,
+      auth: { token: accessToken },
+    });
+    return new Promise<typeof client>((resolve, reject) => {
+      client.on('connect', () => resolve(client));
+      client.on('connect_error', reject);
+    });
+  }
+
+  function nextStatus(client: Awaited<ReturnType<typeof dashboard>>, serialNumber: string, status: string) {
+    return new Promise<Record<string, unknown>>((resolve) => {
+      const handler = (event: Record<string, unknown>) => {
+        if (event.serialNumber === serialNumber && event.status === status) {
+          client.off('station_status', handler);
+          resolve(event);
+        }
+      };
+      client.on('station_status', handler);
+    });
+  }
+
+  it('tracks a station through handshake, heartbeat, state_report and close', async () => {
+    const serialNumber = `STATION-${randomUUID()}`;
+    const machine = await createMachine(serialNumber);
+    const client = await dashboard();
+    const online = nextStatus(client, serialNumber, 'ONLINE');
+
+    const agent = await openAgent();
+    agent.socket.send(
+      makeFrame(envelope('handshake', 1, { serialNumber, agentVersion: '1.0.0', osVersion: 'test', machineName: 'PC-1' })),
+    );
+
+    const handshakeAck = await agent.next();
+    expect(handshakeAck.type).toBe('handshake_ack');
+    expect(handshakeAck.seq).toBe(1);
+    expect(Number.isNaN(Date.parse(handshakeAck.ts))).toBe(false);
+
+    const onlineEvent = await online;
+    expect(onlineEvent).toMatchObject({ serialNumber, name: 'PC-1', status: 'ONLINE', branchId, ip: '127.0.0.1' });
+
+    agent.socket.send(
+      makeFrame(envelope('state_report', 2, { locked: true, sessionId: null, runningGameId: null, leaseExpiresAt: null })),
+    );
+    agent.socket.send(makeFrame(envelope('heartbeat', 3, { locked: true, sessionId: null })));
+    agent.socket.send(makeFrame(envelope('telemetry', 4, { anything: 1 }))); // unhandled: ignored, no reply
+    agent.socket.send(makeFrame(envelope('heartbeat', 5, { locked: false, sessionId: null })));
+
+    expect(await agent.next()).toMatchObject({ type: 'heartbeat_ack', seq: 2, payload: { leaseExpiresAt: null } });
+    expect(await agent.next()).toMatchObject({ type: 'heartbeat_ack', seq: 3, payload: { leaseExpiresAt: null } });
+
+    const auth = { authorization: `Bearer ${accessToken}` };
+    const list = await app.inject({ method: 'GET', url: '/api/v1/stations', headers: auth });
+    expect(list.statusCode).toBe(200);
+    expect(list.json()).toContainEqual(
+      expect.objectContaining({ id: machine.id, serialNumber, status: 'ONLINE', locked: false, ip: '127.0.0.1' }),
+    );
+
+    const one = await app.inject({ method: 'GET', url: `/api/v1/stations/${machine.id}`, headers: auth });
+    expect(one.json()).toMatchObject({ id: machine.id, status: 'ONLINE', branchId });
+
+    const offline = nextStatus(client, serialNumber, 'OFFLINE');
+    agent.socket.close();
+    await expect(offline).resolves.toMatchObject({ serialNumber, status: 'OFFLINE' });
+    expect((await prisma.machine.findUniqueOrThrow({ where: { id: machine.id } })).status).toBe('OFFLINE');
+
+    client.close();
   });
 
-  it('closes agent connections missing station credentials', async () => {
-    const wsUrl = `${baseUrl.replace('http', 'ws')}/agent-ws`;
-    const socket = new WebSocket(wsUrl);
+  it('drops a replayed seq without replying', async () => {
+    const serialNumber = `STATION-${randomUUID()}`;
+    await createMachine(serialNumber);
+    const agent = await openAgent();
 
-    const code = await new Promise<number>((resolve) => {
-      socket.on('close', (closeCode: number) => resolve(closeCode));
-    });
-    expect(code).toBe(4401);
+    agent.socket.send(makeFrame(envelope('handshake', 1, { serialNumber })));
+    expect((await agent.next()).type).toBe('handshake_ack');
+
+    agent.socket.send(makeFrame(envelope('heartbeat', 2, { locked: true, sessionId: null })));
+    agent.socket.send(makeFrame(envelope('heartbeat', 2, { locked: true, sessionId: null }))); // replay
+    agent.socket.send(makeFrame(envelope('heartbeat', 3, { locked: true, sessionId: null })));
+
+    expect(await agent.next()).toMatchObject({ type: 'heartbeat_ack', seq: 2 });
+    expect(await agent.next()).toMatchObject({ type: 'heartbeat_ack', seq: 3 });
+    expect(agent.frames.every((f) => !f.type.endsWith('_nack'))).toBe(true);
+    agent.socket.close();
+  });
+
+  it('watchdog marks a silent station OFFLINE while the socket stays open', async () => {
+    const serialNumber = `STATION-${randomUUID()}`;
+    await createMachine(serialNumber);
+    const client = await dashboard();
+    const offline = nextStatus(client, serialNumber, 'OFFLINE');
+
+    const agent = await openAgent();
+    agent.socket.send(makeFrame(envelope('handshake', 1, { serialNumber })));
+    expect((await agent.next()).type).toBe('handshake_ack');
+
+    await expect(offline).resolves.toMatchObject({ serialNumber, status: 'OFFLINE' });
+    expect(agent.socket.readyState).toBe(WebSocket.OPEN);
+
+    // Heartbeats resuming on the same socket bring it back.
+    const online = nextStatus(client, serialNumber, 'ONLINE');
+    agent.socket.send(makeFrame(envelope('heartbeat', 2, { locked: true, sessionId: null })));
+    await expect(online).resolves.toMatchObject({ serialNumber, status: 'ONLINE' });
+
+    agent.socket.close();
+    client.close();
+  }, 10_000);
+
+  it('closes an agent that never sends a valid handshake', async () => {
+    const agent = await openAgent();
+    agent.socket.send(makeFrame(envelope('handshake', 1, { serialNumber: '' })));
+
+    const code = await new Promise<number>((resolve) => agent.socket.on('close', (closeCode: number) => resolve(closeCode)));
+    expect(code).toBe(4400);
   });
 
   it('rejects a dashboard connection with no token', async () => {

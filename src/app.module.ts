@@ -8,12 +8,14 @@ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter.js';
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard.js';
 import { PermissionsGuard } from './common/guards/permissions.guard.js';
 import { PrismaModule } from './infra/prisma/prisma.module.js';
+import { RedisModule } from './infra/redis/redis.module.js';
 import { HealthModule } from './health/health.module.js';
 import { IdentityModule } from './modules/identity/identity.module.js';
 import { OpsModule } from './modules/ops/ops.module.js';
+import { StationModule } from './modules/station/station.module.js';
 
 @Module({
-  imports: [AppConfigModule, PrismaModule, IdentityModule, OpsModule, HealthModule],
+  imports: [AppConfigModule, PrismaModule, RedisModule, IdentityModule, StationModule, OpsModule, HealthModule],
   controllers: [AppController],
   providers: [
     AppService,

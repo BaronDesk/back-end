@@ -30,6 +30,11 @@ enum MachineEnrollmentStatus {
   DEACTIVATED
 }
 
+enum MachineStatus {
+  ONLINE
+  OFFLINE
+}
+
 enum TransactionType {
   PAYMENT
   REFUND
@@ -279,6 +284,10 @@ model Machine {
   branchId         String                  @map("branch_id") @db.Uuid
   agentPublicKey   String                  @map("agent_public_key")
   enrollmentStatus MachineEnrollmentStatus @default(PENDING) @map("enrollment_status")
+  name             String?
+  status           MachineStatus           @default(OFFLINE)
+  lastSeen         DateTime?               @map("last_seen") @db.Timestamptz
+  ipAddress        String?                 @map("ip_address")
   createdAt        DateTime                @default(now()) @map("created_at") @db.Timestamptz
   updatedAt        DateTime                @updatedAt @map("updated_at") @db.Timestamptz
 
@@ -291,6 +300,7 @@ model Machine {
   @@index([branchId])
   @@index([serialNumber])
   @@index([enrollmentStatus])
+  @@index([status])
   @@map("machines")
 }
 

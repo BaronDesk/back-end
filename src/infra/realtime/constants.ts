@@ -17,6 +17,11 @@ export const AGENT_MESSAGE_TYPES = {
   COMMAND_NACK: 'command_nack',
   STATE_REPORT: 'state_report',
 } as const;
+export const SERVER_MESSAGE_TYPES = {
+  HANDSHAKE_ACK: 'handshake_ack',
+  HEARTBEAT_ACK: 'heartbeat_ack',
+} as const;
+
 export type AgentMessageType = (typeof AGENT_MESSAGE_TYPES)[keyof typeof AGENT_MESSAGE_TYPES];
 
 export const DASHBOARD_EVENTS = {
