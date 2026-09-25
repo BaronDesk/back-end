@@ -36,7 +36,7 @@
     "db:deploy": "npm run dc -- run --rm migrate npx prisma migrate deploy",
     "db:generate": "npm run dc -- exec backend npx prisma generate",
     "db:reset": "npm run dc -- run --rm migrate npx prisma migrate reset --force",
-    "db:studio": "npm run dc -- run --rm -p 5555:5555 migrate npx prisma studio --hostname 0.0.0.0",
+    "db:studio": "node scripts/db-studio.js",
     "db:psql": "npm run dc -- exec postgres psql -U cstam -d cstam",
     "redis:cli": "npm run dc -- exec redis redis-cli",
     "caddy:validate": "npm run dc -- exec reverse-proxy caddy validate --config /etc/caddy/Caddyfile",

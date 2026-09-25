@@ -7,3 +7,4 @@ src/generated/
 *.local
 caddy-root.crt
 *.tsbuildinfo
+package-lock.json
