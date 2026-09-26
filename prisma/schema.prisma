@@ -96,6 +96,21 @@ enum AlertSeverity {
   CRITICAL
 }
 
+enum CommandType {
+  LOCK
+  UNLOCK
+  SHUTDOWN
+}
+
+enum CommandStatus {
+  PENDING
+  SENT
+  ACKED
+  NACKED
+  TIMEOUT
+  FAILED
+}
+
 enum AuditAction {
   CREATE
   READ
@@ -136,6 +151,7 @@ model Branch {
   employeeProfiles  EmployeeProfile[]
   machines          Machine[]
   telemetryAlerts   TelemetryAlert[]
+  commands          Command[]
 
   @@index([name])
   @@map("branches")
@@ -293,6 +309,7 @@ model Machine {
   nodeTelemetry   NodeTelemetry[]
   telemetryAlerts TelemetryAlert[]
   reservations    Reservation[]
+  commands        Command[]
 
   @@index([branchId])
   @@index([serialNumber])
@@ -371,6 +388,36 @@ model TelemetryAlert {
   @@index([acknowledged])
   @@index([createdAt])
   @@map("telemetry_alerts")
+}
+
+// --- Station Commands ---
+
+// One staff-issued control command. `id` doubles as the wire envelope id, so
+// every resend of the same command carries the same id (agent idempotency).
+// `issuedBy` has no FK on purpose: the history outlives the user row.
+model Command {
+  id            String        @id @db.Uuid
+  machineId     String        @map("machine_id") @db.Uuid
+  branchId      String        @map("branch_id") @db.Uuid
+  type          CommandType
+  status        CommandStatus @default(PENDING)
+  issuedBy      String        @map("issued_by") @db.Uuid
+  issuedAt      DateTime      @default(now()) @map("issued_at") @db.Timestamptz
+  sentAt        DateTime?     @map("sent_at") @db.Timestamptz
+  resolvedAt    DateTime?     @map("resolved_at") @db.Timestamptz
+  nackCode      String?       @map("nack_code")
+  nackReason    String?       @map("nack_reason")
+  // Backend-side cause of FAILED/TIMEOUT (station gone, queue down, ...).
+  failureReason String?       @map("failure_reason")
+  attempts      Int           @default(0)
+
+  machine Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  branch  Branch  @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@index([machineId, status])
+  @@index([machineId, issuedAt])
+  @@index([branchId])
+  @@map("commands")
 }
 
 // --- Reservations & Sessions ---

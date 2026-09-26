@@ -19,6 +19,14 @@ export const envSchema = z.object({
   TELEMETRY_CACHE_TTL_S: z.coerce.number().int().positive().default(30),
   TELEMETRY_HISTORY_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
   TELEMETRY_HISTORY_RETENTION_HOURS: z.coerce.number().positive().default(48),
+  // Station commands. The worker holds its BullMQ job while it waits for the
+  // ack, so the timeout stays well under BullMQ's 30s job lock.
+  COMMAND_ACK_TIMEOUT_MS: z.coerce.number().int().positive().max(25_000).default(10_000),
+  COMMAND_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(5).default(2),
+  COMMAND_RETRY_BACKOFF_MS: z.coerce.number().int().nonnegative().default(1_000),
+  // Final status of a command whose station has no live socket at send time.
+  COMMAND_OFFLINE_STATUS: z.enum(['TIMEOUT', 'FAILED']).default('FAILED'),
+  BULLMQ_PREFIX: z.string().min(1).default('bull'),
 });
 
 export type EnvConfig = z.infer<typeof envSchema>;

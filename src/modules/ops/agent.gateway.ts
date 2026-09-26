@@ -21,10 +21,27 @@ import {
 } from '../station/schemas/presence.schemas.js';
 import { PresenceService, UnknownStationError } from '../station/services/presence.service.js';
 import { DashboardGateway } from './dashboard.gateway.js';
+import {
+  commandAckPayloadSchema,
+  commandNackPayloadSchema,
+  type CommandSimulation,
+  type StationCommandType,
+} from './schemas/command.schemas.js';
 import { deviceEventPayloadSchema, telemetryPayloadSchema } from './schemas/telemetry.schemas.js';
+import { CommandsService } from './services/commands.service.js';
 import { TelemetryService } from './services/telemetry.service.js';
 
 const HANDSHAKE_TIMEOUT_MS = 10_000;
+
+/** `simulate: 'stale_ts'` backdates the frame well past any replay window. */
+const SIMULATED_STALE_MS = 10 * 60_000;
+
+/** No live, handshaken socket for the station at send time. */
+export class StationNotConnectedError extends Error {
+  constructor(serialNumber: string) {
+    super(`station ${serialNumber} is not connected`);
+  }
+}
 
 /**
  * The agent stamps these from its TelemetryService's own sequence counter,
@@ -71,6 +88,7 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     private readonly presence: PresenceService,
     private readonly dashboard: DashboardGateway,
     private readonly telemetry: TelemetryService,
+    private readonly commands: CommandsService,
   ) {}
 
   onModuleInit(): void {
@@ -178,6 +196,12 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
         case AGENT_MESSAGE_TYPES.DEVICE_EVENT:
           await this.onDeviceEvent(conn.serialNumber, envelope);
           return;
+        case AGENT_MESSAGE_TYPES.COMMAND_ACK:
+          await this.onCommandAck(conn.serialNumber, envelope);
+          return;
+        case AGENT_MESSAGE_TYPES.COMMAND_NACK:
+          await this.onCommandNack(conn.serialNumber, envelope);
+          return;
         default:
           this.logger.debug(`ignored unhandled frame type '${envelope.type}' from ${conn.serialNumber}`);
       }
@@ -277,10 +301,66 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     await this.telemetry.onDeviceEvent(serialNumber, parsed.data);
   }
 
+  private async onCommandAck(serialNumber: string, envelope: Envelope): Promise<void> {
+    const parsed = commandAckPayloadSchema.safeParse(envelope.payload);
+    if (!parsed.success) {
+      this.logger.warn(`malformed command_ack payload from ${serialNumber}`);
+      return;
+    }
+    await this.commands.onAgentReply(serialNumber, parsed.data.commandId, { kind: 'ack' });
+  }
+
+  private async onCommandNack(serialNumber: string, envelope: Envelope): Promise<void> {
+    const parsed = commandNackPayloadSchema.safeParse(envelope.payload);
+    if (!parsed.success) {
+      this.logger.warn(`malformed command_nack payload from ${serialNumber}`);
+      return;
+    }
+    const { commandId, code, reason } = parsed.data;
+    this.logger.warn(`command_nack ${code} for ${commandId} from ${serialNumber}${reason ? `: ${reason}` : ''}`);
+    await this.commands.onAgentReply(serialNumber, commandId, { kind: 'nack', code, reason: reason ?? null });
+  }
+
+  isConnected(serialNumber: string): boolean {
+    return this.registry.get(serialNumber)?.readyState === WebSocket.OPEN;
+  }
+
+  /**
+   * Delivers a command on the station's live socket. The envelope type is the
+   * command name and its id is the commandId (same id on every resend); seq
+   * and ts are stamped here, at send time, by that connection's sequencer,
+   * because the agent's ReplayGuard nacks anything stale or out of order.
+   */
+  async sendCommand(
+    serialNumber: string,
+    type: StationCommandType,
+    commandId: string,
+    payload: Record<string, unknown> = {},
+    simulate?: CommandSimulation,
+  ): Promise<void> {
+    const socket = this.registry.get(serialNumber);
+    const conn = socket && this.connections.get(socket);
+    if (!socket || !conn || conn.serialNumber !== serialNumber || socket.readyState !== WebSocket.OPEN) {
+      throw new StationNotConnectedError(serialNumber);
+    }
+
+    const envelope = conn.outbound.next(type, payload, commandId);
+    if (simulate === 'stale_ts') envelope.ts = new Date(Date.now() - SIMULATED_STALE_MS).toISOString();
+    await sendFrame(socket, makeFrame(envelope));
+
+    if (simulate === 'duplicate_send') {
+      await sendFrame(socket, makeFrame(conn.outbound.next(type, payload, commandId)));
+    }
+  }
+
   private send(socket: WebSocket, conn: AgentConnection, type: string, payload: unknown): void {
     if (socket.readyState !== WebSocket.OPEN) return;
     socket.send(makeFrame(conn.outbound.next(type, payload)));
   }
+}
+
+function sendFrame(socket: WebSocket, frame: string): Promise<void> {
+  return new Promise((resolve, reject) => socket.send(frame, (err) => (err ? reject(err) : resolve())));
 }
 
 /** Caddy terminates TLS in front of us, so prefer the proxy's client-IP headers. */

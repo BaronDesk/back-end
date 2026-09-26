@@ -14,13 +14,15 @@ export function parseFrame(raw: string | Buffer): Envelope {
 /**
  * Per-connection stamper for server-to-agent frames. The agent's replay guard
  * rejects any seq <= the last one it accepted (starting from 0), so the first
- * frame goes out as seq 1 and every frame gets a fresh id and ts.
+ * frame goes out as seq 1 and every frame gets a fresh ts. The id is fresh
+ * too, unless the caller passes one: commands reuse their commandId on every
+ * resend because the agent keys idempotency off it.
  */
 export class OutboundSequencer {
   private seq = 0;
 
-  next<T>(type: string, payload?: T): OutboundEnvelope<T> {
+  next<T>(type: string, payload?: T, id: string = randomUUID()): OutboundEnvelope<T> {
     this.seq += 1;
-    return { type, id: randomUUID(), ts: new Date().toISOString(), seq: this.seq, payload };
+    return { type, id, ts: new Date().toISOString(), seq: this.seq, payload };
   }
 }

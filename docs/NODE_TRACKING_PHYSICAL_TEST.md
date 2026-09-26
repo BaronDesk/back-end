@@ -252,6 +252,48 @@ Start the agent again, or reconnect the network. The agent reconnects with backo
 
 ---
 
+## 4C. Station commands: LOCK, UNLOCK, SHUTDOWN
+
+The `migrate` service applies `prisma/migrations/20260926180000_station_commands`. Keep the
+monitor running: its COMMANDS pane shows every command live (`command_update`), with type,
+status, attempts, age and any nack code or failure reason.
+
+Issue commands from another terminal with the same token. The `cmd` mode posts the
+command, then polls it until it reaches a final status:
+
+```powershell
+npm run monitor -- cmd LOCK <serial>
+```
+
+The same call over plain HTTP:
+
+```powershell
+$station = (Invoke-RestMethod http://localhost:3000/api/v1/stations -Headers $h) |
+  Where-Object serialNumber -eq '<serial>'
+$cmd = Invoke-RestMethod -Method Post -Uri "http://localhost:3000/api/v1/stations/$($station.id)/commands" `
+  -Headers $h -ContentType 'application/json' -Body '{"type":"LOCK"}'
+Invoke-RestMethod "http://localhost:3000/api/v1/commands/$($cmd.commandId)" -Headers $h
+```
+
+| Case | Do | Expect |
+|---|---|---|
+| a. LOCK | `cmd LOCK <serial>` | The station locks. Status goes `PENDING -> SENT -> ACKED`, attempts 1. |
+| b. UNLOCK | `cmd UNLOCK <serial>` | The station unlocks. Status `ACKED`. |
+| c. Offline station | Stop the agent, wait for OFFLINE, then `cmd LOCK <serial>` | `409 STATION_OFFLINE`. No command row is created. |
+| d. Stale send | `cmd LOCK <serial> stale_ts` | The backend backdates `ts` by 10 minutes. The agent logs `Stale message rejected` and nacks. Status `NACKED`, detail `STALE`. The station does not lock. |
+| e. SHUTDOWN | `cmd SHUTDOWN <serial>` with the hq-admin token (manager+ only, staff get 403) | `ACKED` first. Then the PC powers off and the station goes OFFLINE. The command stays `ACKED`. |
+| f. Idempotency | `cmd LOCK <serial> duplicate_send` | The agent gets the same command id twice, each with a fresh seq and ts. Agent log: `Command <id> was previously processed. Re-acknowledging idempotently.` The station locks once. Status `ACKED`. |
+
+`stale_ts` and `duplicate_send` are dev-only. The backend rejects them with 400 when
+`NODE_ENV=production`.
+
+A retry after an ack timeout (10s by default, `COMMAND_ACK_TIMEOUT_MS`) reuses the same
+command id. To see a real retry, block the agent for more than 10s after it receives the
+command. The row then shows `attempts 2`. If no ack arrives at all, the final status is
+`TIMEOUT`.
+
+---
+
 ## 5. Troubleshooting
 
 | Symptom | Likely cause and fix |

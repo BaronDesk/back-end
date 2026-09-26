@@ -1,15 +1,22 @@
 // TEMPORARY DEV MONITOR — delete before merge
 //
-// Live view of station presence, telemetry and alerts, fed by
-// `station_status`, `telemetry_update`, `alert` and `alert_resolved` on
-// /dashboard-io. Standalone on purpose: no imports from src/.
+// Live view of station presence, telemetry, alerts and commands, fed by
+// `station_status`, `telemetry_update`, `alert`, `alert_resolved` and
+// `command_update` on /dashboard-io. Standalone on purpose: no imports from src/.
 //
 //   TOKEN=<staff access token> npm run monitor
 //   URL defaults to http://localhost:3000 (dev compose exposes Nest directly).
 //   CPU_TEMP_THRESHOLD_C / GPU_TEMP_THRESHOLD_C default to 85 / 90, like the backend.
+//
+// Issue a command (POST /api/v1/stations/:id/commands), then poll it to a
+// final status. <station> is a serial number or MACHINE id. SHUTDOWN needs a
+// manager+ token. [simulate] is dev-only: stale_ts | duplicate_send.
+//
+//   TOKEN=... npm run monitor -- cmd LOCK <station> [simulate]
 import { io } from 'socket.io-client';
 
 interface StationRow {
+  id?: string;
   serialNumber: string;
   name?: string | null;
   status: string;
@@ -23,6 +30,19 @@ interface TelemetryUpdate {
   timestamp: string;
   receivedAt: string;
   metrics: Record<string, number>;
+}
+
+interface CommandEvent {
+  commandId: string;
+  machineId: string;
+  type: string;
+  status: string;
+  issuedAt: string;
+  resolvedAt: string | null;
+  attempts: number;
+  nackCode: string | null;
+  nackReason: string | null;
+  failureReason: string | null;
 }
 
 interface AlertEvent {
@@ -54,6 +74,7 @@ const RESET = '\x1b[0m';
 const rows = new Map<string, StationRow>();
 const telemetry = new Map<string, TelemetryUpdate>();
 const alerts: string[] = [];
+const commands = new Map<string, CommandEvent>();
 const log: string[] = [];
 let connection = 'connecting...';
 
@@ -135,6 +156,39 @@ function alertLine(a: AlertEvent): string {
   return `${pad(time(a.createdAt), 11)} ${pad(a.serialNumber ?? '-', 24)} ${cell(a.category, 11, color)} ${pad(a.type, 20)} ${detail}  ${DIM}${a.id.slice(0, 8)}${RESET}`;
 }
 
+const COMMAND_COLOR: Record<string, string> = {
+  PENDING: DIM,
+  SENT: YELLOW,
+  ACKED: GREEN,
+  NACKED: RED,
+  TIMEOUT: RED,
+  FAILED: RED,
+};
+
+function serialOf(machineId: string): string {
+  return [...rows.values()].find((r) => r.id === machineId)?.serialNumber ?? machineId.slice(0, 8);
+}
+
+function renderCommands(): string[] {
+  const header = `${pad('ISSUED', 11)} ${pad('SERIAL', 24)} ${pad('TYPE', 9)} ${pad('STATUS', 8)} ${pad('TRIES', 5)} ${pad('AGE', 12)} DETAIL`;
+  const lines = [...commands.values()]
+    .sort((a, b) => a.issuedAt.localeCompare(b.issuedAt))
+    .slice(-10)
+    .map((c) => {
+      const detail = c.nackCode ? `${c.nackCode}${c.nackReason ? `: ${c.nackReason}` : ''}` : (c.failureReason ?? '');
+      return [
+        pad(time(c.issuedAt), 11),
+        pad(serialOf(c.machineId), 24),
+        pad(c.type, 9),
+        cell(c.status, 8, COMMAND_COLOR[c.status]),
+        pad(String(c.attempts), 5),
+        pad(relative(c.issuedAt), 12),
+        `${detail}  ${DIM}${c.commandId.slice(0, 8)}${RESET}`,
+      ].join(' ');
+    });
+  return [header, '-'.repeat(header.length + 12), ...(lines.length ? lines : [`${DIM}(no commands)${RESET}`])];
+}
+
 function render(): void {
   console.clear();
   console.log(`node monitor  ${DIM}${URL}  [${connection}]  thresholds CPU>${CPU_MAX} GPU>${GPU_MAX}${RESET}\n`);
@@ -143,6 +197,8 @@ function render(): void {
   const alertHeader = `${pad('TIME', 11)} ${pad('SERIAL', 24)} ${pad('CATEGORY', 11)} ${pad('TYPE', 20)} DETAIL`;
   console.log(`\nALERTS\n${alertHeader}\n${'-'.repeat(alertHeader.length + 20)}`);
   console.log(alerts.length ? alerts.slice(-10).join('\n') : `${DIM}(no alerts)${RESET}`);
+  console.log(`\nCOMMANDS  ${DIM}(issue: npm run monitor -- cmd LOCK|UNLOCK|SHUTDOWN <serial>)${RESET}`);
+  console.log(renderCommands().join('\n'));
   console.log(`\n${DIM}recent events:${RESET}`);
   console.log(log.slice(-6).join('\n'));
 }
@@ -166,6 +222,54 @@ async function seed(): Promise<void> {
   const open = (await get<AlertEvent[]>('/api/v1/alerts?status=open&limit=10')) ?? [];
   alerts.length = 0;
   for (const a of open.reverse()) alerts.push(alertLine(a));
+  for (const station of rows.values()) {
+    if (!station.id) continue;
+    for (const c of (await get<CommandEvent[]>(`/api/v1/stations/${station.id}/commands?limit=5`)) ?? []) {
+      commands.set(c.commandId, c);
+    }
+  }
+}
+
+const FINAL = new Set(['ACKED', 'NACKED', 'TIMEOUT', 'FAILED']);
+
+/** `cmd` mode: POST a command, then poll GET /commands/:id until it settles. */
+async function issueCommand(type: string | undefined, target: string | undefined, simulate: string | undefined) {
+  if (!type || !target) {
+    console.error('usage: npm run monitor -- cmd LOCK|UNLOCK|SHUTDOWN <serial|machineId> [stale_ts|duplicate_send]');
+    process.exit(1);
+  }
+  const stations = (await get<StationRow[]>('/api/v1/stations')) ?? [];
+  const station = stations.find((s) => s.serialNumber === target || s.id === target);
+  if (!station?.id) {
+    console.error(`no station '${target}'. known: ${stations.map((s) => s.serialNumber).join(', ') || '(none)'}`);
+    process.exit(1);
+  }
+
+  const res = await fetch(`${URL}/api/v1/stations/${station.id}/commands`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: type.toUpperCase(), ...(simulate ? { simulate } : {}) }),
+  });
+  const body = (await res.json()) as CommandEvent;
+  console.log(`POST ${type.toUpperCase()} ${station.serialNumber} -> ${res.status} ${JSON.stringify(body)}`);
+  if (!res.ok) process.exit(1);
+
+  let last = body.status;
+  const deadline = Date.now() + 30_000;
+  while (!FINAL.has(last) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 300));
+    const current = await get<CommandEvent>(`/api/v1/commands/${body.commandId}`);
+    if (current && current.status !== last) {
+      last = current.status;
+      const extra = current.nackCode ?? current.failureReason ?? '';
+      console.log(`${new Date().toLocaleTimeString()}  ${body.commandId} -> ${last} (attempts ${current.attempts}) ${extra}`);
+    }
+  }
+  process.exit(FINAL.has(last) ? 0 : 2);
+}
+
+if (process.argv[2] === 'cmd') {
+  await issueCommand(process.argv[3], process.argv[4], process.argv[5]);
 }
 
 const socket = io(URL, { path: '/dashboard-io', auth: { token: TOKEN }, transports: ['websocket'] });
@@ -194,6 +298,15 @@ socket.on('telemetry_update', (event: TelemetryUpdate) => {
 socket.on('alert', (event: AlertEvent) => {
   alerts.push(alertLine(event));
   log.push(`${new Date().toLocaleTimeString()}  ALERT ${event.category}/${event.type} on ${event.serialNumber ?? '?'}`);
+  render();
+});
+socket.on('command_update', (event: CommandEvent) => {
+  const previous = commands.get(event.commandId)?.status;
+  commands.set(event.commandId, event);
+  if (previous !== event.status) {
+    const extra = event.nackCode ?? event.failureReason ?? '';
+    log.push(`${new Date().toLocaleTimeString()}  ${event.type} on ${serialOf(event.machineId)} -> ${event.status} ${extra}`);
+  }
   render();
 });
 socket.on('alert_resolved', (event: AlertEvent) => {

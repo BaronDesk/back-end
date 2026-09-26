@@ -185,6 +185,10 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
       : null;
   }
 
+  isOnline(serialNumber: string): boolean {
+    return this.states.get(serialNumber)?.status === 'ONLINE';
+  }
+
   onlineStations(): StationRef[] {
     return [...this.states.values()].filter((s) => s.status === 'ONLINE').map(toRef);
   }
