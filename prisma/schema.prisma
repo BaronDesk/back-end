@@ -30,6 +30,11 @@ enum MachineEnrollmentStatus {
   DEACTIVATED
 }
 
+enum MachineStatus {
+  ONLINE
+  OFFLINE
+}
+
 enum TransactionType {
   PAYMENT
   REFUND
@@ -78,14 +83,10 @@ enum SubscriptionStatus {
   PENDING
 }
 
-enum TelemetryAlertType {
-  CPU_USAGE
-  MEMORY_USAGE
-  DISK_SPACE
-  NETWORK_ERROR
-  HARDWARE_FAILURE
-  TEMPERATURE_WARNING
-  CONNECTION_LOST
+enum AlertCategory {
+  HARDWARE
+  ANTI_THEFT
+  SECURITY_VIOLATION
 }
 
 enum AlertSeverity {
@@ -93,6 +94,23 @@ enum AlertSeverity {
   MEDIUM
   HIGH
   CRITICAL
+}
+
+enum CommandType {
+  LOCK
+  UNLOCK
+  SHUTDOWN
+  LAUNCH_GAME
+  END_SESSION
+}
+
+enum CommandStatus {
+  PENDING
+  SENT
+  ACKED
+  NACKED
+  TIMEOUT
+  FAILED
 }
 
 enum AuditAction {
@@ -134,6 +152,8 @@ model Branch {
   pricing           Pricing[]
   employeeProfiles  EmployeeProfile[]
   machines          Machine[]
+  telemetryAlerts   TelemetryAlert[]
+  commands          Command[]
 
   @@index([name])
   @@map("branches")
@@ -279,6 +299,10 @@ model Machine {
   branchId         String                  @map("branch_id") @db.Uuid
   agentPublicKey   String                  @map("agent_public_key")
   enrollmentStatus MachineEnrollmentStatus @default(PENDING) @map("enrollment_status")
+  name             String?
+  status           MachineStatus           @default(OFFLINE)
+  lastSeen         DateTime?               @map("last_seen") @db.Timestamptz
+  ipAddress        String?                 @map("ip_address")
   createdAt        DateTime                @default(now()) @map("created_at") @db.Timestamptz
   updatedAt        DateTime                @updatedAt @map("updated_at") @db.Timestamptz
 
@@ -287,25 +311,33 @@ model Machine {
   nodeTelemetry   NodeTelemetry[]
   telemetryAlerts TelemetryAlert[]
   reservations    Reservation[]
+  commands        Command[]
 
   @@index([branchId])
   @@index([serialNumber])
   @@index([enrollmentStatus])
+  @@index([status])
   @@map("machines")
 }
 
+// Backend-side game catalog. The agent never reads it: LAUNCH_GAME sends
+// `launchRef` as its opaque `gameId`, so launchRef is whatever the station's
+// launcher keys on.
 model Game {
-  id             String @id @default(uuid()) @db.Uuid
-  title          String @unique
-  executablePath String @map("executable_path")
-  genre          String
-  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  slug      String   @unique
+  launchRef String   @map("launch_ref")
+  iconUrl   String?  @map("icon_url")
+  enabled   Boolean  @default(true)
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
 
   machineGames MachineGame[]
+  commands     Command[]
 
-  @@index([title])
-  @@index([genre])
+  @@index([enabled, sortOrder])
   @@map("games")
 }
 
@@ -327,39 +359,76 @@ model MachineGame {
 // --- Telemetry ---
 
 model NodeTelemetry {
-  id        String   @id @default(uuid()) @db.Uuid
-  machineId String   @map("machine_id") @db.Uuid
-  metric    String
-  value     Decimal  @db.Decimal(15, 4)
-  sampledAt DateTime @map("sampled_at") @db.Timestamptz
+  id         String   @id @default(uuid()) @db.Uuid
+  machineId  String   @map("machine_id") @db.Uuid
+  metrics    Json
+  recordedAt DateTime @map("recorded_at") @db.Timestamptz
 
   machine Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
 
   @@index([machineId])
-  @@index([metric])
-  @@index([sampledAt])
+  @@index([recordedAt])
   @@map("node_telemetry")
 }
 
 model TelemetryAlert {
-  id                   String          @id @default(uuid()) @db.Uuid
-  machineId            String          @map("machine_id") @db.Uuid
-  type                 TelemetryAlertType
-  severity             AlertSeverity
-  acknowledged         Boolean         @default(false)
-  acknowledgedByUserId String?         @map("acknowledged_by_user_id") @db.Uuid
-  createdAt            DateTime        @default(now()) @map("created_at") @db.Timestamptz
-  acknowledgedAt       DateTime?       @map("acknowledged_at") @db.Timestamptz
+  id                   String        @id @default(uuid()) @db.Uuid
+  machineId            String        @map("machine_id") @db.Uuid
+  branchId             String?       @map("branch_id") @db.Uuid
+  category             AlertCategory
+  type                 String
+  value                Json?
+  severity             AlertSeverity @default(MEDIUM)
+  acknowledged         Boolean       @default(false)
+  acknowledgedByUserId String?       @map("acknowledged_by_user_id") @db.Uuid
+  createdAt            DateTime      @default(now()) @map("created_at") @db.Timestamptz
+  acknowledgedAt       DateTime?     @map("acknowledged_at") @db.Timestamptz
 
   machine            Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  branch             Branch? @relation(fields: [branchId], references: [id], onDelete: SetNull)
   acknowledgedByUser User?   @relation(fields: [acknowledgedByUserId], references: [id], onDelete: SetNull)
 
   @@index([machineId])
+  @@index([branchId])
+  @@index([category])
   @@index([type])
   @@index([severity])
   @@index([acknowledged])
   @@index([createdAt])
   @@map("telemetry_alerts")
+}
+
+// --- Station Commands ---
+
+// One staff-issued control command. `id` doubles as the wire envelope id, so
+// every resend of the same command carries the same id (agent idempotency).
+// `issuedBy` has no FK on purpose: the history outlives the user row.
+model Command {
+  id            String        @id @db.Uuid
+  machineId     String        @map("machine_id") @db.Uuid
+  branchId      String        @map("branch_id") @db.Uuid
+  type          CommandType
+  status        CommandStatus @default(PENDING)
+  issuedBy      String        @map("issued_by") @db.Uuid
+  issuedAt      DateTime      @default(now()) @map("issued_at") @db.Timestamptz
+  sentAt        DateTime?     @map("sent_at") @db.Timestamptz
+  resolvedAt    DateTime?     @map("resolved_at") @db.Timestamptz
+  nackCode      String?       @map("nack_code")
+  nackReason    String?       @map("nack_reason")
+  // Backend-side cause of FAILED/TIMEOUT (station gone, queue down, ...).
+  failureReason String?       @map("failure_reason")
+  attempts      Int           @default(0)
+  // LAUNCH_GAME only: the catalog entry whose launchRef went on the wire.
+  gameId        String?       @map("game_id") @db.Uuid
+
+  machine Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  branch  Branch  @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  game    Game?   @relation(fields: [gameId], references: [id], onDelete: SetNull)
+
+  @@index([machineId, status])
+  @@index([machineId, issuedAt])
+  @@index([branchId])
+  @@map("commands")
 }
 
 // --- Reservations & Sessions ---
