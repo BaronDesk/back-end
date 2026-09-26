@@ -43,8 +43,15 @@ export const OPEN_STATUSES: CommandStatus[] = ['PENDING', 'SENT'];
  */
 const REPLY_FROM: CommandStatus[] = ['PENDING', 'SENT', 'TIMEOUT'];
 
-/** Deterministic nacks: a resend would get the same answer, so they end as FAILED. */
-const DETERMINISTIC_NACKS: ReadonlySet<string> = new Set([NACK_CODES.UNKNOWN_TYPE, NACK_CODES.INVALID_PAYLOAD]);
+/**
+ * Nacks that end the command as FAILED. No nack is ever retried:
+ * - UNKNOWN_TYPE is deterministic.
+ * - EXEC_FAILED is a real handler failure. A resend with the same commandId
+ *   only hits the agent's idempotency re-ack (a false success); a new
+ *   commandId could run it twice.
+ * STALE (and any code a newer agent adds) ends as NACKED.
+ */
+const FAILED_NACKS: ReadonlySet<string> = new Set([NACK_CODES.UNKNOWN_TYPE, NACK_CODES.EXEC_FAILED]);
 
 /** API and `command_update` shape of a command. */
 export function toCommandDto(command: Command) {
@@ -113,7 +120,9 @@ export class CommandsService {
     this.publish(row);
 
     try {
-      await this.enqueue({ commandId: row.id, simulate: body.simulate });
+      // TODO(sessions): the booking flow (Member B) will build `payload` from
+      // the reservation instead of taking it from the request body.
+      await this.enqueue({ commandId: row.id, payload: body.payload, simulate: body.simulate });
     } catch (err) {
       const reason = `enqueue failed: ${(err as Error).message}`;
       this.logger.error(`${row.type} ${row.id}: ${reason}`);
@@ -136,7 +145,14 @@ export class CommandsService {
     return toCommandDto(row);
   }
 
-  /** command_ack / command_nack from the gateway. Never throws past a log line. */
+  /**
+   * command_ack / command_nack from the gateway. Never throws past a log line.
+   *
+   * An ack means "accepted", not "done": a booking UNLOCK is acked while the
+   * station stays locked until the PIN is typed. Nothing here touches lock
+   * state. The station's locked flag comes only from presence (heartbeat /
+   * state_report).
+   */
   async onAgentReply(serialNumber: string, commandId: string, reply: Exclude<CommandReply, { kind: 'timeout' }>) {
     const row = await this.repo.findById(commandId);
     const station = this.presence.resolve(serialNumber);
@@ -150,7 +166,7 @@ export class CommandsService {
       reply.kind === 'ack'
         ? { status: 'ACKED', resolvedAt: now }
         : {
-            status: DETERMINISTIC_NACKS.has(reply.code) ? 'FAILED' : 'NACKED',
+            status: FAILED_NACKS.has(reply.code) ? 'FAILED' : 'NACKED',
             resolvedAt: now,
             nackCode: reply.code,
             nackReason: reply.reason,
@@ -218,8 +234,10 @@ export class CommandsService {
           jobId: data.commandId,
           attempts: Number(this.config.get('COMMAND_MAX_ATTEMPTS') ?? 2),
           backoff: { type: 'fixed', delay: Number(this.config.get('COMMAND_RETRY_BACKOFF_MS') ?? 1_000) },
-          removeOnComplete: 1_000,
-          removeOnFail: 1_000,
+          // Drop finished jobs: a booking UNLOCK's job data holds the PIN.
+          // The COMMAND row is the record of the outcome.
+          removeOnComplete: true,
+          removeOnFail: true,
         }),
         timeout,
       ]);

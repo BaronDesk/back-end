@@ -16,8 +16,9 @@ class RetryableCommandError extends Error {}
  * Delivers one command per job and holds the job until the agent answers or
  * the ack timeout fires. Retries only on timeout or a failed socket write,
  * and every retry resends the same commandId: the agent re-acks a command it
- * already ran instead of running it twice. Every other outcome is final and
- * returns normally, so BullMQ never retries it.
+ * already ran instead of running it twice. Every nack (UNKNOWN_TYPE,
+ * EXEC_FAILED, STALE) and every other outcome is final and returns normally,
+ * so BullMQ never retries it.
  */
 @Processor(COMMAND_QUEUE, { concurrency: 16 })
 export class CommandProcessor extends WorkerHost {
@@ -38,7 +39,7 @@ export class CommandProcessor extends WorkerHost {
   }
 
   async process(job: Job<CommandJobData>): Promise<void> {
-    const { commandId, simulate } = job.data;
+    const { commandId, payload, simulate } = job.data;
     const command = await this.commands.findById(commandId);
     if (!command || !OPEN_STATUSES.includes(command.status)) return;
 
@@ -62,7 +63,7 @@ export class CommandProcessor extends WorkerHost {
 
     const reply = this.tracker.expect(commandId, this.ackTimeoutMs);
     try {
-      await this.gateway.sendCommand(station.serialNumber, command.type, commandId, {}, simulate);
+      await this.gateway.sendCommand(station.serialNumber, command.type, commandId, payload ?? {}, simulate);
     } catch (err) {
       this.tracker.settle(commandId, { kind: 'timeout' });
       if (err instanceof StationNotConnectedError) {

@@ -6,6 +6,7 @@ import type { Subscription } from 'rxjs';
 import { WebSocketServer, WebSocket } from 'ws';
 
 import {
+  AGENT_COMMANDS,
   AGENT_MESSAGE_TYPES,
   DASHBOARD_EVENTS,
   SERVER_MESSAGE_TYPES,
@@ -344,7 +345,9 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
       throw new StationNotConnectedError(serialNumber);
     }
 
-    const envelope = conn.outbound.next(type, payload, commandId);
+    // exec_failed: an allowed type whose handler rejects an empty payload.
+    const wireType = simulate === 'exec_failed' ? AGENT_COMMANDS.LAUNCH_GAME : type;
+    const envelope = conn.outbound.next(wireType, simulate === 'exec_failed' ? {} : payload, commandId);
     if (simulate === 'stale_ts') envelope.ts = new Date(Date.now() - SIMULATED_STALE_MS).toISOString();
     await sendFrame(socket, makeFrame(envelope));
 

@@ -6,6 +6,7 @@ import { StationNotConnectedError } from '../agent.gateway.js';
 import { CommandAckTracker } from './command-ack-tracker.js';
 import { CommandProcessor } from './command.processor.js';
 import { CommandsService } from './commands.service.js';
+import { issueCommandBodySchema } from '../schemas/command.schemas.js';
 
 const STATION = { machineId: 'm1', branchId: 'b1', serialNumber: 'SN-1' };
 
@@ -109,15 +110,30 @@ describe('CommandsService', () => {
     await expect(waiting).resolves.toEqual({ kind: 'ack' });
   });
 
-  it('records STALE as NACKED but deterministic nacks as FAILED', async () => {
+  it('records STALE as NACKED, and UNKNOWN_TYPE / EXEC_FAILED as FAILED with their reason', async () => {
     await service.onAgentReply('SN-1', 'c1', { kind: 'nack', code: 'STALE', reason: 'drift' });
     expect(repo.transition).toHaveBeenLastCalledWith(
       'c1',
       expect.any(Array),
       expect.objectContaining({ status: 'NACKED', nackCode: 'STALE', nackReason: 'drift' }),
     );
-    await service.onAgentReply('SN-1', 'c1', { kind: 'nack', code: 'INVALID_PAYLOAD', reason: null });
+    await service.onAgentReply('SN-1', 'c1', { kind: 'nack', code: 'EXEC_FAILED', reason: 'Game ID is required.' });
+    expect(repo.transition).toHaveBeenLastCalledWith(
+      'c1',
+      expect.any(Array),
+      expect.objectContaining({ status: 'FAILED', nackCode: 'EXEC_FAILED', nackReason: 'Game ID is required.' }),
+    );
+    await service.onAgentReply('SN-1', 'c1', { kind: 'nack', code: 'UNKNOWN_TYPE', reason: null });
     expect(repo.transition).toHaveBeenLastCalledWith('c1', expect.any(Array), expect.objectContaining({ status: 'FAILED' }));
+  });
+
+  it('queues the booking-unlock payload with the job', async () => {
+    const payload = { sessionId: '7b0e7a57-2c4e-4d4f-9d5f-0e7c6a1f1a11', pin: '4821' };
+    const dto = await service.issue(caller(), 'm1', { type: 'UNLOCK', payload });
+    expect(queue.add).toHaveBeenCalledWith('dispatch', expect.objectContaining({ commandId: dto.commandId, payload }), expect.anything());
+    // The PIN never reaches the row or the dashboard push.
+    expect(JSON.stringify(dto)).not.toContain('4821');
+    expect(JSON.stringify(dashboard.publishToBranch.mock.calls)).not.toContain('4821');
   });
 
   it("ignores a reply for another station's command", async () => {
@@ -196,5 +212,27 @@ describe('CommandProcessor', () => {
     await expect(processor.process(job(0))).rejects.toThrow('EPIPE');
     await processor.process(job(1));
     expect(commands.fail).toHaveBeenCalledWith('c1', 'send failed: EPIPE');
+  });
+});
+
+describe('issueCommandBodySchema', () => {
+  const sessionId = '7b0e7a57-2c4e-4d4f-9d5f-0e7c6a1f1a11';
+
+  it('treats no payload and {} as the direct (admin) unlock', () => {
+    expect(issueCommandBodySchema.parse({ type: 'UNLOCK' }).payload).toBeUndefined();
+    expect(issueCommandBodySchema.parse({ type: 'UNLOCK', payload: {} }).payload).toBeUndefined();
+  });
+
+  it('accepts a full booking payload for UNLOCK', () => {
+    expect(issueCommandBodySchema.parse({ type: 'UNLOCK', payload: { sessionId, pin: '4821' } }).payload).toEqual({
+      sessionId,
+      pin: '4821',
+    });
+  });
+
+  it('rejects a partial booking payload, a non-uuid session, and a payload on other types', () => {
+    expect(issueCommandBodySchema.safeParse({ type: 'UNLOCK', payload: { pin: '4821' } }).success).toBe(false);
+    expect(issueCommandBodySchema.safeParse({ type: 'UNLOCK', payload: { sessionId: 'x', pin: '1' } }).success).toBe(false);
+    expect(issueCommandBodySchema.safeParse({ type: 'LOCK', payload: { sessionId, pin: '1' } }).success).toBe(false);
   });
 });

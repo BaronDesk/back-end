@@ -275,17 +275,27 @@ $cmd = Invoke-RestMethod -Method Post -Uri "http://localhost:3000/api/v1/station
 Invoke-RestMethod "http://localhost:3000/api/v1/commands/$($cmd.commandId)" -Headers $h
 ```
 
+The agent starts **locked** (fail-closed), so run the cases in this order. `ACKED` means
+the agent **accepted** the command, not that it finished. The station's lock state is
+the monitor's LOCKED column, which comes from the agent's heartbeat (about every 15s),
+never from the command result. `cmd` mode prints it after the command settles.
+
 | Case | Do | Expect |
 |---|---|---|
-| a. LOCK | `cmd LOCK <serial>` | The station locks. Status goes `PENDING -> SENT -> ACKED`, attempts 1. |
-| b. UNLOCK | `cmd UNLOCK <serial>` | The station unlocks. Status `ACKED`. |
-| c. Offline station | Stop the agent, wait for OFFLINE, then `cmd LOCK <serial>` | `409 STATION_OFFLINE`. No command row is created. |
-| d. Stale send | `cmd LOCK <serial> stale_ts` | The backend backdates `ts` by 10 minutes. The agent logs `Stale message rejected` and nacks. Status `NACKED`, detail `STALE`. The station does not lock. |
-| e. SHUTDOWN | `cmd SHUTDOWN <serial>` with the hq-admin token (manager+ only, staff get 403) | `ACKED` first. Then the PC powers off and the station goes OFFLINE. The command stays `ACKED`. |
-| f. Idempotency | `cmd LOCK <serial> duplicate_send` | The agent gets the same command id twice, each with a fresh seq and ts. Agent log: `Command <id> was previously processed. Re-acknowledging idempotently.` The station locks once. Status `ACKED`. |
+| a. Direct UNLOCK | `cmd UNLOCK <serial>` | `ACKED`. Agent log: `Workstation unlocked directly`. Next heartbeat: LOCKED `no`. |
+| b. Booking UNLOCK | `cmd LOCK <serial>`, then `cmd UNLOCK <serial> pin=4821` | `ACKED`, but LOCKED stays `yes`. Agent log: `Workstation remains locked ... PIN entry required on LockUI`. It unlocks only after `4821` is typed on the station's LockUI (needs `BaronDesk.LockUI` running). |
+| c. Handler failure | `cmd LOCK <serial> exec_failed` | The backend sends a LAUNCH_GAME with no gameId under this command id; LOCK/UNLOCK/SHUTDOWN never fail on the agent. Status `FAILED`, detail `EXEC_FAILED: Game ID is required.`, tries `1` (not retried). |
+| d. Stale send | `cmd LOCK <serial> stale_ts` | Agent log: `Stale message rejected`. Status `NACKED`, detail `STALE`, tries `1`. The lock state does not change. |
+| e. Idempotency | `cmd UNLOCK <serial> duplicate_send` while locked | The agent gets the same command id twice, each with a fresh seq and ts. Agent log: one `unlocked directly`, then `Re-acknowledging idempotently`. Status `ACKED`. |
+| f. Offline station | Stop the agent, wait for OFFLINE, then `cmd LOCK <serial>` | `409 STATION_OFFLINE`. No command row is created. |
+| g. SHUTDOWN | `cmd SHUTDOWN <serial>` with the hq-admin token (manager+ only, staff get 403) | `ACKED`. The agent's power-off is still a stub (it only logs `System shutdown requested.`), so stop the agent yourself: the station goes OFFLINE and the command stays `ACKED`. |
 
-`stale_ts` and `duplicate_send` are dev-only. The backend rejects them with 400 when
-`NODE_ENV=production`.
+`stale_ts`, `duplicate_send` and `exec_failed` are dev-only. The backend rejects them
+with 400 when `NODE_ENV=production`.
+
+Nack handling: the agent only sends `UNKNOWN_TYPE`, `STALE` and `EXEC_FAILED`.
+`UNKNOWN_TYPE` and `EXEC_FAILED` end as `FAILED`, `STALE` as `NACKED`, always with the
+agent's `reason`. No nack is retried.
 
 A retry after an ack timeout (10s by default, `COMMAND_ACK_TIMEOUT_MS`) reuses the same
 command id. To see a real retry, block the agent for more than 10s after it receives the

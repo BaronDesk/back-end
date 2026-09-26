@@ -13,9 +13,10 @@ import { REDIS } from '../src/infra/redis/redis.module.js';
 import { makeFrame } from '../src/infra/realtime/frame.js';
 import type { OutboundEnvelope } from '../src/infra/realtime/envelope.js';
 
-const COMMAND_TYPES = new Set(['LOCK', 'UNLOCK', 'SHUTDOWN']);
+const COMMAND_TYPES = new Set(['LOCK', 'UNLOCK', 'SHUTDOWN', 'LAUNCH_GAME']);
 
-type AgentBehaviour = (frame: OutboundEnvelope, n: number) => 'ack' | 'silent';
+type AgentReply = 'ack' | 'silent' | { code: string; reason: string };
+type AgentBehaviour = (frame: OutboundEnvelope, n: number) => AgentReply;
 
 describe('station commands (e2e)', () => {
   let app: NestFastifyApplication;
@@ -92,7 +93,9 @@ describe('station commands (e2e)', () => {
         return;
       }
       lastCommandSeq = frame.seq;
-      if (behaviour(frame, commands.length) === 'ack') send('command_ack', { commandId: frame.id });
+      const reply = behaviour(frame, commands.length);
+      if (reply === 'ack') send('command_ack', { commandId: frame.id });
+      else if (reply !== 'silent') send('command_nack', { commandId: frame.id, ...reply });
     });
     await new Promise((resolve, reject) => {
       socket.on('open', resolve);
@@ -100,7 +103,7 @@ describe('station commands (e2e)', () => {
     });
     send('handshake', { serialNumber });
     await vi.waitFor(() => expect(handshaken).toBe(true));
-    return { machine, socket, commands };
+    return { machine, socket, commands, send };
   }
 
   const issue = (machineId: string, body: Record<string, unknown>, token = staffToken) =>
@@ -161,6 +164,48 @@ describe('station commands (e2e)', () => {
     const agent = await connectAgent();
     const { commandId } = (await issue(agent.machine.id, { type: 'LOCK', simulate: 'stale_ts' })).json();
     await vi.waitFor(async () => expect(await status(commandId)).toMatchObject({ status: 'NACKED', nackCode: 'STALE' }));
+    agent.socket.close();
+  });
+
+  it('records EXEC_FAILED as FAILED with the reason, without retrying', async () => {
+    const agent = await connectAgent(() => ({ code: 'EXEC_FAILED', reason: 'Game ID is required.' }));
+    const { commandId } = (await issue(agent.machine.id, { type: 'LOCK', simulate: 'exec_failed' })).json();
+    await vi.waitFor(async () =>
+      expect(await status(commandId)).toMatchObject({
+        status: 'FAILED',
+        nackCode: 'EXEC_FAILED',
+        nackReason: 'Game ID is required.',
+      }),
+    );
+    expect(agent.commands[0]).toMatchObject({ type: 'LAUNCH_GAME', id: commandId, payload: {} });
+    // Past the ack timeout + backoff: a retry would have shown up by now.
+    await new Promise((r) => setTimeout(r, 1_200));
+    expect(agent.commands).toHaveLength(1);
+    expect((await status(commandId)).attempts).toBe(1);
+    agent.socket.close();
+  });
+
+  it('acks a booking UNLOCK without reporting the station unlocked', async () => {
+    const agent = await connectAgent();
+    agent.send('heartbeat', { locked: true, sessionId: null });
+    const payload = { sessionId: randomUUID(), pin: '4821' };
+    const res = await issue(agent.machine.id, { type: 'UNLOCK', payload });
+    expect(res.statusCode).toBe(202);
+    expect(res.body).not.toContain('4821');
+    const { commandId } = res.json();
+
+    await vi.waitFor(async () => expect((await status(commandId)).status).toBe('ACKED'));
+    expect(agent.commands[0]).toMatchObject({ type: 'UNLOCK', id: commandId, payload });
+
+    // The agent stays locked until the PIN is typed; lock state follows its heartbeat.
+    agent.send('heartbeat', { locked: true, sessionId: payload.sessionId });
+    await new Promise((r) => setTimeout(r, 200));
+    const station = await app.inject({ method: 'GET', url: `/api/v1/stations/${agent.machine.id}`, headers: auth() });
+    expect(station.json().locked).toBe(true);
+
+    // A payload is UNLOCK-only, and a booking payload must be complete.
+    expect((await issue(agent.machine.id, { type: 'LOCK', payload })).statusCode).toBe(400);
+    expect((await issue(agent.machine.id, { type: 'UNLOCK', payload: { pin: '1' } })).statusCode).toBe(400);
     agent.socket.close();
   });
 

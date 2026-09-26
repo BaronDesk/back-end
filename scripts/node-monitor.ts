@@ -10,9 +10,13 @@
 //
 // Issue a command (POST /api/v1/stations/:id/commands), then poll it to a
 // final status. <station> is a serial number or MACHINE id. SHUTDOWN needs a
-// manager+ token. [simulate] is dev-only: stale_ts | duplicate_send.
+// manager+ token. Options, in any order:
+//   pin=<pin> [session=<uuid>]   UNLOCK only: booking unlock (station stays locked
+//                                until the PIN is typed on its LockUI). session
+//                                defaults to a random uuid.
+//   stale_ts | duplicate_send | exec_failed   dev-only fault injection.
 //
-//   TOKEN=... npm run monitor -- cmd LOCK <station> [simulate]
+//   TOKEN=... npm run monitor -- cmd LOCK <station> [options]
 import { io } from 'socket.io-client';
 
 interface StationRow {
@@ -233,11 +237,17 @@ async function seed(): Promise<void> {
 const FINAL = new Set(['ACKED', 'NACKED', 'TIMEOUT', 'FAILED']);
 
 /** `cmd` mode: POST a command, then poll GET /commands/:id until it settles. */
-async function issueCommand(type: string | undefined, target: string | undefined, simulate: string | undefined) {
+async function issueCommand(type: string | undefined, target: string | undefined, options: string[]) {
   if (!type || !target) {
-    console.error('usage: npm run monitor -- cmd LOCK|UNLOCK|SHUTDOWN <serial|machineId> [stale_ts|duplicate_send]');
+    console.error(
+      'usage: npm run monitor -- cmd LOCK|UNLOCK|SHUTDOWN <serial|machineId> [pin=<pin> [session=<uuid>]] [stale_ts|duplicate_send|exec_failed]',
+    );
     process.exit(1);
   }
+  const option = (key: string) => options.find((o) => o.startsWith(`${key}=`))?.slice(key.length + 1);
+  const simulate = options.find((o) => !o.includes('='));
+  const pin = option('pin');
+  const payload = pin ? { sessionId: option('session') ?? crypto.randomUUID(), pin } : undefined;
   const stations = (await get<StationRow[]>('/api/v1/stations')) ?? [];
   const station = stations.find((s) => s.serialNumber === target || s.id === target);
   if (!station?.id) {
@@ -248,7 +258,7 @@ async function issueCommand(type: string | undefined, target: string | undefined
   const res = await fetch(`${URL}/api/v1/stations/${station.id}/commands`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: type.toUpperCase(), ...(simulate ? { simulate } : {}) }),
+    body: JSON.stringify({ type: type.toUpperCase(), ...(payload ? { payload } : {}), ...(simulate ? { simulate } : {}) }),
   });
   const body = (await res.json()) as CommandEvent;
   console.log(`POST ${type.toUpperCase()} ${station.serialNumber} -> ${res.status} ${JSON.stringify(body)}`);
@@ -265,11 +275,14 @@ async function issueCommand(type: string | undefined, target: string | undefined
       console.log(`${new Date().toLocaleTimeString()}  ${body.commandId} -> ${last} (attempts ${current.attempts}) ${extra}`);
     }
   }
+  // ACKED means "accepted". Whether the station is locked comes from its heartbeat.
+  const after = (await get<StationRow[]>('/api/v1/stations'))?.find((s) => s.id === station.id);
+  console.log(`station ${station.serialNumber} locked=${after?.locked ?? '?'} (from heartbeat; refreshes every ~15s)`);
   process.exit(FINAL.has(last) ? 0 : 2);
 }
 
 if (process.argv[2] === 'cmd') {
-  await issueCommand(process.argv[3], process.argv[4], process.argv[5]);
+  await issueCommand(process.argv[3], process.argv[4], process.argv.slice(5));
 }
 
 const socket = io(URL, { path: '/dashboard-io', auth: { token: TOKEN }, transports: ['websocket'] });

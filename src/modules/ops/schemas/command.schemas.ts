@@ -7,18 +7,47 @@ export const STATION_COMMAND_TYPES = [AGENT_COMMANDS.LOCK, AGENT_COMMANDS.UNLOCK
 export type StationCommandType = (typeof STATION_COMMAND_TYPES)[number];
 
 /**
- * Dev-only fault injection for the physical test. `stale_ts` stamps the frame
- * with a ts far in the past so the agent's ReplayGuard nacks it STALE;
- * `duplicate_send` delivers the same command (same id) twice to prove the
- * agent acts once. Rejected outside development/test.
+ * Dev-only fault injection for the physical test. Rejected outside
+ * development/test.
+ * - `stale_ts`: backdates the frame's ts so the agent's ReplayGuard nacks STALE.
+ * - `duplicate_send`: delivers the same command (same id) twice; the agent
+ *   runs it once and re-acks the duplicate.
+ * - `exec_failed`: puts a LAUNCH_GAME with no gameId on the wire under this
+ *   commandId. LOCK/UNLOCK/SHUTDOWN handlers never fail on the agent, so this
+ *   is the only way to get a real EXEC_FAILED ("Game ID is required.").
  */
-export const COMMAND_SIMULATIONS = ['stale_ts', 'duplicate_send'] as const;
+export const COMMAND_SIMULATIONS = ['stale_ts', 'duplicate_send', 'exec_failed'] as const;
 export type CommandSimulation = (typeof COMMAND_SIMULATIONS)[number];
 
-export const issueCommandBodySchema = z.object({
-  type: z.enum(STATION_COMMAND_TYPES),
-  simulate: z.enum(COMMAND_SIMULATIONS).optional(),
+/**
+ * UNLOCK has two modes on the agent (UnlockCommandHandler):
+ * - no payload / `{}`: direct (admin) unlock. The agent unlocks at once and
+ *   grants the lease. This is the dashboard "unlock" button.
+ * - `{ sessionId, pin }`: booking unlock. The agent starts the session but
+ *   STAYS LOCKED until the user types the PIN on the station's LockUI.
+ */
+export const bookingUnlockPayloadSchema = z.object({
+  sessionId: z.string().uuid(),
+  pin: z.string().min(1),
 });
+export type BookingUnlockPayload = z.infer<typeof bookingUnlockPayloadSchema>;
+
+export const issueCommandBodySchema = z
+  .object({
+    type: z.enum(STATION_COMMAND_TYPES),
+    // `{}` is the explicit admin form; anything else must be a full booking payload.
+    payload: z.union([z.object({}).strict(), bookingUnlockPayloadSchema]).optional(),
+    simulate: z.enum(COMMAND_SIMULATIONS).optional(),
+  })
+  .refine((body) => body.type === 'UNLOCK' || !body.payload || Object.keys(body.payload).length === 0, {
+    message: 'payload is only accepted for UNLOCK',
+    path: ['payload'],
+  })
+  .transform(({ payload, ...body }) => {
+    // Normalized: `payload` is set only for a booking unlock; admin form -> undefined.
+    const booking = bookingUnlockPayloadSchema.safeParse(payload);
+    return { ...body, payload: booking.success ? booking.data : undefined };
+  });
 export type IssueCommandBody = z.infer<typeof issueCommandBodySchema>;
 
 export const listCommandsQuerySchema = z.object({
@@ -26,10 +55,14 @@ export const listCommandsQuerySchema = z.object({
 });
 export type ListCommandsQuery = z.infer<typeof listCommandsQuerySchema>;
 
+/**
+ * The only codes the agent's ConnectionWorker emits. The shared contract also
+ * lists INVALID_PAYLOAD, but the agent never sends it: a bad payload comes
+ * back as EXEC_FAILED, with the cause in `reason` ("Game ID is required.").
+ */
 export const NACK_CODES = {
   UNKNOWN_TYPE: 'UNKNOWN_TYPE',
   STALE: 'STALE',
-  INVALID_PAYLOAD: 'INVALID_PAYLOAD',
   EXEC_FAILED: 'EXEC_FAILED',
 } as const;
 
@@ -50,5 +83,7 @@ export type CommandNackPayload = z.infer<typeof commandNackPayloadSchema>;
 /** What a BullMQ `commands` job carries. */
 export interface CommandJobData {
   commandId: string;
+  /** Booking-unlock payload. Lives only in the job (never in Postgres or logs): it holds the PIN. */
+  payload?: BookingUnlockPayload;
   simulate?: CommandSimulation;
 }
