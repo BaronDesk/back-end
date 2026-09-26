@@ -1,4 +1,4 @@
-import { ConflictException, ForbiddenException } from '@nestjs/common';
+import { ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
@@ -29,6 +29,7 @@ function row(overrides: Record<string, unknown> = {}) {
     nackReason: null,
     failureReason: null,
     attempts: 0,
+    gameId: null,
     ...overrides,
   };
 }
@@ -43,8 +44,13 @@ describe('CommandsService', () => {
   let registry: { has: ReturnType<typeof vi.fn> };
   let dashboard: { publishToBranch: ReturnType<typeof vi.fn> };
   let queue: { add: ReturnType<typeof vi.fn> };
+  let games: { findLaunchable: ReturnType<typeof vi.fn> };
   let tracker: CommandAckTracker;
   let service: CommandsService;
+
+  const GAME = { id: '9d3c1f4e-8a55-4d1b-9a36-2f0f5c1e7b20', launchRef: 'steam:730', enabled: true };
+  const launch = { type: 'LAUNCH_GAME' as const, gameId: GAME.id, payload: undefined };
+  const endSession = { type: 'END_SESSION' as const, payload: undefined };
 
   beforeEach(() => {
     repo = {
@@ -57,7 +63,10 @@ describe('CommandsService', () => {
       resolveById: vi.fn(async () => STATION),
       resolve: vi.fn(() => STATION),
       isOnline: vi.fn(() => true),
+      sessionOf: vi.fn(() => 'sess-1'),
+      expectSessionEnd: vi.fn(),
     };
+    games = { findLaunchable: vi.fn(async () => GAME) };
     registry = { has: vi.fn(() => true) };
     dashboard = { publishToBranch: vi.fn() };
     queue = { add: vi.fn(async () => ({})) };
@@ -70,7 +79,43 @@ describe('CommandsService', () => {
       tracker,
       queue as any,
       config({ NODE_ENV: 'development', COMMAND_MAX_ATTEMPTS: 2 }),
+      games as any,
     );
+  });
+
+  it("queues LAUNCH_GAME with the game's launchRef as the agent's gameId", async () => {
+    const dto = await service.issue(caller(), 'm1', launch);
+    expect(games.findLaunchable).toHaveBeenCalledWith(GAME.id);
+    expect(repo.create).toHaveBeenCalledWith(expect.objectContaining({ type: 'LAUNCH_GAME', gameId: GAME.id }));
+    expect(queue.add).toHaveBeenCalledWith(
+      'dispatch',
+      expect.objectContaining({ commandId: dto.commandId, payload: { gameId: 'steam:730' } }),
+      expect.anything(),
+    );
+  });
+
+  it('rejects LAUNCH_GAME for a missing or disabled game before creating anything', async () => {
+    games.findLaunchable.mockRejectedValueOnce(new NotFoundException());
+    await expect(service.issue(caller(), 'm1', launch)).rejects.toBeInstanceOf(NotFoundException);
+    games.findLaunchable.mockRejectedValueOnce(new ConflictException());
+    await expect(service.issue(caller(), 'm1', launch)).rejects.toBeInstanceOf(ConflictException);
+    expect(repo.create).not.toHaveBeenCalled();
+    expect(queue.add).not.toHaveBeenCalled();
+  });
+
+  it('queues END_SESSION with its reason and labels the expected session end', async () => {
+    await service.issue(caller(), 'm1', { ...endSession, reason: 'closing' });
+    expect(queue.add).toHaveBeenCalledWith('dispatch', expect.objectContaining({ payload: { reason: 'closing' } }), expect.anything());
+    expect(presence.expectSessionEnd).toHaveBeenCalledWith('SN-1', 'closing');
+
+    await service.issue(caller(), 'm1', endSession);
+    expect(queue.add).toHaveBeenLastCalledWith('dispatch', expect.objectContaining({ payload: {} }), expect.anything());
+  });
+
+  it('rejects END_SESSION with 409 when the station reports no session', async () => {
+    presence.sessionOf.mockReturnValue(null);
+    await expect(service.issue(caller(), 'm1', endSession)).rejects.toBeInstanceOf(ConflictException);
+    expect(repo.create).not.toHaveBeenCalled();
   });
 
   it('creates a PENDING row and enqueues a job keyed by the commandId', async () => {
@@ -240,5 +285,15 @@ describe('issueCommandBodySchema', () => {
     expect(issueCommandBodySchema.safeParse({ type: 'UNLOCK', payload: { pin: '4821' } }).success).toBe(false);
     expect(issueCommandBodySchema.safeParse({ type: 'UNLOCK', payload: { sessionId: 'x', pin: '1' } }).success).toBe(false);
     expect(issueCommandBodySchema.safeParse({ type: 'LOCK', payload: { sessionId, pin: '1' } }).success).toBe(false);
+  });
+
+  it('requires a uuid gameId for LAUNCH_GAME only, and takes reason on END_SESSION only', () => {
+    expect(issueCommandBodySchema.safeParse({ type: 'LAUNCH_GAME' }).success).toBe(false);
+    expect(issueCommandBodySchema.safeParse({ type: 'LAUNCH_GAME', gameId: '' }).success).toBe(false);
+    expect(issueCommandBodySchema.safeParse({ type: 'LAUNCH_GAME', gameId: sessionId }).success).toBe(true);
+    expect(issueCommandBodySchema.safeParse({ type: 'LOCK', gameId: sessionId }).success).toBe(false);
+    expect(issueCommandBodySchema.safeParse({ type: 'END_SESSION' }).success).toBe(true);
+    expect(issueCommandBodySchema.parse({ type: 'END_SESSION', reason: ' closing ' }).reason).toBe('closing');
+    expect(issueCommandBodySchema.safeParse({ type: 'LOCK', reason: 'x' }).success).toBe(false);
   });
 });

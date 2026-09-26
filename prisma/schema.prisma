@@ -100,6 +100,8 @@ enum CommandType {
   LOCK
   UNLOCK
   SHUTDOWN
+  LAUNCH_GAME
+  END_SESSION
 }
 
 enum CommandStatus {
@@ -318,18 +320,24 @@ model Machine {
   @@map("machines")
 }
 
+// Backend-side game catalog. The agent never reads it: LAUNCH_GAME sends
+// `launchRef` as its opaque `gameId`, so launchRef is whatever the station's
+// launcher keys on.
 model Game {
-  id             String @id @default(uuid()) @db.Uuid
-  title          String @unique
-  executablePath String @map("executable_path")
-  genre          String
-  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  slug      String   @unique
+  launchRef String   @map("launch_ref")
+  iconUrl   String?  @map("icon_url")
+  enabled   Boolean  @default(true)
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
 
   machineGames MachineGame[]
+  commands     Command[]
 
-  @@index([title])
-  @@index([genre])
+  @@index([enabled, sortOrder])
   @@map("games")
 }
 
@@ -410,9 +418,12 @@ model Command {
   // Backend-side cause of FAILED/TIMEOUT (station gone, queue down, ...).
   failureReason String?       @map("failure_reason")
   attempts      Int           @default(0)
+  // LAUNCH_GAME only: the catalog entry whose launchRef went on the wire.
+  gameId        String?       @map("game_id") @db.Uuid
 
   machine Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
   branch  Branch  @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  game    Game?   @relation(fields: [gameId], references: [id], onDelete: SetNull)
 
   @@index([machineId, status])
   @@index([machineId, issuedAt])

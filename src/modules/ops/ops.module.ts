@@ -1,6 +1,7 @@
 import { BullModule } from '@nestjs/bullmq';
 import { Module } from '@nestjs/common';
 
+import { GamesModule } from '../games/games.module.js';
 import { IdentityModule } from '../identity/identity.module.js';
 import { StationModule } from '../station/station.module.js';
 import { AgentRegistry } from '../../infra/realtime/registry.js';
@@ -19,7 +20,7 @@ import { TelemetryHistoryService } from './services/telemetry-history.service.js
 import { TelemetryService } from './services/telemetry.service.js';
 
 @Module({
-  imports: [IdentityModule, StationModule, BullModule.registerQueue({ name: COMMAND_QUEUE })],
+  imports: [IdentityModule, StationModule, GamesModule, BullModule.registerQueue({ name: COMMAND_QUEUE })],
   controllers: [TelemetryController, AlertsController, CommandsController],
   providers: [
     AgentGateway,

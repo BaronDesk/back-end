@@ -19,8 +19,28 @@ export interface StationStatusEvent {
   lastSeen: string;
   ip: string | null;
   locked: boolean | null;
+  sessionId: string | null;
+  runningGameId: string | null;
   branchId: string;
 }
+
+/**
+ * `session.ended`: a station the agent reported with a session now reports
+ * none. Device-level only; billing close-out (Member B) subscribes to
+ * `PresenceService.sessionEnded`. `reason` is the END_SESSION reason when the
+ * end followed one, else `agent_reported`.
+ */
+export interface SessionEndedEvent {
+  machineId: string;
+  branchId: string;
+  serialNumber: string;
+  sessionId: string;
+  reason: string;
+  endedAt: string;
+}
+
+/** An END_SESSION reason is matched to the observed session end only within this window. */
+const SESSION_END_MATCH_MS = 2 * 60_000;
 
 /** What other modules may know about a station: identity and branch, nothing more. */
 export interface StationRef {
@@ -61,9 +81,16 @@ export class UnknownStationError extends Error {
 export class PresenceService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(PresenceService.name);
   private readonly states = new Map<string, PresenceState>();
+  /** serial -> END_SESSION reason awaiting the agent's report that the session is gone. */
+  private readonly pendingSessionEnds = new Map<string, { reason: string; at: number }>();
   private watchdog?: NodeJS.Timeout;
 
+  /**
+   * Pushed on ONLINE<->OFFLINE and whenever the agent reports a change of
+   * locked / sessionId / runningGameId.
+   */
   readonly statusChanges = new Subject<StationStatusEvent>();
+  readonly sessionEnded = new Subject<SessionEndedEvent>();
 
   private readonly offlineAfterMs: number;
   private readonly watchdogIntervalMs: number;
@@ -89,6 +116,7 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
   onModuleDestroy(): void {
     clearInterval(this.watchdog);
     this.statusChanges.complete();
+    this.sessionEnded.complete();
   }
 
   /** handshake: resolve the machine by serial, mark it ONLINE. */
@@ -134,8 +162,7 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
 
     const now = new Date();
     state.lastSeen = now;
-    state.locked = heartbeat.locked;
-    state.sessionId = heartbeat.sessionId ?? null;
+    const changed = this.applyReport(state, { locked: heartbeat.locked, sessionId: heartbeat.sessionId ?? null });
 
     if (state.status !== 'ONLINE') {
       // Watchdog flipped it while the socket stayed open; heartbeats resumed.
@@ -146,6 +173,9 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
     } else if (now.getTime() - state.lastPersistedAt >= this.persistIntervalMs) {
       state.lastPersistedAt = now.getTime();
       await this.machines.touchLastSeen(state.machineId, now);
+      if (changed) this.emit(state);
+    } else if (changed) {
+      this.emit(state);
     }
 
     await this.writeCache(state);
@@ -156,11 +186,30 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
     const state = this.states.get(serialNumber);
     if (!state) return;
 
-    if (report.locked !== undefined) state.locked = report.locked;
-    if (report.sessionId !== undefined) state.sessionId = report.sessionId ?? null;
-    if (report.runningGameId !== undefined) state.runningGameId = report.runningGameId ?? null;
+    // runningGameId is only ever set from here: a LAUNCH_GAME ack means
+    // "accepted", not "running" (the agent's launch is still a stub).
+    const changed = this.applyReport(state, {
+      locked: report.locked,
+      sessionId: report.sessionId === undefined ? undefined : (report.sessionId ?? null),
+      runningGameId: report.runningGameId === undefined ? undefined : (report.runningGameId ?? null),
+    });
     if (report.leaseExpiresAt !== undefined) state.leaseExpiresAt = report.leaseExpiresAt ?? null;
+    if (changed && state.status === 'ONLINE') this.emit(state);
     await this.writeCache(state);
+  }
+
+  /** The agent's last reported session for a station, or null. */
+  sessionOf(serialNumber: string): string | null {
+    return this.states.get(serialNumber)?.sessionId ?? null;
+  }
+
+  /**
+   * END_SESSION was issued: label the next observed session end with its
+   * reason. Nothing changes here; the end itself is only taken from the
+   * agent's heartbeat / state_report.
+   */
+  expectSessionEnd(serialNumber: string, reason: string): void {
+    this.pendingSessionEnds.set(serialNumber, { reason, at: Date.now() });
   }
 
   /** socket close/error. */
@@ -248,6 +297,48 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
     this.emit(state);
   }
 
+  /**
+   * Applies agent-reported fields (undefined = not reported) and returns
+   * whether any of them changed. Emits `session.ended` on a session -> none
+   * transition.
+   */
+  private applyReport(
+    state: PresenceState,
+    report: { locked?: boolean; sessionId?: string | null; runningGameId?: string | null },
+  ): boolean {
+    let changed = false;
+    if (report.locked !== undefined && report.locked !== state.locked) {
+      state.locked = report.locked;
+      changed = true;
+    }
+    if (report.runningGameId !== undefined && report.runningGameId !== state.runningGameId) {
+      state.runningGameId = report.runningGameId;
+      changed = true;
+    }
+    if (report.sessionId !== undefined && report.sessionId !== state.sessionId) {
+      const previous = state.sessionId;
+      state.sessionId = report.sessionId;
+      changed = true;
+      if (previous && !report.sessionId) this.endSession(state, previous);
+    }
+    return changed;
+  }
+
+  private endSession(state: PresenceState, sessionId: string): void {
+    const pending = this.pendingSessionEnds.get(state.serialNumber);
+    this.pendingSessionEnds.delete(state.serialNumber);
+    const reason = pending && Date.now() - pending.at <= SESSION_END_MATCH_MS ? pending.reason : 'agent_reported';
+    this.logger.log(`session ${sessionId} ended on ${state.serialNumber} (${reason})`);
+    this.sessionEnded.next({
+      machineId: state.machineId,
+      branchId: state.branchId,
+      serialNumber: state.serialNumber,
+      sessionId,
+      reason,
+      endedAt: new Date().toISOString(),
+    });
+  }
+
   private emit(state: PresenceState): void {
     this.statusChanges.next({
       serialNumber: state.serialNumber,
@@ -256,6 +347,8 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
       lastSeen: state.lastSeen.toISOString(),
       ip: state.ip,
       locked: state.locked,
+      sessionId: state.sessionId,
+      runningGameId: state.runningGameId,
       branchId: state.branchId,
     });
   }
@@ -269,6 +362,7 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
         ip: state.ip ?? '',
         locked: state.locked === null ? '' : String(state.locked),
         sessionId: state.sessionId ?? '',
+        runningGameId: state.runningGameId ?? '',
         leaseExpiresAt: state.leaseExpiresAt ?? '',
       });
     } catch (err) {

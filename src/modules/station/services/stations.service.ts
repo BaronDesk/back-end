@@ -37,12 +37,11 @@ export class StationsService {
       ...this.toStation(machine, cached),
       branchId: machine.branchId,
       enrollmentStatus: machine.enrollmentStatus,
-      sessionId: cached?.sessionId || null,
       leaseExpiresAt: cached?.leaseExpiresAt || null,
     };
   }
 
-  /** Postgres is authoritative for status; Redis carries the fresher last_seen and lock state. */
+  /** Postgres is authoritative for status; Redis carries the fresher last_seen and agent-reported state. */
   private toStation(machine: Machine, cached: CachedPresence | undefined) {
     const cachedLastSeen = cached?.lastSeen ? new Date(cached.lastSeen) : null;
     const lastSeen =
@@ -55,6 +54,9 @@ export class StationsService {
       status: machine.status,
       lastSeen: lastSeen?.toISOString() ?? null,
       locked: cached?.locked ? cached.locked === 'true' : null,
+      sessionId: cached?.sessionId || null,
+      // Set only once the agent reports it (state_report); never from a LAUNCH_GAME ack.
+      runningGameId: cached?.runningGameId || null,
       ip: machine.ipAddress,
     };
   }

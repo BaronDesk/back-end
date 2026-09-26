@@ -11,6 +11,7 @@ import { PrismaModule } from './infra/prisma/prisma.module.js';
 import { QueueModule } from './infra/queue/queue.module.js';
 import { RedisModule } from './infra/redis/redis.module.js';
 import { HealthModule } from './health/health.module.js';
+import { GamesModule } from './modules/games/games.module.js';
 import { IdentityModule } from './modules/identity/identity.module.js';
 import { OpsModule } from './modules/ops/ops.module.js';
 import { StationModule } from './modules/station/station.module.js';
@@ -23,6 +24,7 @@ import { StationModule } from './modules/station/station.module.js';
     QueueModule,
     IdentityModule,
     StationModule,
+    GamesModule,
     OpsModule,
     HealthModule,
   ],
