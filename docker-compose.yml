@@ -26,6 +26,14 @@ services:
       timeout: 5s
       retries: 5
     networks: [internal]
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --url http://reverse-proxy:80
+    depends_on:
+      reverse-proxy:
+        condition: service_started
+    networks: [internal]
 
   redis:
     image: redis:7-alpine
