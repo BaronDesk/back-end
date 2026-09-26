@@ -21,12 +21,26 @@ import {
 } from '../station/schemas/presence.schemas.js';
 import { PresenceService, UnknownStationError } from '../station/services/presence.service.js';
 import { DashboardGateway } from './dashboard.gateway.js';
+import { deviceEventPayloadSchema, telemetryPayloadSchema } from './schemas/telemetry.schemas.js';
+import { TelemetryService } from './services/telemetry.service.js';
 
 const HANDSHAKE_TIMEOUT_MS = 10_000;
+
+/**
+ * The agent stamps these from its TelemetryService's own sequence counter,
+ * not the connection counter used for handshake/heartbeat/state_report. The
+ * two interleave, so each stream gets its own SeqGuard: one shared guard
+ * would drop whichever stream lags behind.
+ */
+const TELEMETRY_STREAM_TYPES: ReadonlySet<string> = new Set([
+  AGENT_MESSAGE_TYPES.TELEMETRY,
+  AGENT_MESSAGE_TYPES.DEVICE_EVENT,
+]);
 
 interface AgentConnection {
   ip: string | null;
   seqGuard: SeqGuard;
+  telemetrySeqGuard: SeqGuard;
   outbound: OutboundSequencer;
   /** Set once the handshake has been resolved to a MACHINE row. */
   serialNumber?: string;
@@ -56,6 +70,7 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     private readonly registry: AgentRegistry,
     private readonly presence: PresenceService,
     private readonly dashboard: DashboardGateway,
+    private readonly telemetry: TelemetryService,
   ) {}
 
   onModuleInit(): void {
@@ -84,6 +99,7 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     const conn: AgentConnection = {
       ip: remoteIp(request),
       seqGuard: new SeqGuard(),
+      telemetrySeqGuard: new SeqGuard(),
       outbound: new OutboundSequencer(),
     };
     conn.handshakeTimer = setTimeout(() => socket.close(4408, 'handshake timeout'), HANDSHAKE_TIMEOUT_MS);
@@ -129,7 +145,8 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
 
     // Checked synchronously on arrival so async handlers can't reorder seqs.
     // No nack: the agent answers unknown frame types with its own nack.
-    const result = conn.seqGuard.check(envelope);
+    const guard = TELEMETRY_STREAM_TYPES.has(envelope.type) ? conn.telemetrySeqGuard : conn.seqGuard;
+    const result = guard.check(envelope);
     if (!result.ok) {
       this.logger.warn(
         `dropped ${envelope.type} from ${conn.serialNumber ?? conn.ip}: ${result.reason} (seq ${envelope.seq})`,
@@ -154,6 +171,12 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
           return;
         case AGENT_MESSAGE_TYPES.STATE_REPORT:
           await this.onStateReport(conn.serialNumber, envelope);
+          return;
+        case AGENT_MESSAGE_TYPES.TELEMETRY:
+          await this.onTelemetry(conn.serialNumber, envelope);
+          return;
+        case AGENT_MESSAGE_TYPES.DEVICE_EVENT:
+          await this.onDeviceEvent(conn.serialNumber, envelope);
           return;
         default:
           this.logger.debug(`ignored unhandled frame type '${envelope.type}' from ${conn.serialNumber}`);
@@ -231,6 +254,27 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
       return;
     }
     await this.presence.reportState(serialNumber, parsed.data);
+  }
+
+  // telemetry and device_event get no ack: the agent does not expect one.
+  // telemetry is live-only; device_event is retried by the agent on reconnect
+  // and deduplicated downstream.
+  private async onTelemetry(serialNumber: string, envelope: Envelope): Promise<void> {
+    const parsed = telemetryPayloadSchema.safeParse(envelope.payload);
+    if (!parsed.success) {
+      this.logger.warn(`malformed telemetry payload from ${serialNumber}`);
+      return;
+    }
+    await this.telemetry.ingest(serialNumber, parsed.data);
+  }
+
+  private async onDeviceEvent(serialNumber: string, envelope: Envelope): Promise<void> {
+    const parsed = deviceEventPayloadSchema.safeParse(envelope.payload);
+    if (!parsed.success) {
+      this.logger.warn(`malformed device_event payload from ${serialNumber}`);
+      return;
+    }
+    await this.telemetry.onDeviceEvent(serialNumber, parsed.data);
   }
 
   private send(socket: WebSocket, conn: AgentConnection, type: string, payload: unknown): void {

@@ -83,14 +83,10 @@ enum SubscriptionStatus {
   PENDING
 }
 
-enum TelemetryAlertType {
-  CPU_USAGE
-  MEMORY_USAGE
-  DISK_SPACE
-  NETWORK_ERROR
-  HARDWARE_FAILURE
-  TEMPERATURE_WARNING
-  CONNECTION_LOST
+enum AlertCategory {
+  HARDWARE
+  ANTI_THEFT
+  SECURITY_VIOLATION
 }
 
 enum AlertSeverity {
@@ -139,6 +135,7 @@ model Branch {
   pricing           Pricing[]
   employeeProfiles  EmployeeProfile[]
   machines          Machine[]
+  telemetryAlerts   TelemetryAlert[]
 
   @@index([name])
   @@map("branches")
@@ -337,34 +334,38 @@ model MachineGame {
 // --- Telemetry ---
 
 model NodeTelemetry {
-  id        String   @id @default(uuid()) @db.Uuid
-  machineId String   @map("machine_id") @db.Uuid
-  metric    String
-  value     Decimal  @db.Decimal(15, 4)
-  sampledAt DateTime @map("sampled_at") @db.Timestamptz
+  id         String   @id @default(uuid()) @db.Uuid
+  machineId  String   @map("machine_id") @db.Uuid
+  metrics    Json
+  recordedAt DateTime @map("recorded_at") @db.Timestamptz
 
   machine Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
 
   @@index([machineId])
-  @@index([metric])
-  @@index([sampledAt])
+  @@index([recordedAt])
   @@map("node_telemetry")
 }
 
 model TelemetryAlert {
-  id                   String          @id @default(uuid()) @db.Uuid
-  machineId            String          @map("machine_id") @db.Uuid
-  type                 TelemetryAlertType
-  severity             AlertSeverity
-  acknowledged         Boolean         @default(false)
-  acknowledgedByUserId String?         @map("acknowledged_by_user_id") @db.Uuid
-  createdAt            DateTime        @default(now()) @map("created_at") @db.Timestamptz
-  acknowledgedAt       DateTime?       @map("acknowledged_at") @db.Timestamptz
+  id                   String        @id @default(uuid()) @db.Uuid
+  machineId            String        @map("machine_id") @db.Uuid
+  branchId             String?       @map("branch_id") @db.Uuid
+  category             AlertCategory
+  type                 String
+  value                Json?
+  severity             AlertSeverity @default(MEDIUM)
+  acknowledged         Boolean       @default(false)
+  acknowledgedByUserId String?       @map("acknowledged_by_user_id") @db.Uuid
+  createdAt            DateTime      @default(now()) @map("created_at") @db.Timestamptz
+  acknowledgedAt       DateTime?     @map("acknowledged_at") @db.Timestamptz
 
   machine            Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  branch             Branch? @relation(fields: [branchId], references: [id], onDelete: SetNull)
   acknowledgedByUser User?   @relation(fields: [acknowledgedByUserId], references: [id], onDelete: SetNull)
 
   @@index([machineId])
+  @@index([branchId])
+  @@index([category])
   @@index([type])
   @@index([severity])
   @@index([acknowledged])

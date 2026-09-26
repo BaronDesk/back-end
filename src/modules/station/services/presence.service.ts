@@ -22,6 +22,13 @@ export interface StationStatusEvent {
   branchId: string;
 }
 
+/** What other modules may know about a station: identity and branch, nothing more. */
+export interface StationRef {
+  machineId: string;
+  branchId: string;
+  serialNumber: string;
+}
+
 interface PresenceState {
   machineId: string;
   branchId: string;
@@ -161,6 +168,27 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
     await this.markOffline(serialNumber, 'socket closed');
   }
 
+  /** Resolves a connected (or recently seen) station by serial, from memory. */
+  resolve(serialNumber: string): StationRef | null {
+    const state = this.states.get(serialNumber);
+    return state ? toRef(state) : null;
+  }
+
+  /** Resolves any station by MACHINE id; falls back to Postgres when not in memory. */
+  async resolveById(machineId: string): Promise<StationRef | null> {
+    for (const state of this.states.values()) {
+      if (state.machineId === machineId) return toRef(state);
+    }
+    const machine = await this.machines.findById(machineId);
+    return machine
+      ? { machineId: machine.id, branchId: machine.branchId, serialNumber: machine.serialNumber }
+      : null;
+  }
+
+  onlineStations(): StationRef[] {
+    return [...this.states.values()].filter((s) => s.status === 'ONLINE').map(toRef);
+  }
+
   /** Watchdog: catches crash / power loss, where no close frame ever arrives. */
   private async sweep(): Promise<void> {
     const cutoff = Date.now() - this.offlineAfterMs;
@@ -243,4 +271,8 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
       this.logger.warn(`presence cache write failed for ${state.serialNumber}: ${(err as Error).message}`);
     }
   }
+}
+
+function toRef(state: PresenceState): StationRef {
+  return { machineId: state.machineId, branchId: state.branchId, serialNumber: state.serialNumber };
 }

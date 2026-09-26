@@ -14,11 +14,6 @@ import { DashboardGateway } from '../src/modules/ops/dashboard.gateway.js';
 import { makeFrame } from '../src/infra/realtime/frame.js';
 import type { OutboundEnvelope } from '../src/infra/realtime/envelope.js';
 
-// Short presence timings so the watchdog case runs in seconds. Read by
-// ConfigModule when AppModule compiles in beforeAll.
-process.env.PRESENCE_OFFLINE_AFTER_MS = '1500';
-process.env.PRESENCE_WATCHDOG_INTERVAL_MS = '300';
-
 describe('realtime gateways (e2e)', () => {
   let app: NestFastifyApplication;
   let prisma: PrismaService;

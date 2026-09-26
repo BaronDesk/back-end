@@ -12,6 +12,7 @@ export const AGENT_MESSAGE_TYPES = {
   HANDSHAKE: 'handshake',
   HEARTBEAT: 'heartbeat',
   TELEMETRY: 'telemetry',
+  DEVICE_EVENT: 'device_event',
   ALERT: 'alert',
   COMMAND_ACK: 'command_ack',
   COMMAND_NACK: 'command_nack',
@@ -28,6 +29,7 @@ export const DASHBOARD_EVENTS = {
   STATION_STATUS: 'station_status',
   TELEMETRY_UPDATE: 'telemetry_update',
   ALERT: 'alert',
+  ALERT_RESOLVED: 'alert_resolved',
   SESSION_UPDATE: 'session_update',
   COMMAND_RESULT: 'command_result',
 } as const;
