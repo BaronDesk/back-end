@@ -10,7 +10,14 @@ export class CommandsRepository extends BaseRepository {
     super(prisma);
   }
 
-  create(data: { id: string; machineId: string; branchId: string; type: CommandType; issuedBy: string }) {
+  create(data: {
+    id: string;
+    machineId: string;
+    branchId: string;
+    type: CommandType;
+    issuedBy: string;
+    gameId?: string;
+  }) {
     return this.prisma.command.create({ data });
   }
 

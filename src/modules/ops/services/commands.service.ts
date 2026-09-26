@@ -18,12 +18,14 @@ import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
 import { DASHBOARD_EVENTS } from '../../../infra/realtime/constants.js';
 import { AgentRegistry } from '../../../infra/realtime/registry.js';
 import type { Command, CommandStatus, Prisma } from '../../../generated/prisma/index.js';
+import { GamesService } from '../../games/services/games.service.js';
 import { PresenceService, type StationRef } from '../../station/services/presence.service.js';
 import { DashboardGateway } from '../dashboard.gateway.js';
 import { CommandsRepository } from '../repository/commands.repository.js';
 import {
   NACK_CODES,
   type CommandJobData,
+  type CommandPayload,
   type IssueCommandBody,
   type ListCommandsQuery,
 } from '../schemas/command.schemas.js';
@@ -60,6 +62,7 @@ export function toCommandDto(command: Command) {
     machineId: command.machineId,
     branchId: command.branchId,
     type: command.type,
+    gameId: command.gameId,
     status: command.status,
     issuedBy: command.issuedBy,
     issuedAt: command.issuedAt.toISOString(),
@@ -91,6 +94,7 @@ export class CommandsService {
     private readonly tracker: CommandAckTracker,
     @InjectQueue(COMMAND_QUEUE) private readonly queue: Queue<CommandJobData>,
     private readonly config: ConfigService,
+    private readonly games: GamesService,
   ) {
     this.simulationsAllowed = config.get('NODE_ENV') !== 'production';
   }
@@ -109,20 +113,39 @@ export class CommandsService {
       throw new ConflictException({ code: 'STATION_OFFLINE', error: 'station is not online' });
     }
 
+    // Every rejection happens here, before a row exists or anything is queued.
+    let payload: CommandPayload | undefined = body.payload;
+    let gameId: string | undefined;
+    if (body.type === 'LAUNCH_GAME') {
+      const game = await this.games.findLaunchable(body.gameId!);
+      gameId = game.id;
+      payload = { gameId: game.launchRef };
+    } else if (body.type === 'END_SESSION') {
+      if (!this.presence.sessionOf(station.serialNumber)) {
+        throw new ConflictException({ code: 'NO_ACTIVE_SESSION', error: 'station has no active session' });
+      }
+      payload = body.reason ? { reason: body.reason } : {};
+    }
+
     const row = await this.repo.create({
       id: randomUUID(),
       machineId: station.machineId,
       branchId: station.branchId,
       type: body.type,
       issuedBy: caller.sub,
+      gameId,
     });
     this.logger.log(`${row.type} ${row.id} issued for ${station.serialNumber} by ${caller.sub}`);
     this.publish(row);
 
+    // Labels the session.ended event, which fires only once the agent reports
+    // the session gone. Billing close-out is Member B's, not ours.
+    if (body.type === 'END_SESSION') this.presence.expectSessionEnd(station.serialNumber, body.reason ?? 'normal');
+
     try {
       // TODO(sessions): the booking flow (Member B) will build `payload` from
       // the reservation instead of taking it from the request body.
-      await this.enqueue({ commandId: row.id, payload: body.payload, simulate: body.simulate });
+      await this.enqueue({ commandId: row.id, payload, simulate: body.simulate });
     } catch (err) {
       const reason = `enqueue failed: ${(err as Error).message}`;
       this.logger.error(`${row.type} ${row.id}: ${reason}`);
@@ -149,9 +172,10 @@ export class CommandsService {
    * command_ack / command_nack from the gateway. Never throws past a log line.
    *
    * An ack means "accepted", not "done": a booking UNLOCK is acked while the
-   * station stays locked until the PIN is typed. Nothing here touches lock
-   * state. The station's locked flag comes only from presence (heartbeat /
-   * state_report).
+   * station stays locked until the PIN is typed, and a LAUNCH_GAME is acked
+   * although the agent's launch is still a stub. Nothing here touches station
+   * state. locked / sessionId / runningGameId come only from presence
+   * (heartbeat / state_report).
    */
   async onAgentReply(serialNumber: string, commandId: string, reply: Exclude<CommandReply, { kind: 'timeout' }>) {
     const row = await this.repo.findById(commandId);

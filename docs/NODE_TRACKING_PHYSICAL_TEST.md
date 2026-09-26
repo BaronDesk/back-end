@@ -304,6 +304,46 @@ command. The row then shows `attempts 2`. If no ack arrives at all, the final st
 
 ---
 
+## 4D. Games catalog, LAUNCH_GAME and END_SESSION
+
+The `migrate` service applies `prisma/migrations/20260926200000_games_catalog`. Both
+commands use the same pipeline and socket as section 4C. The monitor's station table now
+has SESSION and RUNNING GAME columns next to LOCKED. All three come from the agent's
+heartbeat / state_report, never from a command ack.
+
+Two facts about the real agent drive the expectations below:
+
+- **The launch is a stub.** `GameService.LaunchGameAsync` only logs `Launch game requested`.
+  The agent acks a valid LAUNCH_GAME, but no game window opens and it never reports a
+  `runningGameId`. RUNNING GAME stays `-`. That is the correct result today.
+- **END_SESSION also locks.** The agent ends the session, locks the station, then revokes
+  the lease. After the ack, the next heartbeat shows SESSION `-` and LOCKED `yes`.
+
+Seed the catalog with the hq-admin token (`game-add` / `game-set` need manager+):
+
+```powershell
+npm run monitor -- game-add cs2 steam:730 "Counter-Strike 2"
+npm run monitor -- game-add old-game legacy:1 "Old Game" disabled
+npm run monitor -- games
+```
+
+| Case | Do | Expect |
+|---|---|---|
+| a. Catalog | `game-add` as above, then `games` (or `GET /api/v1/games`) | Both games listed. A gamer token only sees `cs2`. |
+| b. LAUNCH_GAME | `cmd LAUNCH_GAME <serial> game=cs2` | Wire payload `{ gameId: "steam:730" }`. `ACKED`, detail `game=cs2`. Agent log: `Launch game requested`. No game starts. `cmd` mode prints `runningGameId=null`, and RUNNING GAME stays `-`. |
+| c. Blank gameId | `cmd LAUNCH_GAME <serial> game=cs2 exec_failed` | The wire LAUNCH_GAME has no gameId. Status `FAILED`, detail `EXEC_FAILED: Game ID is required.`, tries `1` (not retried). |
+| d. Rejected up front | `cmd LAUNCH_GAME <serial> game=old-game`; a random game uuid; any LAUNCH_GAME while the station is OFFLINE | `409 GAME_DISABLED`, `404 GAME_NOT_FOUND`, `409 STATION_OFFLINE`. No command row, nothing reaches the agent. |
+| e. END_SESSION | Start a session: `cmd UNLOCK <serial> pin=4821`, wait for SESSION to show an id (next heartbeat). Then `cmd END_SESSION <serial> reason=staff_end` | `ACKED`. Next heartbeat: SESSION `-` and LOCKED `yes`. Event lines: `session ended`, `locked=true`. Backend log: `session <id> ended on <serial> (staff_end)`. |
+| f. No session | `cmd END_SESSION <serial>` while SESSION is `-` | `409 NO_ACTIVE_SESSION`. No command row. |
+| g. No INVALID_PAYLOAD | `git grep INVALID_PAYLOAD -- src` | Only the comment in `command.schemas.ts` that says the agent never sends it. Nothing branches on it. |
+
+END_SESSION only ends the session on the device. Billing and wallet close-out belong to
+Member B, who subscribes to `PresenceService.sessionEnded` (`session.ended { machineId,
+sessionId, reason }`). That event fires when the agent **reports** the session gone, not
+on the ack.
+
+---
+
 ## 5. Troubleshooting
 
 | Symptom | Likely cause and fix |
