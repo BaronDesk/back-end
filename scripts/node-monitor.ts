@@ -35,7 +35,21 @@
 //   TOKEN=... npm run monitor -- game-unassign <gameId> <station> [branch]
 //   TOKEN=... npm run monitor -- station-games <station>   resolved catalog + last catalog_status
 //   TOKEN=... npm run monitor -- catalog <station>         exactly what GET /stations/me/games serves the agent
+//
+// Station credentials (Step 5). The station JWT is signed with the backend's
+// JWT_ACCESS_SECRET (read from the env, else ./.env), like enrollment mints it:
+//   TOKEN=... npm run monitor -- station-token <station> [ttl=<seconds>] [serial=<override>]
+//       prints a station JWT for that MACHINE row. For the agent, put it in
+//       Agent:StationToken (appsettings.Development.json); used when its DPAPI store is empty.
+//   TOKEN=... npm run monitor -- station-auth <station>
+//       runs the physical-test cases against /agent-ws and GET /stations/me/games.
+//       Case a with the real agent: give it a minted token and watch it come ONLINE here.
+//       Never handshakes as the station, so the real agent stays connected.
+import { createHmac } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
+
 import { io } from 'socket.io-client';
+import WebSocket from 'ws';
 
 interface StationRow {
   id?: string;
@@ -420,6 +434,112 @@ async function exitSoon(code: number): Promise<never> {
   process.exit(code);
 }
 
+/** JWT_ACCESS_SECRET from the env, else the backend's ./.env. */
+function accessSecret(): string {
+  if (process.env.JWT_ACCESS_SECRET) return process.env.JWT_ACCESS_SECRET;
+  const line = existsSync('.env')
+    ? readFileSync('.env', 'utf8').split(/\r?\n/).find((l) => l.startsWith('JWT_ACCESS_SECRET='))
+    : undefined;
+  if (!line) {
+    console.error('JWT_ACCESS_SECRET not set and not found in ./.env');
+    process.exit(1);
+  }
+  return line.slice('JWT_ACCESS_SECRET='.length).trim().replace(/^["']|["']$/g, '');
+}
+
+/** HS256, the JwtModule default: what enrollment would mint. */
+function signJwt(claims: Record<string, unknown>, ttlSeconds: number): string {
+  const b64 = (value: object) => Buffer.from(JSON.stringify(value)).toString('base64url');
+  const now = Math.floor(Date.now() / 1000);
+  const body = `${b64({ alg: 'HS256', typ: 'JWT' })}.${b64({ ...claims, iat: now, exp: now + ttlSeconds })}`;
+  return `${body}.${createHmac('sha256', accessSecret()).update(body).digest('base64url')}`;
+}
+
+function stationToken(station: StationRow & { branchId?: string }, ttlSeconds = 30 * 86_400, serial?: string): string {
+  return signJwt(
+    { sub: station.id, type: 'station', serialNumber: serial ?? station.serialNumber, branchId: station.branchId },
+    ttlSeconds,
+  );
+}
+
+const WS_URL = `${URL.replace(/^http/, 'ws')}/agent-ws`;
+
+/** 101 when /agent-ws accepts the token (closed again before any handshake), else the upgrade's HTTP status. */
+function upgradeStatus(token: string | null): Promise<number> {
+  const socket = new WebSocket(WS_URL, token ? { headers: { Authorization: `Bearer ${token}` } } : {});
+  return new Promise((resolve) => {
+    socket.on('unexpected-response', (_req, res) => {
+      resolve(res.statusCode ?? 0);
+      socket.terminate();
+    });
+    socket.on('open', () => {
+      resolve(101);
+      socket.close();
+    });
+    socket.on('error', () => resolve(0));
+  });
+}
+
+/** Connects with `token` and handshakes as `serial`: the close code, or 'ack' if the handshake was accepted. */
+function handshakeResult(token: string, serial: string): Promise<number | 'ack'> {
+  const socket = new WebSocket(WS_URL, { headers: { Authorization: `Bearer ${token}` } });
+  return new Promise((resolve) => {
+    socket.on('open', () =>
+      socket.send(
+        JSON.stringify({
+          type: 'handshake',
+          id: crypto.randomUUID(),
+          ts: new Date().toISOString(),
+          seq: 1,
+          payload: { serialNumber: serial },
+        }),
+      ),
+    );
+    socket.on('message', (data: Buffer) => {
+      if ((JSON.parse(data.toString()) as { type?: string }).type === 'handshake_ack') {
+        resolve('ack');
+        socket.close();
+      }
+    });
+    socket.on('close', (code: number) => resolve(code));
+    socket.on('unexpected-response', (_req, res) => resolve(res.statusCode ?? 0));
+    socket.on('error', () => undefined);
+  });
+}
+
+async function catalogStatus(headers: Record<string, string>): Promise<number> {
+  return (await fetch(`${URL}/stations/me/games`, { headers })).status;
+}
+
+/** `station-auth`: the Step 5 physical-test cases, PASS/FAIL per line. */
+async function stationAuthCases(station: StationRow & { branchId?: string }): Promise<never> {
+  const valid = stationToken(station, 300);
+  const expired = stationToken(station, -60);
+  let failed = 0;
+  const check = (label: string, actual: unknown, expected: unknown) => {
+    const ok = actual === expected;
+    if (!ok) failed++;
+    console.log(`${ok ? `${GREEN}PASS${RESET}` : `${RED}FAIL${RESET}`}  ${pad(label, 60)} got ${actual}, want ${expected}`);
+  };
+
+  console.log(`station ${station.serialNumber}  machine ${station.id}  branch ${station.branchId}\n`);
+  check('a. valid station token: WSS upgrade', await upgradeStatus(valid), 101);
+  check('a. valid station token: GET /stations/me/games', await catalogStatus({ Authorization: `Bearer ${valid}` }), 200);
+  check('b. no token: WSS upgrade', await upgradeStatus(null), 401);
+  check('b. no token: GET /stations/me/games', await catalogStatus({}), 401);
+  check('b. garbage token: WSS upgrade', await upgradeStatus('garbage'), 401);
+  check('b. garbage token: GET /stations/me/games', await catalogStatus({ Authorization: 'Bearer garbage' }), 401);
+  check('b. expired token: WSS upgrade', await upgradeStatus(expired), 401);
+  check('b. expired token: GET /stations/me/games', await catalogStatus({ Authorization: `Bearer ${expired}` }), 401);
+  check('c. user access token (TOKEN): WSS upgrade', await upgradeStatus(TOKEN ?? null), 401);
+  check('c. user access token (TOKEN): GET /stations/me/games', await catalogStatus({ Authorization: `Bearer ${TOKEN}` }), 401);
+  check('d. token serial != handshake serial: close code', await handshakeResult(valid, `${station.serialNumber}-X`), 1008);
+  check('e. serial only (x-station-serial): GET /stations/me/games', await catalogStatus({ 'x-station-serial': station.serialNumber }), 401);
+  check('e. serial only (no token): WSS upgrade', await upgradeStatus(null), 401);
+  console.log(`\n${failed ? `${RED}${failed} failed${RESET}` : `${GREEN}all passed${RESET}`}  ${DIM}(e expects STATION_AUTH_DEV_BYPASS off)${RESET}`);
+  return exitSoon(failed ? 2 : 0);
+}
+
 /** Catalog helpers for the physical test. */
 async function catalogCommand(command: string, args: string[]): Promise<never> {
   if (command === 'games') {
@@ -469,6 +589,12 @@ async function catalogCommand(command: string, args: string[]): Promise<never> {
     return exitSoon(0);
   }
   const station = await findStation(args[0]);
+  if (command === 'station-token') {
+    const option = (key: string) => args.find((a) => a.startsWith(`${key}=`))?.slice(key.length + 1);
+    console.log(stationToken(station, Number(option('ttl') ?? 30 * 86_400), option('serial')));
+    return exitSoon(0);
+  }
+  if (command === 'station-auth') return stationAuthCases(station);
   if (command === 'station-games') {
     for (const g of (await get<StationGameRow[]>(`/api/v1/stations/${station.id}/games`)) ?? []) {
       const state = g.installed === null ? `${DIM}not reported${RESET}` : g.installed ? `${GREEN}installed${RESET}` : `${RED}not installed${RESET}`;
@@ -476,14 +602,24 @@ async function catalogCommand(command: string, args: string[]): Promise<never> {
     }
     return exitSoon(0);
   }
-  // `catalog`: the agent's view, through the dev serial seam.
-  const res = await fetch(`${URL}/stations/me/games`, { headers: { 'x-station-serial': station.serialNumber } });
+  // `catalog`: the agent's view, authenticated with a freshly minted station token.
+  const res = await fetch(`${URL}/stations/me/games`, { headers: { Authorization: `Bearer ${stationToken(station, 60)}` } });
   console.log(`GET /stations/me/games (${station.serialNumber}) -> ${res.status}`);
   console.log(JSON.stringify(await res.json(), null, 2));
   return exitSoon(0);
 }
 
-const CATALOG_COMMANDS = new Set(['games', 'game-add', 'game-set', 'game-assign', 'game-unassign', 'station-games', 'catalog']);
+const CATALOG_COMMANDS = new Set([
+  'games',
+  'game-add',
+  'game-set',
+  'game-assign',
+  'game-unassign',
+  'station-games',
+  'catalog',
+  'station-token',
+  'station-auth',
+]);
 
 if (process.argv[2] === 'cmd') {
   await issueCommand(process.argv[3], process.argv[4], process.argv.slice(5));

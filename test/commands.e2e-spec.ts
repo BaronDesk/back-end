@@ -13,6 +13,7 @@ import { REDIS } from '../src/infra/redis/redis.module.js';
 import { makeFrame } from '../src/infra/realtime/frame.js';
 import type { OutboundEnvelope } from '../src/infra/realtime/envelope.js';
 import { PresenceService, type SessionEndedEvent } from '../src/modules/station/services/presence.service.js';
+import { mintStationToken } from './station-token.js';
 
 const COMMAND_TYPES = new Set(['LOCK', 'UNLOCK', 'SHUTDOWN', 'LAUNCH_GAME', 'END_SESSION', 'CATALOG_UPDATE']);
 
@@ -79,7 +80,7 @@ describe('station commands (e2e)', () => {
     const serialNumber = `CMD-${randomUUID()}`;
     const machine = await prisma.machine.create({ data: { serialNumber, branchId, agentPublicKey: '' } });
     // Like the real agent: the station token rides on the upgrade request.
-    const stationToken = `station-token-${randomUUID()}`;
+    const stationToken = mintStationToken(app, machine);
     const socket = new WebSocket(`${baseUrl.replace('http', 'ws')}/agent-ws`, {
       headers: { authorization: `Bearer ${stationToken}` },
     });
@@ -389,7 +390,11 @@ describe('station commands (e2e)', () => {
 
     it('serves GET /stations/me/games to the agent by its bearer token, resolved for that machine', async () => {
       const agent = await connectAgent();
+      expect((await fetchCatalog({})).statusCode).toBe(401);
       expect((await fetchCatalog({ authorization: 'Bearer nobody' })).statusCode).toBe(401);
+      expect((await fetchCatalog({ authorization: `Bearer ${staffToken}` })).statusCode).toBe(401);
+      const expired = mintStationToken(app, agent.machine, {}, -10);
+      expect((await fetchCatalog({ authorization: `Bearer ${expired}` })).statusCode).toBe(401);
       expect((await fetchCatalog({ authorization: `Bearer ${agent.stationToken}` })).json()).toEqual({ games: [] });
 
       const branchGame = await createGame({ arguments: '-novid', workingDirectory: 'C:\\Games\\test' });
@@ -429,9 +434,9 @@ describe('station commands (e2e)', () => {
       expect(games.find((g) => g.gameId === machineGame.gameId)).toMatchObject({ launchType: 'epic', arguments: null });
       expect(games.some((g) => g.gameId === unassigned.gameId)).toBe(false);
 
-      // Dev seam: the serial header works too (curl / monitor).
+      // Without STATION_AUTH_DEV_BYPASS a serial alone authenticates nothing.
       const bySerial = await fetchCatalog({ 'x-station-serial': agent.machine.serialNumber });
-      expect(bySerial.json().games).toHaveLength(2);
+      expect(bySerial.statusCode).toBe(401);
       agent.socket.close();
     });
 

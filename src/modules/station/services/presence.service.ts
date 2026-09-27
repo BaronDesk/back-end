@@ -7,6 +7,7 @@ import { REDIS } from '../../../infra/redis/redis.module.js';
 import type { MachineStatus } from '../../../generated/prisma/index.js';
 import { MachinesRepository } from '../repository/machines.repository.js';
 import type { HandshakePayload, HeartbeatPayload, StateReportPayload } from '../schemas/presence.schemas.js';
+import type { StationPrincipal } from './station-token.service.js';
 
 export function presenceCacheKey(serialNumber: string): string {
   return `node:${serialNumber}`;
@@ -70,6 +71,13 @@ export class UnknownStationError extends Error {
   }
 }
 
+/** The station token's serial / branch no longer match its MACHINE row. */
+export class StationIdentityMismatchError extends Error {
+  constructor(machineId: string) {
+    super(`station token for ${machineId} does not match its MACHINE row`);
+  }
+}
+
 /**
  * Owns station presence. The ops agent gateway drives it (connect / touch /
  * disconnect); it never writes MACHINE rows itself. Postgres is authoritative
@@ -119,13 +127,25 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
     this.sessionEnded.complete();
   }
 
-  /** handshake: resolve the machine by serial, mark it ONLINE. */
-  async connect(handshake: HandshakePayload, ip: string | null): Promise<void> {
+  /**
+   * handshake: resolve the machine, mark it ONLINE. With a verified station
+   * token the machine is the token's machineId, and its row must still match
+   * the token's serial and branch. `principal: null` (dev bypass only)
+   * resolves by the handshake serial, as before station credentials.
+   */
+  async connect(handshake: HandshakePayload, ip: string | null, principal: StationPrincipal | null = null): Promise<void> {
     const { serialNumber } = handshake;
     const name = handshake.machineName?.trim() || null;
 
-    let machine = await this.machines.findBySerial(serialNumber);
-    if (!machine) {
+    let machine = principal
+      ? await this.machines.findById(principal.machineId)
+      : await this.machines.findBySerial(serialNumber);
+    if (principal) {
+      if (!machine) throw new UnknownStationError(serialNumber);
+      if (machine.serialNumber !== principal.serialNumber || machine.branchId !== principal.branchId) {
+        throw new StationIdentityMismatchError(principal.machineId);
+      }
+    } else if (!machine) {
       if (!this.allowProvisional) throw new UnknownStationError(serialNumber);
       this.logger.warn(`unknown station ${serialNumber}: creating provisional MACHINE row (dev only)`);
       machine = await this.machines.createProvisional(serialNumber, name);

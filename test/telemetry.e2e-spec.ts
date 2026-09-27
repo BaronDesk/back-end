@@ -13,6 +13,7 @@ import { REDIS } from '../src/infra/redis/redis.module.js';
 import { makeFrame } from '../src/infra/realtime/frame.js';
 import type { OutboundEnvelope } from '../src/infra/realtime/envelope.js';
 import { TelemetryHistoryService } from '../src/modules/ops/services/telemetry-history.service.js';
+import { mintStationToken } from './station-token.js';
 
 describe('telemetry & alerts (e2e)', () => {
   let app: NestFastifyApplication;
@@ -81,7 +82,9 @@ describe('telemetry & alerts (e2e)', () => {
   async function connectAgent() {
     const serialNumber = `TEL-${randomUUID()}`;
     const machine = await prisma.machine.create({ data: { serialNumber, branchId, agentPublicKey: '' } });
-    const socket = new WebSocket(`${baseUrl.replace('http', 'ws')}/agent-ws`);
+    const socket = new WebSocket(`${baseUrl.replace('http', 'ws')}/agent-ws`, {
+      headers: { authorization: `Bearer ${mintStationToken(app, machine)}` },
+    });
     const frames: OutboundEnvelope[] = [];
     socket.on('message', (data: Buffer) => frames.push(JSON.parse(data.toString()) as OutboundEnvelope));
     await new Promise((resolve, reject) => {

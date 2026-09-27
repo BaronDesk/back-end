@@ -27,6 +27,16 @@ export const envSchema = z.object({
   // Final status of a command whose station has no live socket at send time.
   COMMAND_OFFLINE_STATUS: z.enum(['TIMEOUT', 'FAILED']).default('FAILED'),
   BULLMQ_PREFIX: z.string().min(1).default('bull'),
+  // DEV ONLY, default off. Lets a station without a valid station JWT be
+  // identified by its handshake serial / x-station-serial, as before station
+  // credentials existed. Refused at startup in production.
+  STATION_AUTH_DEV_BYPASS: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+}).refine((env) => !(env.NODE_ENV === 'production' && env.STATION_AUTH_DEV_BYPASS), {
+  message: 'STATION_AUTH_DEV_BYPASS must not be enabled in production',
+  path: ['STATION_AUTH_DEV_BYPASS'],
 });
 
 export type EnvConfig = z.infer<typeof envSchema>;

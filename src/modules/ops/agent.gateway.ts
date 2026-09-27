@@ -20,8 +20,13 @@ import {
   heartbeatPayloadSchema,
   stateReportPayloadSchema,
 } from '../station/schemas/presence.schemas.js';
-import { PresenceService, UnknownStationError } from '../station/services/presence.service.js';
+import {
+  PresenceService,
+  StationIdentityMismatchError,
+  UnknownStationError,
+} from '../station/services/presence.service.js';
 import { bearerToken, StationAuthService } from '../station/services/station-auth.service.js';
+import { InvalidStationTokenError, type StationPrincipal } from '../station/services/station-token.service.js';
 import { catalogStatusPayloadSchema } from '../games/schemas/games.schemas.js';
 import { GamesService } from '../games/services/games.service.js';
 import { DashboardGateway } from './dashboard.gateway.js';
@@ -37,6 +42,9 @@ import { CommandsService } from './services/commands.service.js';
 import { TelemetryService } from './services/telemetry.service.js';
 
 const HANDSHAKE_TIMEOUT_MS = 10_000;
+
+/** RFC 6455 policy violation: the station's credential does not fit the connection. */
+const CLOSE_POLICY_VIOLATION = 1008;
 
 /** `simulate: 'stale_ts'` backdates the frame well past any replay window. */
 const SIMULATED_STALE_MS = 10 * 60_000;
@@ -70,7 +78,12 @@ const TELEMETRY_STREAM_TYPES: ReadonlySet<string> = new Set([
 
 interface AgentConnection {
   ip: string | null;
-  /** `Authorization: Bearer` from the upgrade request. Unverified until station credentials exist. */
+  /**
+   * Who the verified station token says this is, from the upgrade request.
+   * null only under STATION_AUTH_DEV_BYPASS (the handshake serial decides).
+   */
+  principal: StationPrincipal | null;
+  /** `Authorization: Bearer` from the upgrade request; kept for the dev bypass's REST binding. */
   bearerToken: string | null;
   seqGuard: SeqGuard;
   telemetrySeqGuard: SeqGuard;
@@ -87,9 +100,11 @@ interface AgentConnection {
  * HTTP server (no @nestjs/websockets — that would pull in socket.io for a
  * channel that must speak the plain agent wire protocol).
  *
- * Station identity is the `serialNumber` in the `handshake` frame, not a
- * query parameter. Presence itself lives in the station module; this gateway
- * only translates frames into PresenceService calls.
+ * Station identity is the station JWT on the upgrade request
+ * (`Authorization: Bearer`), verified before the upgrade completes; a missing
+ * or invalid token gets a 401 and never becomes a socket. The handshake's
+ * `serialNumber` must match the token's. Presence itself lives in the station
+ * module; this gateway only translates frames into PresenceService calls.
  */
 @Injectable()
 export class AgentGateway implements OnModuleInit, OnModuleDestroy {
@@ -97,6 +112,8 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
   private wss?: WebSocketServer;
   private statusSub?: Subscription;
   private readonly connections = new WeakMap<WebSocket, AgentConnection>();
+  /** Upgrade request -> its verified principal, from verifyClient to 'connection'. */
+  private readonly principals = new WeakMap<IncomingMessage, StationPrincipal | null>();
 
   constructor(
     private readonly adapterHost: HttpAdapterHost,
@@ -112,7 +129,11 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
   onModuleInit(): void {
     const httpServer = this.adapterHost.httpAdapter.getHttpServer();
 
-    this.wss = new WebSocketServer({ server: httpServer, path: '/agent-ws' });
+    this.wss = new WebSocketServer({
+      server: httpServer,
+      path: '/agent-ws',
+      verifyClient: (info, done) => void this.verifyUpgrade(info.req, done),
+    });
     this.wss.on('connection', (socket: WebSocket, request: IncomingMessage) =>
       this.handleConnection(socket, request),
     );
@@ -128,12 +149,33 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     this.wss?.close();
   }
 
-  // STUB: verifyStation per ADR-003 goes here. The agent may send
-  // `Authorization: Bearer <stationToken>`; it is ignored until station
-  // credentials exist.
+  /** Runs before the upgrade completes: no valid station token, no socket. */
+  private async verifyUpgrade(
+    request: IncomingMessage,
+    done: (result: boolean, code?: number, message?: string) => void,
+  ): Promise<void> {
+    try {
+      this.principals.set(request, await this.stationAuth.authenticateAgent(request.headers.authorization));
+      done(true);
+    } catch (err) {
+      const invalid = err instanceof InvalidStationTokenError;
+      this.logger.warn(`agent-ws upgrade rejected (${remoteIp(request)}): ${(err as Error).message}`);
+      done(false, invalid ? 401 : 500, invalid ? 'Unauthorized' : 'Internal Server Error');
+    }
+  }
+
   private handleConnection(socket: WebSocket, request: IncomingMessage): void {
+    const principal = this.principals.get(request);
+    this.principals.delete(request);
+    if (principal === undefined) {
+      // Only reachable if verifyClient was bypassed; never serve an unverified socket.
+      socket.close(CLOSE_POLICY_VIOLATION, 'unauthenticated');
+      return;
+    }
+
     const conn: AgentConnection = {
       ip: remoteIp(request),
+      principal,
       bearerToken: bearerToken(request.headers.authorization),
       seqGuard: new SeqGuard(),
       telemetrySeqGuard: new SeqGuard(),
@@ -240,15 +282,26 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     }
     const handshake = parsed.data;
 
+    if (conn.principal && handshake.serialNumber !== conn.principal.serialNumber) {
+      this.logger.warn(
+        `rejected agent: handshake serial ${handshake.serialNumber} != token serial ${conn.principal.serialNumber} (${conn.ip})`,
+      );
+      socket.close(CLOSE_POLICY_VIOLATION, 'serial number does not match station token');
+      return;
+    }
+
     if (conn.serialNumber && conn.serialNumber !== handshake.serialNumber) {
       socket.close(4409, 'serial number changed mid-connection');
       return;
     }
 
-    const ready = this.presence.connect(handshake, conn.ip).then(
+    const ready = this.presence.connect(handshake, conn.ip, conn.principal).then(
       () => true,
       (err: Error) => {
-        if (err instanceof UnknownStationError) {
+        if (err instanceof StationIdentityMismatchError) {
+          this.logger.warn(`rejected agent: ${err.message} (${conn.ip})`);
+          socket.close(CLOSE_POLICY_VIOLATION, 'station token does not match the station');
+        } else if (err instanceof UnknownStationError) {
           this.logger.warn(`rejected agent: ${err.message} (${conn.ip})`);
           socket.close(4403, 'unknown station');
         } else {
@@ -270,10 +323,13 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
 
     conn.serialNumber = handshake.serialNumber;
     this.registry.register(handshake.serialNumber, socket);
-    // Dev stub: lets GET /stations/me/games recognise this agent by the same token.
-    this.stationAuth.bindDevToken(conn.bearerToken, handshake.serialNumber);
+    // Dev bypass only: lets GET /stations/me/games recognise a serial-identified agent by its token.
+    if (!conn.principal) this.stationAuth.bindDevToken(conn.bearerToken, handshake.serialNumber);
+    const identity = conn.principal
+      ? `machine ${conn.principal.machineId}, branch ${conn.principal.branchId}`
+      : 'UNVERIFIED, dev bypass';
     this.logger.log(
-      `agent connected: ${handshake.serialNumber} (${handshake.machineName ?? '?'}, v${handshake.agentVersion ?? '?'}) from ${conn.ip}`,
+      `agent connected: ${handshake.serialNumber} [${identity}] (${handshake.machineName ?? '?'}, v${handshake.agentVersion ?? '?'}) from ${conn.ip}`,
     );
     this.send(socket, conn, SERVER_MESSAGE_TYPES.HANDSHAKE_ACK, {});
   }

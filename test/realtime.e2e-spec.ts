@@ -13,6 +13,7 @@ import { REDIS } from '../src/infra/redis/redis.module.js';
 import { DashboardGateway } from '../src/modules/ops/dashboard.gateway.js';
 import { makeFrame } from '../src/infra/realtime/frame.js';
 import type { OutboundEnvelope } from '../src/infra/realtime/envelope.js';
+import { mintStationToken } from './station-token.js';
 
 describe('realtime gateways (e2e)', () => {
   let app: NestFastifyApplication;
@@ -71,8 +72,14 @@ describe('realtime gateways (e2e)', () => {
     return prisma.machine.create({ data: { serialNumber, branchId, agentPublicKey: '' } });
   }
 
-  function openAgent(): Promise<{ socket: WebSocket; frames: OutboundEnvelope[]; next: () => Promise<OutboundEnvelope> }> {
-    const socket = new WebSocket(`${baseUrl.replace('http', 'ws')}/agent-ws`);
+  /** `token` rides on the upgrade request, like the real agent's station JWT. */
+  function openAgent(
+    token: string | null,
+  ): Promise<{ socket: WebSocket; frames: OutboundEnvelope[]; next: () => Promise<OutboundEnvelope> }> {
+    const socket = new WebSocket(
+      `${baseUrl.replace('http', 'ws')}/agent-ws`,
+      token ? { headers: { authorization: `Bearer ${token}` } } : {},
+    );
     const frames: OutboundEnvelope[] = [];
     const waiters: ((frame: OutboundEnvelope) => void)[] = [];
     let read = 0;
@@ -125,7 +132,7 @@ describe('realtime gateways (e2e)', () => {
     const client = await dashboard();
     const online = nextStatus(client, serialNumber, 'ONLINE');
 
-    const agent = await openAgent();
+    const agent = await openAgent(mintStationToken(app, machine));
     agent.socket.send(
       makeFrame(envelope('handshake', 1, { serialNumber, agentVersion: '1.0.0', osVersion: 'test', machineName: 'PC-1' })),
     );
@@ -168,8 +175,8 @@ describe('realtime gateways (e2e)', () => {
 
   it('drops a replayed seq without replying', async () => {
     const serialNumber = `STATION-${randomUUID()}`;
-    await createMachine(serialNumber);
-    const agent = await openAgent();
+    const machine = await createMachine(serialNumber);
+    const agent = await openAgent(mintStationToken(app, machine));
 
     agent.socket.send(makeFrame(envelope('handshake', 1, { serialNumber })));
     expect((await agent.next()).type).toBe('handshake_ack');
@@ -186,11 +193,11 @@ describe('realtime gateways (e2e)', () => {
 
   it('watchdog marks a silent station OFFLINE while the socket stays open', async () => {
     const serialNumber = `STATION-${randomUUID()}`;
-    await createMachine(serialNumber);
+    const machine = await createMachine(serialNumber);
     const client = await dashboard();
     const offline = nextStatus(client, serialNumber, 'OFFLINE');
 
-    const agent = await openAgent();
+    const agent = await openAgent(mintStationToken(app, machine));
     agent.socket.send(makeFrame(envelope('handshake', 1, { serialNumber })));
     expect((await agent.next()).type).toBe('handshake_ack');
 
@@ -207,11 +214,61 @@ describe('realtime gateways (e2e)', () => {
   }, 10_000);
 
   it('closes an agent that never sends a valid handshake', async () => {
-    const agent = await openAgent();
+    const agent = await openAgent(mintStationToken(app, await createMachine(`STATION-${randomUUID()}`)));
     agent.socket.send(makeFrame(envelope('handshake', 1, { serialNumber: '' })));
 
     const code = await new Promise<number>((resolve) => agent.socket.on('close', (closeCode: number) => resolve(closeCode)));
     expect(code).toBe(4400);
+  });
+
+  /** Resolves with the upgrade's HTTP status when the server refuses it, or 101 if it connects. */
+  function upgradeStatus(token: string | null): Promise<number> {
+    const socket = new WebSocket(
+      `${baseUrl.replace('http', 'ws')}/agent-ws`,
+      token ? { headers: { authorization: `Bearer ${token}` } } : {},
+    );
+    return new Promise((resolve) => {
+      socket.on('unexpected-response', (_req, res) => {
+        resolve(res.statusCode ?? 0);
+        socket.terminate();
+      });
+      socket.on('open', () => {
+        resolve(101);
+        socket.close();
+      });
+      socket.on('error', () => undefined);
+    });
+  }
+
+  it('refuses the agent-ws upgrade without a valid station token', async () => {
+    const machine = await createMachine(`STATION-${randomUUID()}`);
+
+    expect(await upgradeStatus(null)).toBe(401);
+    expect(await upgradeStatus('garbage')).toBe(401);
+    expect(await upgradeStatus(mintStationToken(app, machine, {}, -10))).toBe(401);
+    // A user access token is signed with the same key but is not a station credential.
+    expect(await upgradeStatus(accessToken)).toBe(401);
+    expect(await upgradeStatus(mintStationToken(app, machine))).toBe(101);
+  });
+
+  it('closes 1008 when the handshake serial differs from the token serial', async () => {
+    const machine = await createMachine(`STATION-${randomUUID()}`);
+    const agent = await openAgent(mintStationToken(app, machine));
+    agent.socket.send(makeFrame(envelope('handshake', 1, { serialNumber: `OTHER-${randomUUID()}` })));
+
+    const code = await new Promise<number>((resolve) => agent.socket.on('close', (closeCode: number) => resolve(closeCode)));
+    expect(code).toBe(1008);
+    expect((await prisma.machine.findUniqueOrThrow({ where: { id: machine.id } })).status).toBe('OFFLINE');
+  });
+
+  it('closes 1008 when the token no longer matches its MACHINE row', async () => {
+    const machine = await createMachine(`STATION-${randomUUID()}`);
+    const token = mintStationToken(app, machine, { branchId: randomUUID() });
+    const agent = await openAgent(token);
+    agent.socket.send(makeFrame(envelope('handshake', 1, { serialNumber: machine.serialNumber })));
+
+    const code = await new Promise<number>((resolve) => agent.socket.on('close', (closeCode: number) => resolve(closeCode)));
+    expect(code).toBe(1008);
   });
 
   it('rejects a dashboard connection with no token', async () => {
