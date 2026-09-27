@@ -18,7 +18,7 @@ import { EnrollmentService } from '../services/enrollment.service.js';
 export class EnrollmentController {
   constructor(private readonly enrollment: EnrollmentService) {}
 
-  // admin(branch): mints a one-time token for a NEW station to redeem.
+  
   @RequireScope('admin')
   @Post('machines/enrollment-tokens')
   issueToken(
@@ -28,15 +28,14 @@ export class EnrollmentController {
     return this.enrollment.issueToken(caller, dto);
   }
 
-  // admin(branch): mints a one-time token to rotate an ENROLLED machine's credential.
+  
   @RequireScope('admin')
   @Post('machines/:id/rotate-token')
   rotateToken(@CurrentUser() caller: AccessTokenPayload, @Param('id', new ZodValidationPipe(idParamSchema)) id: string) {
     return this.enrollment.rotateToken(caller, id);
   }
 
-  // public: the station redeems the token — it has no user session, so the
-  // one-time token itself is the credential for this one call.
+  
   @Public()
   @Post('machines/enroll')
   redeem(@Body(new ZodValidationPipe(redeemEnrollmentTokenSchema)) dto: RedeemEnrollmentTokenDto) {

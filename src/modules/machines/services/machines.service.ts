@@ -7,7 +7,7 @@ import { MachinesRepository } from '../repository/machines.repository.js';
 import type { ListMachinesQueryDto } from '../schemas/machines.schemas.js';
 import { toPublicMachine, type MachineRecord } from '../util/public-machine.js';
 
-/** Everything that happens to a Machine record once it exists: read + the approve/reject/revoke lifecycle. */
+
 @Injectable()
 export class MachinesService {
   constructor(private readonly machines: MachinesRepository) {}
@@ -15,7 +15,7 @@ export class MachinesService {
   async list(caller: AccessTokenPayload, query: ListMachinesQueryDto) {
     if (query.branchId) assertScope(caller, { branchId: query.branchId });
 
-    // hq with no branchId filter sees every branch; anyone else is pinned to their own.
+   
     const branchId = caller.scope === 'hq' ? query.branchId : (caller.branchId ?? undefined);
     const machines = await this.machines.list({ branchId, enrollmentStatus: query.status });
     return machines.map(toPublicMachine);
@@ -27,7 +27,7 @@ export class MachinesService {
     return toPublicMachine(machine);
   }
 
-  /** admin(branch): PENDING -> ENROLLED. The credential was already set at redemption time. */
+  
   async approve(caller: AccessTokenPayload, id: string) {
     const machine = await this.findOrThrow(id);
     assertScope(caller, { branchId: machine.branchId });
@@ -37,7 +37,7 @@ export class MachinesService {
     return toPublicMachine(updated);
   }
 
-  /** admin(branch): PENDING -> DEACTIVATED. Declines a station that redeemed a token but shouldn't be trusted. */
+  
   async reject(caller: AccessTokenPayload, id: string) {
     const machine = await this.findOrThrow(id);
     assertScope(caller, { branchId: machine.branchId });
@@ -47,7 +47,7 @@ export class MachinesService {
     return toPublicMachine(updated);
   }
 
-  /** admin(branch): any status -> DEACTIVATED. Kills trust in a machine's current credential. */
+  
   async revoke(caller: AccessTokenPayload, id: string) {
     const machine = await this.findOrThrow(id);
     assertScope(caller, { branchId: machine.branchId });
@@ -63,7 +63,7 @@ export class MachinesService {
   }
 
   private assertStatus(
-    machine: { enrollmentStatus: MachineEnrollmentStatus },
+    machine: Pick<MachineRecord, 'enrollmentStatus'>,
     expected: MachineEnrollmentStatus,
     code: string,
     error: string,

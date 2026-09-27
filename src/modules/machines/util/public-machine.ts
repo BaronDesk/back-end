@@ -10,8 +10,7 @@ export interface MachineRecord {
   createdAt: Date;
 }
 
-// agentPublicKey is, by definition, not secret — safe to return to any
-// caller who can already see the machine (unlike the enrollment token).
+
 export function toPublicMachine(machine: MachineRecord) {
   return {
     id: machine.id,

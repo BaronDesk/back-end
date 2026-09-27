@@ -14,11 +14,7 @@ const MAX_TOKEN_TTL_MINUTES = 24 * 60;
 const INVALID_TOKEN = () =>
   new UnauthorizedException({ code: 'INVALID_ENROLLMENT_TOKEN', error: 'enrollment token is invalid, used, or expired' });
 
-/**
- * The credential lifecycle: mint a one-time token (fresh station or
- * rotation), and redeem it. `MachinesService` owns everything that happens
- * to a Machine record afterwards (approve/reject/revoke/list/get).
- */
+
 @Injectable()
 export class EnrollmentService {
   constructor(
@@ -26,13 +22,13 @@ export class EnrollmentService {
     private readonly machines: MachinesRepository,
   ) {}
 
-  /** admin(branch): a token for a station that doesn't exist as a Machine yet. */
+  
   async issueToken(caller: AccessTokenPayload, dto: IssueEnrollmentTokenDto) {
     assertScope(caller, { branchId: dto.branchId });
     return this.mintToken({ branchId: dto.branchId, machineId: null, issuedById: caller.sub, ttlMinutes: dto.ttlMinutes });
   }
 
-  /** admin(branch): a token to replace the agentPublicKey of an already-ENROLLED machine. */
+  
   async rotateToken(caller: AccessTokenPayload, machineId: string) {
     const machine = await this.machines.findById(machineId);
     if (!machine) throw new NotFoundException({ code: 'MACHINE_NOT_FOUND', error: 'machine not found' });
@@ -48,17 +44,14 @@ export class EnrollmentService {
     return this.mintToken({ branchId: machine.branchId, machineId: machine.id, issuedById: caller.sub });
   }
 
-  /**
-   * public: the station redeems the token itself — it has no user session,
-   * so the one-time token IS its authentication for this single call.
-   */
+  
   async redeem(dto: RedeemEnrollmentTokenDto) {
     const record = await this.tokens.findByHash(hashEnrollmentToken(dto.token));
     if (!record || record.consumedAt || record.expiresAt < new Date()) {
       throw INVALID_TOKEN();
     }
 
-    // Consume first: if anything below fails, the token still can't be reused.
+    
     await this.tokens.consume(record.id);
 
     if (record.machineId) {
@@ -71,8 +64,7 @@ export class EnrollmentService {
     const machine = await this.machines.findById(machineId);
     if (!machine) throw new NotFoundException({ code: 'MACHINE_NOT_FOUND', error: 'machine not found' });
 
-    // Extra check beyond "the token was valid": make sure this rotation token
-    // is being redeemed by the same physical station it was minted for.
+    
     if (machine.serialNumber !== dto.serialNumber) {
       throw new ConflictException({
         code: 'SERIAL_NUMBER_MISMATCH',
@@ -120,7 +112,7 @@ export class EnrollmentService {
       expiresAt,
     });
 
-    // Only chance to see the plaintext: the DB only ever gets the hash.
+    
     return { token, expiresAt };
   }
 }
