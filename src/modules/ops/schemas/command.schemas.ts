@@ -9,6 +9,7 @@ export const STATION_COMMAND_TYPES = [
   AGENT_COMMANDS.SHUTDOWN,
   AGENT_COMMANDS.LAUNCH_GAME,
   AGENT_COMMANDS.END_SESSION,
+  AGENT_COMMANDS.CATALOG_UPDATE,
 ] as const;
 export type StationCommandType = (typeof STATION_COMMAND_TYPES)[number];
 
@@ -18,12 +19,16 @@ export type StationCommandType = (typeof STATION_COMMAND_TYPES)[number];
  * - `stale_ts`: backdates the frame's ts so the agent's ReplayGuard nacks STALE.
  * - `duplicate_send`: delivers the same command (same id) twice; the agent
  *   runs it once and re-acks the duplicate.
- * - `exec_failed`: puts a LAUNCH_GAME with no gameId on the wire under this
- *   commandId, whatever the issued type. The agent's LaunchGameCommandHandler
- *   rejects it, which is the only way to get a real EXEC_FAILED
- *   ("Game ID is required.").
+ * - `invalid_payload`: puts a LAUNCH_GAME with an empty gameId on the wire
+ *   under this commandId, whatever the issued type. The agent nacks
+ *   INVALID_PAYLOAD ("gameId is required (1-128 characters).").
+ * - `exec_failed`: puts a LAUNCH_GAME for a gameId that is in no catalog on
+ *   the wire. The agent nacks EXEC_FAILED: "must be unlocked with an active
+ *   session" while locked, else "not in catalog".
+ * Both skip the backend's LAUNCH_GAME pre-checks: they exist to see the
+ * agent's own rejection.
  */
-export const COMMAND_SIMULATIONS = ['stale_ts', 'duplicate_send', 'exec_failed'] as const;
+export const COMMAND_SIMULATIONS = ['stale_ts', 'duplicate_send', 'invalid_payload', 'exec_failed'] as const;
 export type CommandSimulation = (typeof COMMAND_SIMULATIONS)[number];
 
 /**
@@ -40,16 +45,18 @@ export const bookingUnlockPayloadSchema = z.object({
 export type BookingUnlockPayload = z.infer<typeof bookingUnlockPayloadSchema>;
 
 /**
- * LAUNCH_GAME: `gameId` is a catalog GAME id. The agent never sees it; it gets
- * `{ gameId: game.launchRef }`.
+ * LAUNCH_GAME: `gameId` is the catalog's wire gameId, exactly as
+ * GET /stations/me/games served it. The agent launches that entry from its
+ * synced catalog; no path or target ever goes on the wire.
  * END_SESSION: optional `reason` (the agent defaults it to "normal").
+ * CATALOG_UPDATE: no payload; the agent re-pulls GET /stations/me/games.
  */
 export const issueCommandBodySchema = z
   .object({
     type: z.enum(STATION_COMMAND_TYPES),
     // `{}` is the explicit admin form; anything else must be a full booking payload.
     payload: z.union([z.object({}).strict(), bookingUnlockPayloadSchema]).optional(),
-    gameId: z.string().uuid().optional(),
+    gameId: z.string().trim().min(1).max(128).optional(),
     reason: z.string().trim().min(1).max(200).optional(),
     simulate: z.enum(COMMAND_SIMULATIONS).optional(),
   })
@@ -109,13 +116,13 @@ export const commandNackPayloadSchema = z.object({
 });
 export type CommandNackPayload = z.infer<typeof commandNackPayloadSchema>;
 
-/** LAUNCH_GAME wire payload. `gameId` is the catalog entry's launchRef, opaque to the agent. */
+/** LAUNCH_GAME wire payload: the catalog entry's wire gameId. */
 export type LaunchGamePayload = { gameId: string };
 
 /** END_SESSION wire payload. `{}` makes the agent default the reason to "normal". */
 export type EndSessionPayload = { reason?: string };
 
-export type CommandPayload = BookingUnlockPayload | LaunchGamePayload | EndSessionPayload;
+export type CommandPayload = BookingUnlockPayload | LaunchGamePayload | EndSessionPayload | Record<string, never>;
 
 /** What a BullMQ `commands` job carries. */
 export interface CommandJobData {

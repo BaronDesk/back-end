@@ -284,18 +284,18 @@ never from the command result. `cmd` mode prints it after the command settles.
 |---|---|---|
 | a. Direct UNLOCK | `cmd UNLOCK <serial>` | `ACKED`. Agent log: `Workstation unlocked directly`. Next heartbeat: LOCKED `no`. |
 | b. Booking UNLOCK | `cmd LOCK <serial>`, then `cmd UNLOCK <serial> pin=4821` | `ACKED`, but LOCKED stays `yes`. Agent log: `Workstation remains locked ... PIN entry required on LockUI`. It unlocks only after `4821` is typed on the station's LockUI (needs `BaronDesk.LockUI` running). |
-| c. Handler failure | `cmd LOCK <serial> exec_failed` | The backend sends a LAUNCH_GAME with no gameId under this command id; LOCK/UNLOCK/SHUTDOWN never fail on the agent. Status `FAILED`, detail `EXEC_FAILED: Game ID is required.`, tries `1` (not retried). |
+| c. Handler failure | `cmd LOCK <serial> exec_failed` | The backend sends a LAUNCH_GAME for `simulated-not-in-catalog` under this command id. Status `FAILED`, detail `EXEC_FAILED: ...` (the agent's reason: "must be unlocked with an active session" while locked, else "not in catalog"), tries `1` (not retried). |
 | d. Stale send | `cmd LOCK <serial> stale_ts` | Agent log: `Stale message rejected`. Status `NACKED`, detail `STALE`, tries `1`. The lock state does not change. |
 | e. Idempotency | `cmd UNLOCK <serial> duplicate_send` while locked | The agent gets the same command id twice, each with a fresh seq and ts. Agent log: one `unlocked directly`, then `Re-acknowledging idempotently`. Status `ACKED`. |
 | f. Offline station | Stop the agent, wait for OFFLINE, then `cmd LOCK <serial>` | `409 STATION_OFFLINE`. No command row is created. |
 | g. SHUTDOWN | `cmd SHUTDOWN <serial>` with the hq-admin token (manager+ only, staff get 403) | `ACKED`. The agent's power-off is still a stub (it only logs `System shutdown requested.`), so stop the agent yourself: the station goes OFFLINE and the command stays `ACKED`. |
 
-`stale_ts`, `duplicate_send` and `exec_failed` are dev-only. The backend rejects them
-with 400 when `NODE_ENV=production`.
+`stale_ts`, `duplicate_send`, `invalid_payload` and `exec_failed` are dev-only. The
+backend rejects them with 400 when `NODE_ENV=production`.
 
-Nack handling: the agent only sends `UNKNOWN_TYPE`, `STALE` and `EXEC_FAILED`.
-`UNKNOWN_TYPE` and `EXEC_FAILED` end as `FAILED`, `STALE` as `NACKED`, always with the
-agent's `reason`. No nack is retried.
+Nack handling: the agent sends `UNKNOWN_TYPE`, `INVALID_PAYLOAD`, `EXEC_FAILED` and
+`STALE`. The first three end as `FAILED`, `STALE` as `NACKED`, always with the agent's
+`reason`. No nack is retried.
 
 A retry after an ack timeout (10s by default, `COMMAND_ACK_TIMEOUT_MS`) reuses the same
 command id. To see a real retry, block the agent for more than 10s after it receives the
@@ -304,38 +304,56 @@ command. The row then shows `attempts 2`. If no ack arrives at all, the final st
 
 ---
 
-## 4D. Games catalog, LAUNCH_GAME and END_SESSION
+## 4D. Station game catalog, LAUNCH_GAME and END_SESSION
 
-The `migrate` service applies `prisma/migrations/20260926200000_games_catalog`. Both
-commands use the same pipeline and socket as section 4C. The monitor's station table now
-has SESSION and RUNNING GAME columns next to LOCKED. All three come from the agent's
-heartbeat / state_report, never from a command ack.
+The `migrate` service applies `prisma/migrations/20260927120000_station_game_catalog`.
 
-Two facts about the real agent drive the expectations below:
+How it fits together:
 
-- **The launch is a stub.** `GameService.LaunchGameAsync` only logs `Launch game requested`.
-  The agent acks a valid LAUNCH_GAME, but no game window opens and it never reports a
-  `runningGameId`. RUNNING GAME stays `-`. That is the correct result today.
-- **END_SESSION also locks.** The agent ends the session, locks the station, then revokes
-  the lease. After the ack, the next heartbeat shows SESSION `-` and LOCKED `yes`.
+- **The agent pulls its catalog.** On every (re)connect, and on `CATALOG_UPDATE`, it calls
+  `GET /stations/me/games` with `Authorization: Bearer <stationToken>` on the same host as
+  `/agent-ws` (through Caddy on 443). The response is already resolved for that machine:
+  only games assigned to its branch or to the station itself, with per-machine
+  `target` / `arguments` / `workingDirectory` overrides applied.
+- **Station auth is a dev stub.** Nothing verifies the token yet. In development the backend
+  remembers which serial handshook on `/agent-ws` with that token, so the agent needs only
+  `Agent__StationToken` set to any value. `x-station-serial: <serial>` also works for curl.
+  In production the route answers 401 until station credentials exist.
+- **The agent reports back.** After each sync it sends `catalog_status` (`installed` +
+  `reason` per game). That is the only availability truth: the monitor's CATALOG column
+  shows `installed/reported`, and LAUNCH_GAME is refused up front for a game the station has
+  not reported as installed.
+- **The launch is real.** LAUNCH_GAME carries only `{ gameId }`; the agent launches that
+  entry from its synced catalog. An ack means the process was started. RUNNING GAME only
+  updates from `state_report`, which the agent sends on reconnect, not on heartbeat.
+- **END_SESSION stops the game itself,** then ends the session and locks. The backend sends no
+  separate stop command.
 
-Seed the catalog with the hq-admin token (`game-add` / `game-set` need manager+):
+Seed and assign a game with the hq-admin token (game-* need manager+). Use an exe that exists
+on the test PC; Notepad works everywhere:
 
 ```powershell
-npm run monitor -- game-add cs2 steam:730 "Counter-Strike 2"
-npm run monitor -- game-add old-game legacy:1 "Old Game" disabled
-npm run monitor -- games
+npm run monitor -- game-add notepad exe C:\Windows\System32\notepad.exe name=Notepad process=notepad.exe
+npm run monitor -- game-assign notepad <serial>          # this station only
+npm run monitor -- catalog <serial>                      # exactly what the agent receives
+npm run monitor -- station-games <serial>                # catalog + last catalog_status
 ```
+
+To launch, the station must be unlocked with an active session. The current agent's UNLOCK
+always needs a `sessionId`: run `cmd UNLOCK <serial> pin=0000`, and wait until LOCKED `no`
+and SESSION shows an id (type the PIN on the LockUI if the station stays locked).
 
 | Case | Do | Expect |
 |---|---|---|
-| a. Catalog | `game-add` as above, then `games` (or `GET /api/v1/games`) | Both games listed. A gamer token only sees `cs2`. |
-| b. LAUNCH_GAME | `cmd LAUNCH_GAME <serial> game=cs2` | Wire payload `{ gameId: "steam:730" }`. `ACKED`, detail `game=cs2`. Agent log: `Launch game requested`. No game starts. `cmd` mode prints `runningGameId=null`, and RUNNING GAME stays `-`. |
-| c. Blank gameId | `cmd LAUNCH_GAME <serial> game=cs2 exec_failed` | The wire LAUNCH_GAME has no gameId. Status `FAILED`, detail `EXEC_FAILED: Game ID is required.`, tries `1` (not retried). |
-| d. Rejected up front | `cmd LAUNCH_GAME <serial> game=old-game`; a random game uuid; any LAUNCH_GAME while the station is OFFLINE | `409 GAME_DISABLED`, `404 GAME_NOT_FOUND`, `409 STATION_OFFLINE`. No command row, nothing reaches the agent. |
-| e. END_SESSION | Start a session: `cmd UNLOCK <serial> pin=4821`, wait for SESSION to show an id (next heartbeat). Then `cmd END_SESSION <serial> reason=staff_end` | `ACKED`. Next heartbeat: SESSION `-` and LOCKED `yes`. Event lines: `session ended`, `locked=true`. Backend log: `session <id> ended on <serial> (staff_end)`. |
-| f. No session | `cmd END_SESSION <serial>` while SESSION is `-` | `409 NO_ACTIVE_SESSION`. No command row. |
-| g. No INVALID_PAYLOAD | `git grep INVALID_PAYLOAD -- src` | Only the comment in `command.schemas.ts` that says the agent never sends it. Nothing branches on it. |
+| a. Catalog sync | Start (or restart) the agent after `game-assign` | Backend log: `served catalog to <serial>: 1 game(s)`, then `catalog_status from <serial>: 1/1 launchable`. Agent log: `Game catalog synced: 1 games, 1 launchable here`. Monitor CATALOG `1/1`; `station-games` shows `installed`. |
+| b. CATALOG_UPDATE | With the agent connected: `game-add steam-game steam 730 process=cs2.exe`, then `game-assign steam-game <serial>` | A `CATALOG_UPDATE` row goes `ACKED` in COMMANDS, the agent re-pulls, and a fresh `catalog_status` event line follows (CATALOG `x/2`; the steam game shows installed only if Steam and that app are on the PC). `cmd CATALOG_UPDATE <serial>` forces the same. |
+| c. LAUNCH_GAME | Session active: `cmd LAUNCH_GAME <serial> game=notepad` | Notepad opens on the station. `ACKED`. Agent log: `Launched Notepad (notepad) via exe`. RUNNING GAME stays `-` until the agent reconnects (then `state_report` carries `notepad`). |
+| d1. Invalid payload | `cmd LAUNCH_GAME <serial> game=notepad invalid_payload` | Wire gameId is empty. `FAILED`, detail `INVALID_PAYLOAD: gameId is required (1-128 characters).`, tries `1`. |
+| d2. Agent refusal | `cmd LAUNCH_GAME <serial> game=notepad exec_failed` (in session, then again while locked) | `FAILED`, `EXEC_FAILED` with the agent's reason ("not in catalog", then "must be unlocked with an active session"), tries `1`. |
+| d3. Refused up front | `cmd LAUNCH_GAME` for: an unknown id; a game not assigned to the station; a game reported not installed; any game while locked or without a session | `404 GAME_NOT_FOUND`, `409 GAME_NOT_ASSIGNED`, `409 GAME_NOT_INSTALLED` (with the agent's reason), `409 STATION_NOT_IN_SESSION`. Nothing reaches the agent. |
+| e. Untracked launcher game | `cmd LAUNCH_GAME <serial> game=<a steam/epic game without process=>` | Launches, `ACKED`. Agent log: `has no processName in the catalog: it cannot be tracked or closed at session end`. The backend only records the ack. |
+| f. END_SESSION | With Notepad running: `cmd END_SESSION <serial> reason=staff_end` | Agent log: `Stopping game notepad`. Notepad closes. `ACKED`; next heartbeat: SESSION `-`, LOCKED `yes`, RUNNING GAME `-`. COMMANDS shows only the END_SESSION row: no stop command was sent. |
+| g. No session | `cmd END_SESSION <serial>` while SESSION is `-` | `409 NO_ACTIVE_SESSION`. No command row. |
 
 END_SESSION only ends the session on the device. Billing and wallet close-out belong to
 Member B, who subscribes to `PresenceService.sessionEnded` (`session.ended { machineId,

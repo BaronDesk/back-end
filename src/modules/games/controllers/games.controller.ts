@@ -1,40 +1,97 @@
-import { Body, Controller, Get, Param, Patch, Post } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Put } from '@nestjs/common';
 
 import { CurrentUser } from '../../../common/decorators/current-user.decorator.js';
 import { RequireScope } from '../../../common/decorators/require-scope.decorator.js';
 import { ZodValidationPipe } from '../../../common/pipes/zod-validation.pipe.js';
 import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
 import {
+  assignStationSchema,
   createGameSchema,
-  gameIdParamSchema,
   updateGameSchema,
+  uuidParamSchema,
+  type AssignStationDto,
   type CreateGameDto,
   type UpdateGameDto,
 } from '../schemas/games.schemas.js';
 import { GamesService } from '../services/games.service.js';
 
-@Controller('api/v1/games')
+/** Catalog admin. `:id` is the GAME row id (uuid), not the wire gameId. */
+@Controller('api/v1')
 export class GamesController {
   constructor(private readonly games: GamesService) {}
 
   @RequireScope('self')
-  @Get()
+  @Get('games')
   list(@CurrentUser() caller: AccessTokenPayload) {
     return this.games.list(caller);
   }
 
   @RequireScope('admin')
-  @Post()
+  @Post('games')
   create(@Body(new ZodValidationPipe(createGameSchema)) dto: CreateGameDto) {
     return this.games.create(dto);
   }
 
   @RequireScope('admin')
-  @Patch(':id')
+  @Patch('games/:id')
   update(
-    @Param('id', new ZodValidationPipe(gameIdParamSchema)) id: string,
+    @CurrentUser() caller: AccessTokenPayload,
+    @Param('id', new ZodValidationPipe(uuidParamSchema)) id: string,
     @Body(new ZodValidationPipe(updateGameSchema)) dto: UpdateGameDto,
   ) {
-    return this.games.update(id, dto);
+    return this.games.update(caller, id, dto);
+  }
+
+  /** Offer the game at every station of a branch. */
+  @RequireScope('admin')
+  @Put('games/:id/branches/:branchId')
+  assignBranch(
+    @CurrentUser() caller: AccessTokenPayload,
+    @Param('id', new ZodValidationPipe(uuidParamSchema)) id: string,
+    @Param('branchId', new ZodValidationPipe(uuidParamSchema)) branchId: string,
+  ) {
+    return this.games.assignBranch(caller, id, branchId);
+  }
+
+  @RequireScope('admin')
+  @Delete('games/:id/branches/:branchId')
+  unassignBranch(
+    @CurrentUser() caller: AccessTokenPayload,
+    @Param('id', new ZodValidationPipe(uuidParamSchema)) id: string,
+    @Param('branchId', new ZodValidationPipe(uuidParamSchema)) branchId: string,
+  ) {
+    return this.games.unassignBranch(caller, id, branchId);
+  }
+
+  /** Offer the game on one station, optionally with per-machine target/arguments/workingDirectory. */
+  @RequireScope('admin')
+  @Put('games/:id/stations/:stationId')
+  assignStation(
+    @CurrentUser() caller: AccessTokenPayload,
+    @Param('id', new ZodValidationPipe(uuidParamSchema)) id: string,
+    @Param('stationId', new ZodValidationPipe(uuidParamSchema)) stationId: string,
+    @Body(new ZodValidationPipe(assignStationSchema)) dto: AssignStationDto,
+  ) {
+    return this.games.assignStation(caller, id, stationId, dto);
+  }
+
+  @RequireScope('admin')
+  @Delete('games/:id/stations/:stationId')
+  unassignStation(
+    @CurrentUser() caller: AccessTokenPayload,
+    @Param('id', new ZodValidationPipe(uuidParamSchema)) id: string,
+    @Param('stationId', new ZodValidationPipe(uuidParamSchema)) stationId: string,
+  ) {
+    return this.games.unassignStation(caller, id, stationId);
+  }
+
+  /** A station's resolved catalog, with its last reported install state per game. */
+  @RequireScope('staff')
+  @Get('stations/:id/games')
+  stationGames(
+    @CurrentUser() caller: AccessTokenPayload,
+    @Param('id', new ZodValidationPipe(uuidParamSchema)) id: string,
+  ) {
+    return this.games.stationGames(caller, id);
   }
 }

@@ -21,6 +21,9 @@ import {
   stateReportPayloadSchema,
 } from '../station/schemas/presence.schemas.js';
 import { PresenceService, UnknownStationError } from '../station/services/presence.service.js';
+import { bearerToken, StationAuthService } from '../station/services/station-auth.service.js';
+import { catalogStatusPayloadSchema } from '../games/schemas/games.schemas.js';
+import { GamesService } from '../games/services/games.service.js';
 import { DashboardGateway } from './dashboard.gateway.js';
 import {
   commandAckPayloadSchema,
@@ -37,6 +40,15 @@ const HANDSHAKE_TIMEOUT_MS = 10_000;
 
 /** `simulate: 'stale_ts'` backdates the frame well past any replay window. */
 const SIMULATED_STALE_MS = 10 * 60_000;
+
+/**
+ * Wire LAUNCH_GAME payloads for the agent-rejection simulations: an empty
+ * gameId (INVALID_PAYLOAD) and one no catalog contains (EXEC_FAILED).
+ */
+const SIMULATED_LAUNCH_PAYLOADS: Partial<Record<CommandSimulation, Record<string, unknown>>> = {
+  invalid_payload: { gameId: '' },
+  exec_failed: { gameId: 'simulated-not-in-catalog' },
+};
 
 /** No live, handshaken socket for the station at send time. */
 export class StationNotConnectedError extends Error {
@@ -58,6 +70,8 @@ const TELEMETRY_STREAM_TYPES: ReadonlySet<string> = new Set([
 
 interface AgentConnection {
   ip: string | null;
+  /** `Authorization: Bearer` from the upgrade request. Unverified until station credentials exist. */
+  bearerToken: string | null;
   seqGuard: SeqGuard;
   telemetrySeqGuard: SeqGuard;
   outbound: OutboundSequencer;
@@ -91,6 +105,8 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     private readonly dashboard: DashboardGateway,
     private readonly telemetry: TelemetryService,
     private readonly commands: CommandsService,
+    private readonly games: GamesService,
+    private readonly stationAuth: StationAuthService,
   ) {}
 
   onModuleInit(): void {
@@ -118,6 +134,7 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
   private handleConnection(socket: WebSocket, request: IncomingMessage): void {
     const conn: AgentConnection = {
       ip: remoteIp(request),
+      bearerToken: bearerToken(request.headers.authorization),
       seqGuard: new SeqGuard(),
       telemetrySeqGuard: new SeqGuard(),
       outbound: new OutboundSequencer(),
@@ -204,6 +221,9 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
         case AGENT_MESSAGE_TYPES.COMMAND_NACK:
           await this.onCommandNack(conn.serialNumber, envelope);
           return;
+        case AGENT_MESSAGE_TYPES.CATALOG_STATUS:
+          await this.onCatalogStatus(conn.serialNumber, envelope);
+          return;
         default:
           this.logger.debug(`ignored unhandled frame type '${envelope.type}' from ${conn.serialNumber}`);
       }
@@ -250,6 +270,8 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
 
     conn.serialNumber = handshake.serialNumber;
     this.registry.register(handshake.serialNumber, socket);
+    // Dev stub: lets GET /stations/me/games recognise this agent by the same token.
+    this.stationAuth.bindDevToken(conn.bearerToken, handshake.serialNumber);
     this.logger.log(
       `agent connected: ${handshake.serialNumber} (${handshake.machineName ?? '?'}, v${handshake.agentVersion ?? '?'}) from ${conn.ip}`,
     );
@@ -328,6 +350,18 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     await this.commands.onAgentReply(serialNumber, commandId, { kind: 'nack', code, reason: reason ?? null });
   }
 
+  /** catalog_status: after every catalog sync, what this station can actually launch. */
+  private async onCatalogStatus(serialNumber: string, envelope: Envelope): Promise<void> {
+    const parsed = catalogStatusPayloadSchema.safeParse(envelope.payload);
+    const station = this.presence.resolve(serialNumber);
+    if (!parsed.success || !station) {
+      this.logger.warn(`malformed catalog_status payload from ${serialNumber}`);
+      return;
+    }
+    const status = await this.games.recordStationStatus(station, parsed.data);
+    this.dashboard.publishToBranch(station.branchId, DASHBOARD_EVENTS.CATALOG_STATUS, status);
+  }
+
   isConnected(serialNumber: string): boolean {
     return this.registry.get(serialNumber)?.readyState === WebSocket.OPEN;
   }
@@ -351,9 +385,10 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
       throw new StationNotConnectedError(serialNumber);
     }
 
-    // exec_failed: an allowed type whose handler rejects an empty payload.
-    const wireType = simulate === 'exec_failed' ? AGENT_COMMANDS.LAUNCH_GAME : type;
-    const envelope = conn.outbound.next(wireType, simulate === 'exec_failed' ? {} : payload, commandId);
+    // invalid_payload / exec_failed: a LAUNCH_GAME the agent is sure to reject.
+    const simulatedLaunch = simulate ? SIMULATED_LAUNCH_PAYLOADS[simulate] : undefined;
+    const wireType = simulatedLaunch ? AGENT_COMMANDS.LAUNCH_GAME : type;
+    const envelope = conn.outbound.next(wireType, simulatedLaunch ?? payload, commandId);
     if (simulate === 'stale_ts') envelope.ts = new Date(Date.now() - SIMULATED_STALE_MS).toISOString();
     await sendFrame(socket, makeFrame(envelope));
 

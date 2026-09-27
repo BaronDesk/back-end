@@ -21,6 +21,15 @@ export class CommandsRepository extends BaseRepository {
     return this.prisma.command.create({ data });
   }
 
+  /** An undelivered command of this type is already on its way to the machine. */
+  async hasOpen(machineId: string, type: CommandType): Promise<boolean> {
+    const open = await this.prisma.command.findFirst({
+      where: { machineId, type, status: { in: ['PENDING', 'SENT'] } },
+      select: { id: true },
+    });
+    return open !== null;
+  }
+
   findById(id: string) {
     return this.prisma.command.findUnique({ where: { id } });
   }

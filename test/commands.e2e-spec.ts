@@ -14,7 +14,7 @@ import { makeFrame } from '../src/infra/realtime/frame.js';
 import type { OutboundEnvelope } from '../src/infra/realtime/envelope.js';
 import { PresenceService, type SessionEndedEvent } from '../src/modules/station/services/presence.service.js';
 
-const COMMAND_TYPES = new Set(['LOCK', 'UNLOCK', 'SHUTDOWN', 'LAUNCH_GAME', 'END_SESSION']);
+const COMMAND_TYPES = new Set(['LOCK', 'UNLOCK', 'SHUTDOWN', 'LAUNCH_GAME', 'END_SESSION', 'CATALOG_UPDATE']);
 
 type AgentReply = 'ack' | 'silent' | { code: string; reason: string };
 type AgentBehaviour = (frame: OutboundEnvelope, n: number) => AgentReply;
@@ -78,7 +78,11 @@ describe('station commands (e2e)', () => {
   async function connectAgent(behaviour: AgentBehaviour = () => 'ack') {
     const serialNumber = `CMD-${randomUUID()}`;
     const machine = await prisma.machine.create({ data: { serialNumber, branchId, agentPublicKey: '' } });
-    const socket = new WebSocket(`${baseUrl.replace('http', 'ws')}/agent-ws`);
+    // Like the real agent: the station token rides on the upgrade request.
+    const stationToken = `station-token-${randomUUID()}`;
+    const socket = new WebSocket(`${baseUrl.replace('http', 'ws')}/agent-ws`, {
+      headers: { authorization: `Bearer ${stationToken}` },
+    });
     const commands: OutboundEnvelope[] = [];
     let seq = 0;
     let lastCommandSeq = 0;
@@ -106,7 +110,7 @@ describe('station commands (e2e)', () => {
     });
     send('handshake', { serialNumber });
     await vi.waitFor(() => expect(handshaken).toBe(true));
-    return { machine, socket, commands, send };
+    return { machine, socket, commands, send, stationToken };
   }
 
   const issue = (machineId: string, body: Record<string, unknown>, token = staffToken) =>
@@ -202,7 +206,7 @@ describe('station commands (e2e)', () => {
         nackReason: 'Game ID is required.',
       }),
     );
-    expect(agent.commands[0]).toMatchObject({ type: 'LAUNCH_GAME', id: commandId, payload: {} });
+    expect(agent.commands[0]).toMatchObject({ type: 'LAUNCH_GAME', id: commandId, payload: { gameId: 'simulated-not-in-catalog' } });
     // Past the ack timeout + backoff: a retry would have shown up by now.
     await new Promise((r) => setTimeout(r, 1_200));
     expect(agent.commands).toHaveLength(1);
@@ -287,129 +291,250 @@ describe('station commands (e2e)', () => {
     await prisma.branch.delete({ where: { id: otherBranch.id } });
   });
 
-  describe('games catalog, LAUNCH_GAME and END_SESSION', () => {
+  describe('station game catalog, LAUNCH_GAME and END_SESSION', () => {
     const station = async (machineId: string) =>
       (await app.inject({ method: 'GET', url: `/api/v1/stations/${machineId}`, headers: auth() })).json();
 
+    const stationGames = async (machineId: string) =>
+      (await app.inject({ method: 'GET', url: `/api/v1/stations/${machineId}/games`, headers: auth() })).json();
+
+    const fetchCatalog = (headers: Record<string, string>) =>
+      app.inject({ method: 'GET', url: '/stations/me/games', headers });
+
     const createGame = async (overrides: Record<string, unknown> = {}) => {
-      const slug = `g-${randomUUID().slice(0, 8)}`;
+      const gameId = `g-${randomUUID().slice(0, 8)}`;
       const res = await app.inject({
         method: 'POST',
         url: '/api/v1/games',
         headers: auth(managerToken),
-        payload: { name: `Game ${slug}`, slug, launchRef: `ref:${slug}`, ...overrides },
+        payload: { gameId, name: `Game ${gameId}`, launchType: 'exe', target: 'C:\\Games\\test\\game.exe', ...overrides },
       });
       expect(res.statusCode).toBe(201);
       gameIds.push(res.json().id);
-      return res.json() as { id: string; slug: string; launchRef: string; enabled: boolean };
+      return res.json() as { id: string; gameId: string; target: string; enabled: boolean };
     };
 
-    it('lets admin+ manage the catalog; gamers only see enabled games', async () => {
+    const assignToBranch = (id: string) =>
+      app.inject({ method: 'PUT', url: `/api/v1/games/${id}/branches/${branchId}`, headers: auth(managerToken) });
+
+    /** Like LaunchGameCommandHandler: an empty gameId is INVALID_PAYLOAD, anything else is launched. */
+    const launchingAgent = () =>
+      connectAgent((frame) => {
+        if (frame.type !== 'LAUNCH_GAME') return 'ack';
+        const gameId = (frame.payload as { gameId?: unknown } | null)?.gameId;
+        if (typeof gameId !== 'string' || gameId.trim() === '') {
+          return { code: 'INVALID_PAYLOAD', reason: 'gameId is required (1-128 characters).' };
+        }
+        return gameId === 'simulated-not-in-catalog'
+          ? { code: 'EXEC_FAILED', reason: `Game '${gameId}' is not in this station's catalog.` }
+          : 'ack';
+      });
+
+    /** Assigned + reported installed + unlocked with a session: ready to launch. */
+    const readyToLaunch = async () => {
+      const game = await createGame();
+      await assignToBranch(game.id);
+      const agent = await launchingAgent();
+      agent.send('catalog_status', { games: [{ gameId: game.gameId, installed: true, reason: null }] });
+      agent.send('heartbeat', { locked: false, sessionId: randomUUID() });
+      await vi.waitFor(async () =>
+        expect((await stationGames(agent.machine.id)).find((g: { id: string }) => g.id === game.id)?.installed).toBe(true),
+      );
+      await vi.waitFor(async () => expect((await station(agent.machine.id)).locked).toBe(false));
+      return { game, agent };
+    };
+
+    it('lets admin+ manage the catalog, validates launch specs, and hides disabled games from gamers', async () => {
       const denied = await app.inject({
         method: 'POST',
         url: '/api/v1/games',
         headers: auth(),
-        payload: { name: 'x', slug: 'x', launchRef: 'x' },
+        payload: { gameId: 'x', name: 'x', target: 'C:\\x.exe' },
       });
       expect(denied.statusCode).toBe(403);
 
-      const enabled = await createGame();
+      const badPath = await app.inject({
+        method: 'POST',
+        url: '/api/v1/games',
+        headers: auth(managerToken),
+        payload: { gameId: `bad-${randomUUID()}`, name: 'x', launchType: 'exe', target: 'games/cs2.exe' },
+      });
+      expect(badPath.json().code).toBe('INVALID_LAUNCH_SPEC');
+      const badSteam = await app.inject({
+        method: 'POST',
+        url: '/api/v1/games',
+        headers: auth(managerToken),
+        payload: { gameId: `bad-${randomUUID()}`, name: 'x', launchType: 'steam', target: 'cs2' },
+      });
+      expect(badSteam.json().code).toBe('INVALID_LAUNCH_SPEC');
+
+      const enabled = await createGame({ launchType: 'steam', target: '730', processName: 'cs2.exe' });
       const disabled = await createGame({ enabled: false });
       const dup = await app.inject({
         method: 'POST',
         url: '/api/v1/games',
         headers: auth(managerToken),
-        payload: { name: 'dup', slug: enabled.slug, launchRef: 'x' },
+        payload: { gameId: enabled.gameId, name: 'dup', target: 'C:\\x.exe' },
       });
       expect(dup.statusCode).toBe(409);
 
-      const patched = await app.inject({
-        method: 'PATCH',
-        url: `/api/v1/games/${enabled.id}`,
-        headers: auth(managerToken),
-        payload: { sortOrder: 5 },
-      });
-      expect(patched.json()).toMatchObject({ id: enabled.id, sortOrder: 5 });
-
-      const ids = async (token: string) =>
-        (await app.inject({ method: 'GET', url: '/api/v1/games', headers: auth(token) }))
-          .json()
-          .map((g: { id: string }) => g.id);
-      expect(await ids(staffToken)).toEqual(expect.arrayContaining([enabled.id, disabled.id]));
-
       await app.inject({ method: 'POST', url: '/users', payload: { username: usernames[2], password } });
       const login = await app.inject({ method: 'POST', url: '/auth/login', payload: { username: usernames[2], password } });
-      const gamerIds = await ids(login.json().accessToken);
+      const gamerIds = (await app.inject({ method: 'GET', url: '/api/v1/games', headers: auth(login.json().accessToken) }))
+        .json()
+        .map((g: { id: string }) => g.id);
       expect(gamerIds).toContain(enabled.id);
       expect(gamerIds).not.toContain(disabled.id);
     });
 
-    it('delivers LAUNCH_GAME with the launchRef and never reports the game running from the ack', async () => {
-      const game = await createGame();
+    it('serves GET /stations/me/games to the agent by its bearer token, resolved for that machine', async () => {
       const agent = await connectAgent();
-      const res = await issue(agent.machine.id, { type: 'LAUNCH_GAME', gameId: game.id });
+      expect((await fetchCatalog({ authorization: 'Bearer nobody' })).statusCode).toBe(401);
+      expect((await fetchCatalog({ authorization: `Bearer ${agent.stationToken}` })).json()).toEqual({ games: [] });
+
+      const branchGame = await createGame({ arguments: '-novid', workingDirectory: 'C:\\Games\\test' });
+      const machineGame = await createGame({ launchType: 'epic', target: 'Fortnite', arguments: '-ignored' });
+      const unassigned = await createGame();
+
+      // Assigning changes this station's catalog: it gets CATALOG_UPDATE {} to re-sync.
+      expect((await assignToBranch(branchGame.id)).statusCode).toBe(200);
+      await vi.waitFor(() => expect(agent.commands.filter((c) => c.type === 'CATALOG_UPDATE')).toHaveLength(1));
+      expect(agent.commands[0].payload).toEqual({});
+
+      const override = await app.inject({
+        method: 'PUT',
+        url: `/api/v1/games/${branchGame.id}/stations/${agent.machine.id}`,
+        headers: auth(managerToken),
+        payload: { target: 'D:\\Other\\game.exe' },
+      });
+      expect(override.statusCode).toBe(200);
+      await app.inject({
+        method: 'PUT',
+        url: `/api/v1/games/${machineGame.id}/stations/${agent.machine.id}`,
+        headers: auth(managerToken),
+      });
+
+      const res = await fetchCatalog({ authorization: `Bearer ${agent.stationToken}` });
+      expect(res.statusCode).toBe(200);
+      const games = res.json().games as Record<string, unknown>[];
+      expect(games.find((g) => g.gameId === branchGame.gameId)).toEqual({
+        gameId: branchGame.gameId,
+        name: `Game ${branchGame.gameId}`,
+        launchType: 'exe',
+        target: 'D:\\Other\\game.exe',
+        arguments: '-novid',
+        workingDirectory: 'C:\\Games\\test',
+        processName: null,
+      });
+      expect(games.find((g) => g.gameId === machineGame.gameId)).toMatchObject({ launchType: 'epic', arguments: null });
+      expect(games.some((g) => g.gameId === unassigned.gameId)).toBe(false);
+
+      // Dev seam: the serial header works too (curl / monitor).
+      const bySerial = await fetchCatalog({ 'x-station-serial': agent.machine.serialNumber });
+      expect(bySerial.json().games).toHaveLength(2);
+      agent.socket.close();
+    });
+
+    it('stores catalog_status as the station install truth and pushes it to dashboards', async () => {
+      const client = ioClient(baseUrl, {
+        path: '/dashboard-io',
+        forceNew: true,
+        reconnection: false,
+        auth: { token: staffToken },
+      });
+      await new Promise((resolve) => client.on('connect', resolve));
+      const pushed: Record<string, unknown>[] = [];
+      client.on('catalog_status', (e: Record<string, unknown>) => pushed.push(e));
+
+      const game = await createGame();
+      await assignToBranch(game.id);
+      const agent = await connectAgent();
+      agent.send('catalog_status', { games: [{ gameId: game.gameId, installed: false, reason: 'Executable not found.' }] });
+      await vi.waitFor(async () =>
+        expect((await stationGames(agent.machine.id)).find((g: { id: string }) => g.id === game.id)).toMatchObject({
+          installed: false,
+          reason: 'Executable not found.',
+        }),
+      );
+      await vi.waitFor(() => expect(pushed.some((p) => p.machineId === agent.machine.id)).toBe(true));
+
+      // Malformed: logged and dropped, the socket keeps working.
+      agent.send('catalog_status', { games: 'nope' });
+      agent.send('catalog_status', { games: [{ gameId: game.gameId, installed: true }] });
+      await vi.waitFor(async () =>
+        expect((await stationGames(agent.machine.id)).find((g: { id: string }) => g.id === game.id)?.installed).toBe(true),
+      );
+      client.close();
+      agent.socket.close();
+    });
+
+    it('launches only an installed game on an unlocked station in session, sending just the gameId', async () => {
+      const { game, agent } = await readyToLaunch();
+      const res = await issue(agent.machine.id, { type: 'LAUNCH_GAME', gameId: game.gameId });
       expect(res.statusCode).toBe(202);
       const { commandId } = res.json();
 
       await vi.waitFor(async () => expect(await status(commandId)).toMatchObject({ status: 'ACKED', gameId: game.id }));
-      expect(agent.commands[0]).toMatchObject({ type: 'LAUNCH_GAME', id: commandId, payload: { gameId: game.launchRef } });
+      const frame = agent.commands.find((c) => c.id === commandId);
+      expect(frame).toMatchObject({ type: 'LAUNCH_GAME', payload: { gameId: game.gameId } });
+      expect(JSON.stringify(frame)).not.toContain(game.target);
+
+      // runningGameId comes only from state_report, never from the ack.
       expect((await station(agent.machine.id)).runningGameId).toBeNull();
-
-      // Only the agent's own report sets it.
-      agent.send('state_report', { runningGameId: game.launchRef });
-      await vi.waitFor(async () => expect((await station(agent.machine.id)).runningGameId).toBe(game.launchRef));
+      agent.send('state_report', { locked: false, runningGameId: game.gameId });
+      await vi.waitFor(async () => expect((await station(agent.machine.id)).runningGameId).toBe(game.gameId));
       agent.socket.close();
     });
 
-    it('rejects LAUNCH_GAME up front for an unknown or disabled game and an offline station', async () => {
+    it('rejects LAUNCH_GAME up front: no session, unknown, disabled, unassigned, unreported or not installed', async () => {
+      const { game, agent } = await readyToLaunch();
+      const code = async (gameId: string) => (await issue(agent.machine.id, { type: 'LAUNCH_GAME', gameId })).json().code;
+
+      expect(await code(`nope-${randomUUID()}`)).toBe('GAME_NOT_FOUND');
       const disabled = await createGame({ enabled: false });
-      const enabled = await createGame();
-      const agent = await connectAgent();
+      expect(await code(disabled.gameId)).toBe('GAME_DISABLED');
+      const unassigned = await createGame();
+      expect(await code(unassigned.gameId)).toBe('GAME_NOT_ASSIGNED');
+      const unreported = await createGame();
+      await assignToBranch(unreported.id);
+      expect(await code(unreported.gameId)).toBe('GAME_STATUS_UNKNOWN');
 
-      const unknown = await issue(agent.machine.id, { type: 'LAUNCH_GAME', gameId: randomUUID() });
-      expect(unknown.statusCode).toBe(404);
-      expect(unknown.json().code).toBe('GAME_NOT_FOUND');
-      const off = await issue(agent.machine.id, { type: 'LAUNCH_GAME', gameId: disabled.id });
-      expect(off.statusCode).toBe(409);
-      expect(off.json().code).toBe('GAME_DISABLED');
-      expect((await issue(agent.machine.id, { type: 'LAUNCH_GAME' })).statusCode).toBe(400);
+      agent.send('catalog_status', { games: [{ gameId: game.gameId, installed: false, reason: 'Not installed.' }] });
+      await vi.waitFor(async () =>
+        expect((await stationGames(agent.machine.id)).find((g: { id: string }) => g.id === game.id)?.installed).toBe(false),
+      );
+      expect(await code(game.gameId)).toBe('GAME_NOT_INSTALLED');
 
-      const offline = await prisma.machine.create({
-        data: { serialNumber: `CMD-${randomUUID()}`, branchId, agentPublicKey: '' },
-      });
-      const offlineRes = await issue(offline.id, { type: 'LAUNCH_GAME', gameId: enabled.id });
-      expect(offlineRes.statusCode).toBe(409);
-      expect(offlineRes.json().code).toBe('STATION_OFFLINE');
+      agent.send('heartbeat', { locked: true, sessionId: null });
+      await vi.waitFor(async () => expect((await station(agent.machine.id)).locked).toBe(true));
+      expect(await code(game.gameId)).toBe('STATION_NOT_IN_SESSION');
 
-      expect(await prisma.command.count({ where: { machineId: { in: [agent.machine.id, offline.id] } } })).toBe(0);
-      expect(agent.commands).toHaveLength(0);
+      expect(agent.commands.filter((c) => c.type === 'LAUNCH_GAME')).toHaveLength(0);
       agent.socket.close();
     });
 
-    it('records a blank-gameId LAUNCH_GAME as FAILED / EXEC_FAILED, not retried', async () => {
-      const game = await createGame();
-      // Like LaunchGameCommandHandler: a missing or blank gameId fails, and the agent nacks EXEC_FAILED.
-      const agent = await connectAgent((frame) => {
-        const gameId = (frame.payload as { gameId?: unknown } | null)?.gameId;
-        return typeof gameId === 'string' && gameId.trim() !== ''
-          ? 'ack'
-          : { code: 'EXEC_FAILED', reason: 'Game ID is required.' };
-      });
-      const res = await issue(agent.machine.id, { type: 'LAUNCH_GAME', gameId: game.id, simulate: 'exec_failed' });
-      const { commandId } = res.json();
+    it('records INVALID_PAYLOAD and EXEC_FAILED from the agent as FAILED, never retried', async () => {
+      const agent = await launchingAgent();
+      const invalid = (await issue(agent.machine.id, { type: 'LAUNCH_GAME', gameId: 'x', simulate: 'invalid_payload' })).json();
+      const failed = (await issue(agent.machine.id, { type: 'LAUNCH_GAME', gameId: 'x', simulate: 'exec_failed' })).json();
+
       await vi.waitFor(async () =>
-        expect(await status(commandId)).toMatchObject({
+        expect(await status(invalid.commandId)).toMatchObject({
           status: 'FAILED',
-          nackCode: 'EXEC_FAILED',
-          nackReason: 'Game ID is required.',
+          nackCode: 'INVALID_PAYLOAD',
+          nackReason: 'gameId is required (1-128 characters).',
         }),
       );
+      await vi.waitFor(async () =>
+        expect(await status(failed.commandId)).toMatchObject({ status: 'FAILED', nackCode: 'EXEC_FAILED' }),
+      );
+      expect(agent.commands.find((c) => c.id === invalid.commandId)?.payload).toEqual({ gameId: '' });
       await new Promise((r) => setTimeout(r, 1_200));
-      expect(agent.commands).toHaveLength(1);
+      expect(agent.commands).toHaveLength(2);
       agent.socket.close();
     });
 
-    it('ends a session: 409 without one; with one, ACKED, then locked with no session from the next heartbeat', async () => {
+    it('ends a session: 409 without one; with one, ACKED, then locked with no session and no game', async () => {
       const agent = await connectAgent();
       const presence = app.get(PresenceService);
       const ended: SessionEndedEvent[] = [];
@@ -423,6 +548,7 @@ describe('station commands (e2e)', () => {
 
       const sessionId = randomUUID();
       agent.send('heartbeat', { locked: false, sessionId });
+      agent.send('state_report', { locked: false, sessionId, runningGameId: 'cs2' });
       await vi.waitFor(() => expect(presence.sessionOf(agent.machine.serialNumber)).toBe(sessionId));
 
       const { commandId } = (await issue(agent.machine.id, { type: 'END_SESSION', reason: 'staff_end' })).json();
@@ -433,10 +559,14 @@ describe('station commands (e2e)', () => {
       expect(await station(agent.machine.id)).toMatchObject({ sessionId, locked: false });
       expect(ended).toHaveLength(0);
 
-      // What the agent does on END_SESSION: ends the session, then locks.
+      // What the agent does on END_SESSION: stops the game, ends the session, locks.
       agent.send('heartbeat', { locked: true, sessionId: null });
-      await vi.waitFor(async () => expect(await station(agent.machine.id)).toMatchObject({ sessionId: null, locked: true }));
+      await vi.waitFor(async () =>
+        expect(await station(agent.machine.id)).toMatchObject({ sessionId: null, locked: true, runningGameId: null }),
+      );
       expect(ended).toEqual([expect.objectContaining({ machineId: agent.machine.id, sessionId, reason: 'staff_end' })]);
+      // The agent stops the game itself: only the END_SESSION frame went out.
+      expect(agent.commands.map((c) => c.type)).toEqual(['END_SESSION']);
       sub.unsubscribe();
       agent.socket.close();
     });

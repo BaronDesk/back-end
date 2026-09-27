@@ -102,6 +102,15 @@ enum CommandType {
   SHUTDOWN
   LAUNCH_GAME
   END_SESSION
+  CATALOG_UPDATE
+}
+
+// How the agent starts a catalog entry (GameLaunchTypes on the agent). The
+// values are the wire strings.
+enum GameLaunchType {
+  exe
+  steam
+  epic
 }
 
 enum CommandStatus {
@@ -154,6 +163,7 @@ model Branch {
   machines          Machine[]
   telemetryAlerts   TelemetryAlert[]
   commands          Command[]
+  gameBranches      GameBranch[]
 
   @@index([name])
   @@map("branches")
@@ -308,6 +318,7 @@ model Machine {
 
   branch          Branch           @relation(fields: [branchId], references: [id], onDelete: Cascade)
   machineGames    MachineGame[]
+  gameStatuses    StationGameStatus[]
   nodeTelemetry   NodeTelemetry[]
   telemetryAlerts TelemetryAlert[]
   reservations    Reservation[]
@@ -320,32 +331,60 @@ model Machine {
   @@map("machines")
 }
 
-// Backend-side game catalog. The agent never reads it: LAUNCH_GAME sends
-// `launchRef` as its opaque `gameId`, so launchRef is whatever the station's
-// launcher keys on.
+// Backend-side game catalog. A station pulls its resolved view over
+// GET /stations/me/games; LAUNCH_GAME then only carries `gameId`, and the agent
+// launches it from its local copy of that catalog.
 model Game {
-  id        String   @id @default(uuid()) @db.Uuid
-  name      String
-  slug      String   @unique
-  launchRef String   @map("launch_ref")
-  iconUrl   String?  @map("icon_url")
-  enabled   Boolean  @default(true)
-  sortOrder Int      @default(0) @map("sort_order")
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  id               String         @id @default(uuid()) @db.Uuid
+  // Stable wire id: what the catalog response and LAUNCH_GAME carry (1-128 chars).
+  gameId           String         @unique @map("game_id")
+  name             String
+  launchType       GameLaunchType @default(exe) @map("launch_type")
+  // exe: full .exe path | steam: app id | epic: AppName. Per-machine overrides live on MachineGame.
+  target           String
+  arguments        String?
+  workingDirectory String?        @map("working_directory")
+  // Image name of the game's own process (e.g. cs2.exe). Without it the agent
+  // cannot track or close launcher-started (steam/epic) games.
+  processName      String?        @map("process_name")
+  iconUrl          String?        @map("icon_url")
+  enabled          Boolean        @default(true)
+  sortOrder        Int            @default(0) @map("sort_order")
+  createdAt        DateTime       @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime       @updatedAt @map("updated_at") @db.Timestamptz
 
   machineGames MachineGame[]
+  gameBranches GameBranch[]
   commands     Command[]
 
   @@index([enabled, sortOrder])
   @@map("games")
 }
 
-model MachineGame {
-  machineId String  @map("machine_id") @db.Uuid
-  gameId    String  @map("game_id") @db.Uuid
-  installed Boolean @default(false)
+// Game offered at every station of a branch.
+model GameBranch {
+  gameId    String   @map("game_id") @db.Uuid
+  branchId  String   @map("branch_id") @db.Uuid
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  game   Game   @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@id([gameId, branchId])
+  @@index([branchId])
+  @@map("game_branches")
+}
+
+// Game assigned to one station, with optional per-machine overrides (a null
+// override keeps the game's own value).
+model MachineGame {
+  machineId        String   @map("machine_id") @db.Uuid
+  gameId           String   @map("game_id") @db.Uuid
+  target           String?
+  arguments        String?
+  workingDirectory String?  @map("working_directory")
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
 
   machine Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
   game    Game    @relation(fields: [gameId], references: [id], onDelete: Cascade)
@@ -354,6 +393,23 @@ model MachineGame {
   @@index([machineId])
   @@index([gameId])
   @@map("machine_games")
+}
+
+// What the station's last `catalog_status` said: whether each catalog entry
+// can actually be launched there. Replaced wholesale on every report.
+// `gameId` is the wire id as the agent reported it (no FK: the agent may
+// report an entry it rejected).
+model StationGameStatus {
+  machineId  String   @map("machine_id") @db.Uuid
+  gameId     String   @map("game_id")
+  installed  Boolean
+  reason     String?
+  reportedAt DateTime @map("reported_at") @db.Timestamptz
+
+  machine Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
+
+  @@id([machineId, gameId])
+  @@map("station_game_status")
 }
 
 // --- Telemetry ---

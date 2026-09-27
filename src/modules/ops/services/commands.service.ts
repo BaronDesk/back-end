@@ -7,10 +7,13 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  type OnModuleDestroy,
+  type OnModuleInit,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectQueue } from '@nestjs/bullmq';
 import type { Queue } from 'bullmq';
+import type { Subscription } from 'rxjs';
 
 import { assertScope } from '../../../common/utils/assert-scope.js';
 import { SCOPE_RANK } from '../../../common/utils/scope.js';
@@ -18,7 +21,7 @@ import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
 import { DASHBOARD_EVENTS } from '../../../infra/realtime/constants.js';
 import { AgentRegistry } from '../../../infra/realtime/registry.js';
 import type { Command, CommandStatus, Prisma } from '../../../generated/prisma/index.js';
-import { GamesService } from '../../games/services/games.service.js';
+import { GamesService, type CatalogChange } from '../../games/services/games.service.js';
 import { PresenceService, type StationRef } from '../../station/services/presence.service.js';
 import { DashboardGateway } from '../dashboard.gateway.js';
 import { CommandsRepository } from '../repository/commands.repository.js';
@@ -26,7 +29,9 @@ import {
   NACK_CODES,
   type CommandJobData,
   type CommandPayload,
+  type CommandSimulation,
   type IssueCommandBody,
+  type StationCommandType,
   type ListCommandsQuery,
 } from '../schemas/command.schemas.js';
 import { CommandAckTracker, type CommandReply } from './command-ack-tracker.js';
@@ -86,10 +91,14 @@ export function toCommandDto(command: Command) {
  * agent's reply back here. Every status change goes through `transition`,
  * which is compare-and-set in the DB and pushes `command_update`.
  */
+/** Simulations that replace the wire LAUNCH_GAME to provoke an agent-side rejection. */
+const AGENT_REJECTION_SIMULATIONS: ReadonlySet<CommandSimulation> = new Set(['invalid_payload', 'exec_failed']);
+
 @Injectable()
-export class CommandsService {
+export class CommandsService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(CommandsService.name);
   private readonly simulationsAllowed: boolean;
+  private catalogSub?: Subscription;
 
   constructor(
     private readonly repo: CommandsRepository,
@@ -102,6 +111,14 @@ export class CommandsService {
     private readonly games: GamesService,
   ) {
     this.simulationsAllowed = config.get('NODE_ENV') !== 'production';
+  }
+
+  onModuleInit(): void {
+    this.catalogSub = this.games.catalogChanges.subscribe((change) => void this.requestCatalogSync(change));
+  }
+
+  onModuleDestroy(): void {
+    this.catalogSub?.unsubscribe();
   }
 
   async issue(caller: AccessTokenPayload, stationId: string, body: IssueCommandBody) {
@@ -122,9 +139,19 @@ export class CommandsService {
     let payload: CommandPayload | undefined = body.payload;
     let gameId: string | undefined;
     if (body.type === 'LAUNCH_GAME') {
-      const game = await this.games.findLaunchable(body.gameId!);
-      gameId = game.id;
-      payload = { gameId: game.launchRef };
+      const wireGameId = body.gameId!;
+      payload = { gameId: wireGameId };
+      if (!body.simulate || !AGENT_REJECTION_SIMULATIONS.has(body.simulate)) {
+        // The agent refuses the launch while locked or without a session.
+        const agent = this.presence.agentStateOf(station.serialNumber);
+        if (agent?.locked !== false || !agent.sessionId) {
+          throw new ConflictException({
+            code: 'STATION_NOT_IN_SESSION',
+            error: 'station must be unlocked with an active session to launch a game',
+          });
+        }
+        gameId = (await this.games.findLaunchable(station, wireGameId)).id;
+      }
     } else if (body.type === 'END_SESSION') {
       if (!this.presence.sessionOf(station.serialNumber)) {
         throw new ConflictException({ code: 'NO_ACTIVE_SESSION', error: 'station has no active session' });
@@ -132,25 +159,58 @@ export class CommandsService {
       payload = body.reason ? { reason: body.reason } : {};
     }
 
+    // Labels the session.ended event, which fires only once the agent reports
+    // the session gone. The agent also stops the running game itself: no
+    // separate stop command. Billing close-out is Member B's, not ours.
+    if (body.type === 'END_SESSION') this.presence.expectSessionEnd(station.serialNumber, body.reason ?? 'normal');
+
+    // TODO(sessions): the booking flow (Member B) will build `payload` from
+    // the reservation instead of taking it from the request body.
+    return this.dispatch(station, body.type, caller.sub, { payload, gameId, simulate: body.simulate });
+  }
+
+  /**
+   * CATALOG_UPDATE for every online station whose resolved catalog changed,
+   * so the agent re-pulls GET /stations/me/games now instead of on its next
+   * reconnect. Offline stations need nothing: they sync on connect. Never
+   * throws: this runs from a subscription.
+   */
+  async requestCatalogSync(change: CatalogChange): Promise<void> {
+    const targets = this.presence
+      .onlineStations()
+      .filter((s) => change.branchIds.includes(s.branchId) || change.machineIds.includes(s.machineId))
+      .filter((s) => this.registry.has(s.serialNumber));
+    for (const station of targets) {
+      try {
+        // One pending sync is enough: the agent pulls the latest catalog when it runs.
+        if (await this.repo.hasOpen(station.machineId, 'CATALOG_UPDATE')) continue;
+        await this.dispatch(station, 'CATALOG_UPDATE', change.issuedBy, { payload: {} });
+      } catch (err) {
+        this.logger.error(`CATALOG_UPDATE for ${station.serialNumber} not issued: ${(err as Error).message}`);
+      }
+    }
+  }
+
+  /** Creates the COMMAND row, pushes it, and queues its delivery. */
+  private async dispatch(
+    station: StationRef,
+    type: StationCommandType,
+    issuedBy: string,
+    options: { payload?: CommandPayload; gameId?: string; simulate?: CommandSimulation },
+  ) {
     const row = await this.repo.create({
       id: randomUUID(),
       machineId: station.machineId,
       branchId: station.branchId,
-      type: body.type,
-      issuedBy: caller.sub,
-      gameId,
+      type,
+      issuedBy,
+      gameId: options.gameId,
     });
-    this.logger.log(`${row.type} ${row.id} issued for ${station.serialNumber} by ${caller.sub}`);
+    this.logger.log(`${row.type} ${row.id} issued for ${station.serialNumber} by ${issuedBy}`);
     this.publish(row);
 
-    // Labels the session.ended event, which fires only once the agent reports
-    // the session gone. Billing close-out is Member B's, not ours.
-    if (body.type === 'END_SESSION') this.presence.expectSessionEnd(station.serialNumber, body.reason ?? 'normal');
-
     try {
-      // TODO(sessions): the booking flow (Member B) will build `payload` from
-      // the reservation instead of taking it from the request body.
-      await this.enqueue({ commandId: row.id, payload, simulate: body.simulate });
+      await this.enqueue({ commandId: row.id, payload: options.payload, simulate: options.simulate });
     } catch (err) {
       const reason = `enqueue failed: ${(err as Error).message}`;
       this.logger.error(`${row.type} ${row.id}: ${reason}`);
@@ -177,10 +237,11 @@ export class CommandsService {
    * command_ack / command_nack from the gateway. Never throws past a log line.
    *
    * An ack means "accepted", not "done": a booking UNLOCK is acked while the
-   * station stays locked until the PIN is typed, and a LAUNCH_GAME is acked
-   * although the agent's launch is still a stub. Nothing here touches station
-   * state. locked / sessionId / runningGameId come only from presence
-   * (heartbeat / state_report).
+   * station stays locked until the PIN is typed. A LAUNCH_GAME ack does mean
+   * the process was started, but runningGameId still comes only from the
+   * agent's state_report (sent on its next reconnect), never from here.
+   * Nothing here touches station state: locked / sessionId / runningGameId
+   * come only from presence (heartbeat / state_report).
    */
   async onAgentReply(serialNumber: string, commandId: string, reply: Exclude<CommandReply, { kind: 'timeout' }>) {
     const row = await this.repo.findById(commandId);

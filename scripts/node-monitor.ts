@@ -1,9 +1,10 @@
 // TEMPORARY DEV MONITOR — delete before merge
 //
-// Live view of station presence (with session / locked / running game),
-// telemetry, alerts and commands, fed by `station_status`, `telemetry_update`,
-// `alert`, `alert_resolved` and `command_update` on /dashboard-io. Standalone
-// on purpose: no imports from src/.
+// Live view of station presence (with session / locked / running game /
+// catalog install state), telemetry, alerts and commands, fed by
+// `station_status`, `catalog_status`, `telemetry_update`, `alert`,
+// `alert_resolved` and `command_update` on /dashboard-io. Standalone on
+// purpose: no imports from src/.
 //
 //   TOKEN=<staff access token> npm run monitor
 //   URL defaults to http://localhost:3000 (dev compose exposes Nest directly).
@@ -15,19 +16,25 @@
 //   pin=<pin> [session=<uuid>]   UNLOCK only: booking unlock (station stays locked
 //                                until the PIN is typed on its LockUI). session
 //                                defaults to a random uuid.
-//   game=<gameId|slug>           LAUNCH_GAME only (required): a catalog game.
+//   game=<gameId>                LAUNCH_GAME only (required): the catalog's wire gameId.
 //   reason=<text>                END_SESSION only: the agent defaults it to "normal".
-//   stale_ts | duplicate_send | exec_failed   dev-only fault injection.
-//                                exec_failed puts a blank-gameId LAUNCH_GAME on the wire.
+//   stale_ts | duplicate_send | invalid_payload | exec_failed   dev-only fault injection.
+//                                invalid_payload: LAUNCH_GAME with an empty gameId (agent: INVALID_PAYLOAD).
+//                                exec_failed: LAUNCH_GAME for an id in no catalog (agent: EXEC_FAILED).
 //
 //   TOKEN=... npm run monitor -- cmd LOCK <station> [options]
-//   TOKEN=... npm run monitor -- cmd LAUNCH_GAME <station> game=<slug> [exec_failed]
+//   TOKEN=... npm run monitor -- cmd LAUNCH_GAME <station> game=<gameId> [invalid_payload|exec_failed]
 //   TOKEN=... npm run monitor -- cmd END_SESSION <station> [reason=<text>]
+//   TOKEN=... npm run monitor -- cmd CATALOG_UPDATE <station>
 //
-// Game catalog (game-add / game-set need a manager+ token):
+// Game catalog (game-* need a manager+ token). <station> is a serial or MACHINE id:
 //   TOKEN=... npm run monitor -- games
-//   TOKEN=... npm run monitor -- game-add <slug> <launchRef> [name] [disabled]
-//   TOKEN=... npm run monitor -- game-set <gameId|slug> enabled=true|false
+//   TOKEN=... npm run monitor -- game-add <gameId> exe|steam|epic <target> [name=..] [process=..] [args=..] [dir=..] [disabled]
+//   TOKEN=... npm run monitor -- game-set <gameId> enabled=true|false | target=.. | process=.. | args=..
+//   TOKEN=... npm run monitor -- game-assign <gameId> <station> [branch] [target=..] [args=..] [dir=..]
+//   TOKEN=... npm run monitor -- game-unassign <gameId> <station> [branch]
+//   TOKEN=... npm run monitor -- station-games <station>   resolved catalog + last catalog_status
+//   TOKEN=... npm run monitor -- catalog <station>         exactly what GET /stations/me/games serves the agent
 import { io } from 'socket.io-client';
 
 interface StationRow {
@@ -44,11 +51,31 @@ interface StationRow {
 
 interface GameRow {
   id: string;
+  gameId: string;
   name: string;
-  slug: string;
-  launchRef: string;
+  launchType: string;
+  target: string;
+  processName: string | null;
   enabled: boolean;
   sortOrder: number;
+}
+
+interface StationGameRow {
+  id: string;
+  gameId: string;
+  name: string;
+  launchType: string;
+  target: string;
+  processName: string | null;
+  installed: boolean | null;
+  reason: string | null;
+}
+
+interface CatalogStatusEvent {
+  machineId: string;
+  serialNumber: string;
+  reportedAt: string;
+  games: { gameId: string; installed: boolean; reason: string | null }[];
 }
 
 interface TelemetryUpdate {
@@ -103,6 +130,8 @@ const telemetry = new Map<string, TelemetryUpdate>();
 const alerts: string[] = [];
 const commands = new Map<string, CommandEvent>();
 const games = new Map<string, GameRow>();
+/** serial -> last catalog_status: what the station says it can launch. */
+const catalogs = new Map<string, CatalogStatusEvent['games']>();
 const log: string[] = [];
 let connection = 'connecting...';
 
@@ -139,7 +168,7 @@ function indexed(metrics: Record<string, number>, prefix: string, suffix: string
 }
 
 function renderStations(): string[] {
-  const header = `${pad('SERIAL', 24)} ${pad('STATUS', 8)} ${pad('LOCKED', 7)} ${pad('SESSION', 10)} ${pad('RUNNING GAME', 16)} ${pad('LAST SEEN', 14)} IP`;
+  const header = `${pad('SERIAL', 24)} ${pad('STATUS', 8)} ${pad('LOCKED', 7)} ${pad('SESSION', 10)} ${pad('RUNNING GAME', 16)} ${pad('CATALOG', 9)} ${pad('LAST SEEN', 14)} IP`;
   const lines = [...rows.values()]
     .sort((a, b) => a.serialNumber.localeCompare(b.serialNumber))
     .map((r) => {
@@ -147,7 +176,10 @@ function renderStations(): string[] {
       // Both come straight from the agent's heartbeat / state_report, never from a command ack.
       const session = r.sessionId ? r.sessionId.slice(0, 8) : '-';
       const game = r.runningGameId ?? '-';
-      return `${pad(r.serialNumber, 24)} ${cell(r.status, 8, r.status === 'ONLINE' ? GREEN : RED)} ${pad(locked, 7)} ${pad(session, 10)} ${cell(game, 16, r.runningGameId ? GREEN : undefined)} ${pad(relative(r.lastSeen), 14)} ${r.ip ?? '-'}`;
+      // installed / reported, from the station's last catalog_status.
+      const catalog = catalogs.get(r.serialNumber);
+      const catalogText = catalog ? `${catalog.filter((g) => g.installed).length}/${catalog.length}` : '-';
+      return `${pad(r.serialNumber, 24)} ${cell(r.status, 8, r.status === 'ONLINE' ? GREEN : RED)} ${pad(locked, 7)} ${pad(session, 10)} ${cell(game, 16, r.runningGameId ? GREEN : undefined)} ${pad(catalogText, 9)} ${pad(relative(r.lastSeen), 14)} ${r.ip ?? '-'}`;
     });
   return [header, '-'.repeat(header.length + 12), ...(lines.length ? lines : [`${DIM}(no stations yet)${RESET}`])];
 }
@@ -206,7 +238,7 @@ function renderCommands(): string[] {
     .sort((a, b) => a.issuedAt.localeCompare(b.issuedAt))
     .slice(-10)
     .map((c) => {
-      const game = c.gameId ? (games.get(c.gameId)?.slug ?? c.gameId.slice(0, 8)) : '';
+      const game = c.gameId ? (games.get(c.gameId)?.gameId ?? c.gameId.slice(0, 8)) : '';
       const outcome = c.nackCode ? `${c.nackCode}${c.nackReason ? `: ${c.nackReason}` : ''}` : (c.failureReason ?? '');
       const detail = [game && `game=${game}`, outcome].filter(Boolean).join('  ');
       return [
@@ -231,7 +263,7 @@ function render(): void {
   console.log(`\nALERTS\n${alertHeader}\n${'-'.repeat(alertHeader.length + 20)}`);
   console.log(alerts.length ? alerts.slice(-10).join('\n') : `${DIM}(no alerts)${RESET}`);
   console.log(
-    `\nCOMMANDS  ${DIM}(issue: npm run monitor -- cmd LOCK|UNLOCK|SHUTDOWN|LAUNCH_GAME|END_SESSION <serial>)${RESET}`,
+    `\nCOMMANDS  ${DIM}(issue: npm run monitor -- cmd LOCK|UNLOCK|SHUTDOWN|LAUNCH_GAME|END_SESSION|CATALOG_UPDATE <serial>)${RESET}`,
   );
   console.log(renderCommands().join('\n'));
   console.log(`\n${DIM}recent events:${RESET}`);
@@ -255,6 +287,18 @@ async function get<T>(path: string): Promise<T | null> {
 async function seed(): Promise<void> {
   for (const s of (await get<StationRow[]>('/api/v1/stations')) ?? []) rows.set(s.serialNumber, s);
   for (const g of (await get<GameRow[]>('/api/v1/games')) ?? []) games.set(g.id, g);
+  for (const station of rows.values()) {
+    if (!station.id) continue;
+    const reported = ((await get<StationGameRow[]>(`/api/v1/stations/${station.id}/games`)) ?? []).filter(
+      (g) => g.installed !== null,
+    );
+    if (reported.length) {
+      catalogs.set(
+        station.serialNumber,
+        reported.map((g) => ({ gameId: g.gameId, installed: g.installed === true, reason: g.reason })),
+      );
+    }
+  }
   const open = (await get<AlertEvent[]>('/api/v1/alerts?status=open&limit=10')) ?? [];
   alerts.length = 0;
   for (const a of open.reverse()) alerts.push(alertLine(a));
@@ -272,7 +316,7 @@ const FINAL = new Set(['ACKED', 'NACKED', 'TIMEOUT', 'FAILED']);
 async function issueCommand(type: string | undefined, target: string | undefined, options: string[]) {
   if (!type || !target) {
     console.error(
-      'usage: npm run monitor -- cmd LOCK|UNLOCK|SHUTDOWN|LAUNCH_GAME|END_SESSION <serial|machineId> [pin=<pin> [session=<uuid>]] [game=<id|slug>] [reason=<text>] [stale_ts|duplicate_send|exec_failed]',
+      'usage: npm run monitor -- cmd LOCK|UNLOCK|SHUTDOWN|LAUNCH_GAME|END_SESSION|CATALOG_UPDATE <serial|machineId> [pin=<pin> [session=<uuid>]] [game=<gameId>] [reason=<text>] [stale_ts|duplicate_send|invalid_payload|exec_failed]',
     );
     process.exit(1);
   }
@@ -281,16 +325,8 @@ async function issueCommand(type: string | undefined, target: string | undefined
   const pin = option('pin');
   const payload = pin ? { sessionId: option('session') ?? crypto.randomUUID(), pin } : undefined;
   const reason = option('reason');
-  const gameArg = option('game');
-  let gameId: string | undefined;
-  if (gameArg) {
-    const catalog = (await get<GameRow[]>('/api/v1/games')) ?? [];
-    gameId = catalog.find((g) => g.id === gameArg || g.slug === gameArg)?.id;
-    if (!gameId) {
-      console.error(`no game '${gameArg}'. known: ${catalog.map((g) => g.slug).join(', ') || '(none)'}`);
-      process.exit(1);
-    }
-  }
+  // The wire gameId goes as typed: the backend (or, with a simulation, the agent) judges it.
+  const gameId = option('game');
   const stations = (await get<StationRow[]>('/api/v1/stations')) ?? [];
   const station = stations.find((s) => s.serialNumber === target || s.id === target);
   if (!station?.id) {
@@ -320,62 +356,140 @@ async function issueCommand(type: string | undefined, target: string | undefined
     const current = await get<CommandEvent>(`/api/v1/commands/${body.commandId}`);
     if (current && current.status !== last) {
       last = current.status;
-      const extra = current.nackCode ?? current.failureReason ?? '';
+      const extra = current.nackCode ? `${current.nackCode}: ${current.nackReason ?? ''}` : (current.failureReason ?? '');
       console.log(`${new Date().toLocaleTimeString()}  ${body.commandId} -> ${last} (attempts ${current.attempts}) ${extra}`);
     }
   }
   // ACKED means "accepted". Station state comes from its heartbeat / state_report.
   const after = (await get<StationRow[]>('/api/v1/stations'))?.find((s) => s.id === station.id);
   console.log(
-    `station ${station.serialNumber} locked=${after?.locked ?? '?'} sessionId=${after?.sessionId ?? 'null'} runningGameId=${after?.runningGameId ?? 'null'} (from heartbeat; refreshes every ~15s)`,
+    `station ${station.serialNumber} locked=${after?.locked ?? '?'} sessionId=${after?.sessionId ?? 'null'} runningGameId=${after?.runningGameId ?? 'null'} (locked/session from heartbeat ~15s; runningGameId only from state_report, i.e. after an agent reconnect)`,
   );
   process.exit(FINAL.has(last) ? 0 : 2);
 }
 
-async function send(method: string, path: string, body: unknown): Promise<void> {
+async function send(method: string, path: string, body?: unknown): Promise<void> {
   const res = await fetch(`${URL}${path}`, {
     method,
-    headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    headers: { Authorization: `Bearer ${TOKEN}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
-  console.log(`${method} ${path} -> ${res.status} ${JSON.stringify(await res.json())}`);
+  console.log(`${method} ${path} -> ${res.status} ${await res.text()}`);
   if (!res.ok) process.exit(1);
 }
 
-/** `games` / `game-add` / `game-set`: catalog helpers for the physical test. */
+async function findStation(target: string | undefined): Promise<StationRow & { branchId?: string }> {
+  const stations = (await get<StationRow[]>('/api/v1/stations')) ?? [];
+  const station = stations.find((s) => s.serialNumber === target || s.id === target);
+  if (!station?.id) {
+    console.error(`no station '${target}'. known: ${stations.map((s) => s.serialNumber).join(', ') || '(none)'}`);
+    process.exit(1);
+  }
+  return (await get<StationRow & { branchId?: string }>(`/api/v1/stations/${station.id}`)) ?? station;
+}
+
+async function findGame(gameId: string | undefined): Promise<GameRow> {
+  const catalog = (await get<GameRow[]>('/api/v1/games')) ?? [];
+  const game = catalog.find((g) => g.gameId === gameId || g.id === gameId);
+  if (!game) {
+    console.error(`no game '${gameId}'. known: ${catalog.map((g) => g.gameId).join(', ') || '(none)'}`);
+    process.exit(1);
+  }
+  return game;
+}
+
+/** `key=value` options into an object, mapping short names to API fields. */
+function fields(args: string[], names: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const arg of args) {
+    const at = arg.indexOf('=');
+    if (at > 0 && names[arg.slice(0, at)]) out[names[arg.slice(0, at)]] = arg.slice(at + 1);
+  }
+  return out;
+}
+
+const GAME_FIELDS = { name: 'name', process: 'processName', args: 'arguments', dir: 'workingDirectory', target: 'target' };
+const OVERRIDE_FIELDS = { target: 'target', args: 'arguments', dir: 'workingDirectory' };
+
+/**
+ * process.exit right after a fetch can trip a libuv assertion on Windows
+ * (a keep-alive socket still closing). Let the handles settle first.
+ */
+async function exitSoon(code: number): Promise<never> {
+  await new Promise((r) => setTimeout(r, 100));
+  process.exit(code);
+}
+
+/** Catalog helpers for the physical test. */
 async function catalogCommand(command: string, args: string[]): Promise<never> {
   if (command === 'games') {
     for (const g of (await get<GameRow[]>('/api/v1/games')) ?? []) {
-      console.log(`${pad(g.slug, 24)} ${pad(g.enabled ? 'enabled' : 'disabled', 9)} launchRef=${g.launchRef}  ${g.id}`);
+      console.log(
+        `${pad(g.gameId, 20)} ${pad(g.enabled ? 'enabled' : 'disabled', 9)} ${pad(g.launchType, 6)} target=${g.target} process=${g.processName ?? '-'}  ${DIM}${g.id}${RESET}`,
+      );
     }
     if (log.length) console.log(log.join('\n'));
-    process.exit(0);
+    return exitSoon(0);
   }
   if (command === 'game-add') {
-    const [slug, launchRef, name, flag] = args;
-    if (!slug || !launchRef) {
-      console.error('usage: npm run monitor -- game-add <slug> <launchRef> [name] [disabled]');
+    const [gameId, launchType, target, ...rest] = args;
+    if (!gameId || !launchType || !target) {
+      console.error('usage: npm run monitor -- game-add <gameId> exe|steam|epic <target> [name=..] [process=..] [args=..] [dir=..] [disabled]');
       process.exit(1);
     }
-    await send('POST', '/api/v1/games', { slug, launchRef, name: name ?? slug, enabled: flag !== 'disabled' });
-    process.exit(0);
+    await send('POST', '/api/v1/games', {
+      gameId,
+      name: gameId,
+      launchType,
+      target,
+      ...fields(rest, GAME_FIELDS),
+      enabled: !rest.includes('disabled'),
+    });
+    return exitSoon(0);
   }
-  const [target, setting] = args;
-  const enabled = setting?.match(/^enabled=(true|false)$/)?.[1];
-  const game = ((await get<GameRow[]>('/api/v1/games')) ?? []).find((g) => g.id === target || g.slug === target);
-  if (!game || !enabled) {
-    console.error('usage: npm run monitor -- game-set <gameId|slug> enabled=true|false');
-    process.exit(1);
+  if (command === 'game-set') {
+    const [gameId, ...rest] = args;
+    const game = await findGame(gameId);
+    const patch: Record<string, unknown> = fields(rest, GAME_FIELDS);
+    const enabled = rest.find((a) => a.startsWith('enabled='))?.slice('enabled='.length);
+    if (enabled) patch.enabled = enabled === 'true';
+    await send('PATCH', `/api/v1/games/${game.id}`, patch);
+    return exitSoon(0);
   }
-  await send('PATCH', `/api/v1/games/${game.id}`, { enabled: enabled === 'true' });
-  process.exit(0);
+  if (command === 'game-assign' || command === 'game-unassign') {
+    const [gameId, target, ...rest] = args;
+    const game = await findGame(gameId);
+    const station = await findStation(target);
+    const method = command === 'game-assign' ? 'PUT' : 'DELETE';
+    if (rest.includes('branch')) {
+      await send(method, `/api/v1/games/${game.id}/branches/${station.branchId}`);
+    } else {
+      await send(method, `/api/v1/games/${game.id}/stations/${station.id}`, method === 'PUT' ? fields(rest, OVERRIDE_FIELDS) : undefined);
+    }
+    return exitSoon(0);
+  }
+  const station = await findStation(args[0]);
+  if (command === 'station-games') {
+    for (const g of (await get<StationGameRow[]>(`/api/v1/stations/${station.id}/games`)) ?? []) {
+      const state = g.installed === null ? `${DIM}not reported${RESET}` : g.installed ? `${GREEN}installed${RESET}` : `${RED}not installed${RESET}`;
+      console.log(`${pad(g.gameId, 20)} ${pad(g.launchType, 6)} target=${g.target}  ${state}${g.reason ? `  (${g.reason})` : ''}`);
+    }
+    return exitSoon(0);
+  }
+  // `catalog`: the agent's view, through the dev serial seam.
+  const res = await fetch(`${URL}/stations/me/games`, { headers: { 'x-station-serial': station.serialNumber } });
+  console.log(`GET /stations/me/games (${station.serialNumber}) -> ${res.status}`);
+  console.log(JSON.stringify(await res.json(), null, 2));
+  return exitSoon(0);
 }
+
+const CATALOG_COMMANDS = new Set(['games', 'game-add', 'game-set', 'game-assign', 'game-unassign', 'station-games', 'catalog']);
 
 if (process.argv[2] === 'cmd') {
   await issueCommand(process.argv[3], process.argv[4], process.argv.slice(5));
 }
-if (process.argv[2] === 'games' || process.argv[2] === 'game-add' || process.argv[2] === 'game-set') {
-  await catalogCommand(process.argv[2], process.argv.slice(3));
+if (CATALOG_COMMANDS.has(process.argv[2] ?? '')) {
+  await catalogCommand(process.argv[2] ?? '', process.argv.slice(3));
 }
 
 const socket = io(URL, { path: '/dashboard-io', auth: { token: TOKEN }, transports: ['websocket'] });
@@ -404,6 +518,15 @@ socket.on('station_status', (event: StationRow) => {
   if (previous && (previous.runningGameId ?? null) !== (event.runningGameId ?? null)) {
     log.push(`${at}  ${event.serialNumber} runningGameId=${event.runningGameId ?? 'null'}`);
   }
+  render();
+});
+socket.on('catalog_status', (event: CatalogStatusEvent) => {
+  catalogs.set(event.serialNumber, event.games);
+  const installed = event.games.filter((g) => g.installed).length;
+  const missing = event.games.filter((g) => !g.installed).map((g) => `${g.gameId}${g.reason ? ` (${g.reason})` : ''}`);
+  log.push(
+    `${new Date().toLocaleTimeString()}  catalog_status ${event.serialNumber}: ${installed}/${event.games.length} launchable${missing.length ? `; not: ${missing.join(', ')}` : ''}`,
+  );
   render();
 });
 socket.on('telemetry_update', (event: TelemetryUpdate) => {

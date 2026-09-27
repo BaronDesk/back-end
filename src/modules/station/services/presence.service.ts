@@ -203,6 +203,12 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
     return this.states.get(serialNumber)?.sessionId ?? null;
   }
 
+  /** The agent's last reported lock / session / game, or null for a station never seen. */
+  agentStateOf(serialNumber: string): { locked: boolean | null; sessionId: string | null; runningGameId: string | null } | null {
+    const state = this.states.get(serialNumber);
+    return state ? { locked: state.locked, sessionId: state.sessionId, runningGameId: state.runningGameId } : null;
+  }
+
   /**
    * END_SESSION was issued: label the next observed session end with its
    * reason. Nothing changes here; the end itself is only taken from the
@@ -229,6 +235,16 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
       if (state.machineId === machineId) return toRef(state);
     }
     const machine = await this.machines.findById(machineId);
+    return machine
+      ? { machineId: machine.id, branchId: machine.branchId, serialNumber: machine.serialNumber }
+      : null;
+  }
+
+  /** Resolves any station by serial; falls back to Postgres when not in memory. */
+  async resolveBySerial(serialNumber: string): Promise<StationRef | null> {
+    const known = this.resolve(serialNumber);
+    if (known) return known;
+    const machine = await this.machines.findBySerial(serialNumber);
     return machine
       ? { machineId: machine.id, branchId: machine.branchId, serialNumber: machine.serialNumber }
       : null;
@@ -327,7 +343,12 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
   private endSession(state: PresenceState, sessionId: string): void {
     const pending = this.pendingSessionEnds.get(state.serialNumber);
     this.pendingSessionEnds.delete(state.serialNumber);
-    const reason = pending && Date.now() - pending.at <= SESSION_END_MATCH_MS ? pending.reason : 'agent_reported';
+    const matched = pending && Date.now() - pending.at <= SESSION_END_MATCH_MS ? pending : null;
+    const reason = matched?.reason ?? 'agent_reported';
+    // The agent stops its tracked game as part of END_SESSION, and only
+    // re-sends runningGameId on its next reconnect (state_report). Clear it
+    // here so the station does not keep showing a game it already closed.
+    if (matched) state.runningGameId = null;
     this.logger.log(`session ${sessionId} ended on ${state.serialNumber} (${reason})`);
     this.sessionEnded.next({
       machineId: state.machineId,
