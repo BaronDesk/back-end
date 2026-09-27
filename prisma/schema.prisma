@@ -377,7 +377,7 @@ model Reservation {
   gamerProfile GamerProfile @relation(fields: [gamerProfileId], references: [id], onDelete: Cascade)
   machine      Machine      @relation(fields: [machineId], references: [id], onDelete: Cascade)
   sessions     Session[]
-
+  @@unique([machineId, startTime])
   @@index([gamerProfileId])
   @@index([machineId])
   @@index([status])
