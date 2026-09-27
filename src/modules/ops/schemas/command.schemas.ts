@@ -56,14 +56,19 @@ export const listCommandsQuerySchema = z.object({
 export type ListCommandsQuery = z.infer<typeof listCommandsQuerySchema>;
 
 /**
- * The only codes the agent's ConnectionWorker emits. The shared contract also
- * lists INVALID_PAYLOAD, but the agent never sends it: a bad payload comes
- * back as EXEC_FAILED, with the cause in `reason` ("Game ID is required.").
+ * The codes the agent emits (NackCodes.cs / CommandResult.cs). Each carries a
+ * human-readable `reason`.
+ * - UNKNOWN_TYPE: type not in the agent's allow-list.
+ * - INVALID_PAYLOAD: payload missing, malformed or failing field validation
+ *   (e.g. "sessionId is required."). The backend built the command wrong.
+ * - EXEC_FAILED: valid payload, but the action could not be carried out.
+ * - STALE: failed the agent's seq/ts anti-replay check.
  */
 export const NACK_CODES = {
   UNKNOWN_TYPE: 'UNKNOWN_TYPE',
-  STALE: 'STALE',
+  INVALID_PAYLOAD: 'INVALID_PAYLOAD',
   EXEC_FAILED: 'EXEC_FAILED',
+  STALE: 'STALE',
 } as const;
 
 export const commandAckPayloadSchema = z.object({

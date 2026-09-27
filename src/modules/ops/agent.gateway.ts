@@ -25,6 +25,7 @@ import { DashboardGateway } from './dashboard.gateway.js';
 import {
   commandAckPayloadSchema,
   commandNackPayloadSchema,
+  NACK_CODES,
   type CommandSimulation,
   type StationCommandType,
 } from './schemas/command.schemas.js';
@@ -318,7 +319,12 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
       return;
     }
     const { commandId, code, reason } = parsed.data;
-    this.logger.warn(`command_nack ${code} for ${commandId} from ${serialNumber}${reason ? `: ${reason}` : ''}`);
+    const line = `command_nack ${code} for ${commandId} from ${serialNumber}${reason ? `: ${reason}` : ''}`;
+    // INVALID_PAYLOAD means we sent a malformed command: a backend bug that
+    // validation should have caught. EXEC_FAILED is normal operational traffic.
+    if (code === NACK_CODES.INVALID_PAYLOAD) this.logger.error(`${line} (backend sent a malformed command)`);
+    else if (code === NACK_CODES.EXEC_FAILED) this.logger.log(line);
+    else this.logger.warn(line);
     await this.commands.onAgentReply(serialNumber, commandId, { kind: 'nack', code, reason: reason ?? null });
   }
 

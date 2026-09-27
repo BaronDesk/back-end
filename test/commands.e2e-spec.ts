@@ -167,6 +167,28 @@ describe('station commands (e2e)', () => {
     agent.socket.close();
   });
 
+  it('records INVALID_PAYLOAD as FAILED with the reason, without retrying', async () => {
+    // Like the current agent: UNLOCK without a sessionId is rejected.
+    const agent = await connectAgent((frame) =>
+      (frame.payload as { sessionId?: string } | undefined)?.sessionId
+        ? 'ack'
+        : { code: 'INVALID_PAYLOAD', reason: 'sessionId is required.' },
+    );
+    const { commandId } = (await issue(agent.machine.id, { type: 'UNLOCK' })).json();
+    await vi.waitFor(async () =>
+      expect(await status(commandId)).toMatchObject({
+        status: 'FAILED',
+        nackCode: 'INVALID_PAYLOAD',
+        nackReason: 'sessionId is required.',
+      }),
+    );
+    // Past the ack timeout + backoff: a retry would have shown up by now.
+    await new Promise((r) => setTimeout(r, 1_200));
+    expect(agent.commands).toHaveLength(1);
+    expect((await status(commandId)).attempts).toBe(1);
+    agent.socket.close();
+  });
+
   it('records EXEC_FAILED as FAILED with the reason, without retrying', async () => {
     const agent = await connectAgent(() => ({ code: 'EXEC_FAILED', reason: 'Game ID is required.' }));
     const { commandId } = (await issue(agent.machine.id, { type: 'LOCK', simulate: 'exec_failed' })).json();

@@ -125,6 +125,12 @@ describe('CommandsService', () => {
     );
     await service.onAgentReply('SN-1', 'c1', { kind: 'nack', code: 'UNKNOWN_TYPE', reason: null });
     expect(repo.transition).toHaveBeenLastCalledWith('c1', expect.any(Array), expect.objectContaining({ status: 'FAILED' }));
+    await service.onAgentReply('SN-1', 'c1', { kind: 'nack', code: 'INVALID_PAYLOAD', reason: 'sessionId is required.' });
+    expect(repo.transition).toHaveBeenLastCalledWith(
+      'c1',
+      expect.any(Array),
+      expect.objectContaining({ status: 'FAILED', nackCode: 'INVALID_PAYLOAD', nackReason: 'sessionId is required.' }),
+    );
   });
 
   it('queues the booking-unlock payload with the job', async () => {

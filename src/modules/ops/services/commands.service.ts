@@ -45,13 +45,18 @@ const REPLY_FROM: CommandStatus[] = ['PENDING', 'SENT', 'TIMEOUT'];
 
 /**
  * Nacks that end the command as FAILED. No nack is ever retried:
- * - UNKNOWN_TYPE is deterministic.
+ * - UNKNOWN_TYPE and INVALID_PAYLOAD are deterministic: the same command gets
+ *   the same answer.
  * - EXEC_FAILED is a real handler failure. A resend with the same commandId
  *   only hits the agent's idempotency re-ack (a false success); a new
  *   commandId could run it twice.
  * STALE (and any code a newer agent adds) ends as NACKED.
  */
-const FAILED_NACKS: ReadonlySet<string> = new Set([NACK_CODES.UNKNOWN_TYPE, NACK_CODES.EXEC_FAILED]);
+const FAILED_NACKS: ReadonlySet<string> = new Set([
+  NACK_CODES.UNKNOWN_TYPE,
+  NACK_CODES.INVALID_PAYLOAD,
+  NACK_CODES.EXEC_FAILED,
+]);
 
 /** API and `command_update` shape of a command. */
 export function toCommandDto(command: Command) {
