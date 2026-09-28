@@ -16,14 +16,14 @@ export class EnrollmentTokensRepository extends BaseRepository {
     issuedById: string;
     expiresAt: Date;
   }) {
-    return (this.prisma as any).enrollmentToken.create({ data });
+    return this.prisma.enrollmentToken.create({ data });
   }
 
   findByHash(tokenHash: string) {
-    return (this.prisma as any).enrollmentToken.findUnique({ where: { tokenHash } });
+    return this.prisma.enrollmentToken.findUnique({ where: { tokenHash } });
   }
 
   consume(id: string) {
-    return (this.prisma as any).enrollmentToken.update({ where: { id }, data: { consumedAt: new Date() } });
+    return this.prisma.enrollmentToken.update({ where: { id }, data: { consumedAt: new Date() } });
   }
 }
