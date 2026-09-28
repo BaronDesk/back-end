@@ -13,6 +13,7 @@ import { IdentityModule } from './modules/identity/identity.module.js';
 import { OpsModule } from './modules/ops/ops.module.js';
 import { WalletModule } from './modules/wallet/wallet.module.js';
 import { MembershipModule } from './modules/membership/membership.module.js';
+import { SubscriptionsModule } from './modules/subscriptions/subscriptions.module.js';
 
 @Module({
   imports: [
@@ -22,6 +23,7 @@ import { MembershipModule } from './modules/membership/membership.module.js';
     OpsModule,
     WalletModule,
     MembershipModule,
+    SubscriptionsModule,
     HealthModule,
   ],
   controllers: [AppController],

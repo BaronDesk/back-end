@@ -462,6 +462,8 @@ model Subscription {
   id                 String           @id @default(uuid()) @db.Uuid
   gamerProfileId     String           @map("gamer_profile_id") @db.Uuid
   subscriptionPlanId String           @map("subscription_plan_id") @db.Uuid
+  benefitsSnapshot  Json             @map("benefits_snapshot")
+  idempotencyKey    String?          @map("idempotency_key")
   startDate          DateTime         @map("start_date") @db.Date
   endDate            DateTime         @map("end_date") @db.Date
   status             SubscriptionStatus @default(ACTIVE)
@@ -476,6 +478,7 @@ model Subscription {
   @@index([status])
   @@index([startDate])
   @@index([endDate])
+  @@unique([gamerProfileId, idempotencyKey])
   @@map("subscriptions")
 }
 
