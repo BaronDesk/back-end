@@ -78,7 +78,7 @@ describe('station commands (e2e)', () => {
    */
   async function connectAgent(behaviour: AgentBehaviour = () => 'ack') {
     const serialNumber = `CMD-${randomUUID()}`;
-    const machine = await prisma.machine.create({ data: { serialNumber, branchId, agentPublicKey: '' } });
+    const machine = await prisma.machine.create({ data: { serialNumber, branchId, agentPublicKey: '', enrollmentStatus: 'ENROLLED' } });
     // Like the real agent: the station token rides on the upgrade request.
     const stationToken = mintStationToken(app, machine);
     const socket = new WebSocket(`${baseUrl.replace('http', 'ws')}/agent-ws`, {
@@ -160,7 +160,7 @@ describe('station commands (e2e)', () => {
 
   it('rejects a command for an offline station with 409', async () => {
     const machine = await prisma.machine.create({
-      data: { serialNumber: `CMD-${randomUUID()}`, branchId, agentPublicKey: '' },
+      data: { serialNumber: `CMD-${randomUUID()}`, branchId, agentPublicKey: '', enrollmentStatus: 'ENROLLED' },
     });
     const res = await issue(machine.id, { type: 'UNLOCK' });
     expect(res.statusCode).toBe(409);
@@ -434,9 +434,18 @@ describe('station commands (e2e)', () => {
       expect(games.find((g) => g.gameId === machineGame.gameId)).toMatchObject({ launchType: 'epic', arguments: null });
       expect(games.some((g) => g.gameId === unassigned.gameId)).toBe(false);
 
-      // Without STATION_AUTH_DEV_BYPASS a serial alone authenticates nothing.
+      // A serial alone authenticates nothing.
       const bySerial = await fetchCatalog({ 'x-station-serial': agent.machine.serialNumber });
       expect(bySerial.statusCode).toBe(401);
+
+      // Valid token, station no longer ENROLLED (or never had a row): 403.
+      const stationAuth = { authorization: `Bearer ${agent.stationToken}` };
+      await prisma.machine.update({ where: { id: agent.machine.id }, data: { enrollmentStatus: 'PENDING' } });
+      expect((await fetchCatalog(stationAuth)).statusCode).toBe(403);
+      await prisma.machine.update({ where: { id: agent.machine.id }, data: { enrollmentStatus: 'ENROLLED' } });
+      expect((await fetchCatalog(stationAuth)).statusCode).toBe(200);
+      const ghost = mintStationToken(app, { ...agent.machine, id: randomUUID() });
+      expect((await fetchCatalog({ authorization: `Bearer ${ghost}` })).statusCode).toBe(403);
       agent.socket.close();
     });
 

@@ -181,9 +181,11 @@ $env:Agent__SerialNumber = "STATION-DEV-01"             # the station identity
 dotnet run                                               # launchSettings sets DOTNET_ENVIRONMENT=Development (Debug logs)
 ```
 
-You do not need to create a machine row first. In dev, an unknown serial gets a
-provisional `MACHINE` row. The backend logs
-`unknown station STATION-DEV-01: creating provisional MACHINE row (dev only)`.
+The station must already have an ENROLLED `MACHINE` row and a station JWT.
+Nothing is auto-created, in any environment. Until enrollment exists, seed both
+with the monitor (inside the backend container, see the monitor header):
+`npm run monitor -- station-enroll STATION-DEV-01`, then
+`npm run monitor -- station-token STATION-DEV-01`, and give the token to the agent.
 
 ---
 
@@ -369,7 +371,8 @@ on the ack.
 | Agent: `Connection lost or could not be established` in a loop | Wrong URL, port or host. Check the setup in section 0. Test reachability with `Test-NetConnection 192.168.1.50 -Port 443` from the gaming PC. |
 | Agent connects, but no handshake_ack. Backend closes with 4400 | Payload or `ts` rejected. Check the backend log for `malformed envelope` or `invalid handshake payload`. |
 | Socket closed with 4408 after 10s | The server received no handshake. The agent never sent one, or the frames are not reaching Nest. |
-| Socket closed with 4403 `unknown station` | `NODE_ENV=production`, where provisional rows are off. Create the machine row, or run in development. |
+| Upgrade refused with HTTP 401 | Missing, invalid or expired station JWT. Mint a new one with `station-token`. |
+| Socket closed with 1008 `station not enrolled` | The token's `MACHINE` row is missing or not ENROLLED. Run `station-enroll <serial>`. |
 | Monitor `connect_error: invalid token` or `missing token` | Token expired or not set. Log in again (section 2). |
 | Monitor connected, but no rows | The station was never seen, or the token belongs to a staff user of a different branch. The hq admin sees all branches. |
 | IP column shows `172.x.x.x` or `192.168.65.x` | Docker Desktop NATs inbound traffic, so Caddy sees Docker's gateway, not the gaming PC. This is a known dev-only limitation. The real client IP appears when the stack runs on native Linux or with host networking. |
@@ -383,5 +386,6 @@ on the ack.
 - Remove the hosts entry on the gaming PC and the firewall rules on the server PC:
   `Remove-NetFirewallRule -DisplayName "CSTAM Caddy 443"`.
 - If you used Setup C, revert or deliberately commit the `Caddyfile` and compose changes.
-- Provisional machine rows sit on the oldest branch, or on a branch named
-  `Provisional (unenrolled stations)`. Delete them, or enroll them properly.
+- Provisional machine rows from before Step 6 sit on the oldest branch, or on a
+  branch named `Provisional (unenrolled stations)`. They stay PENDING and are
+  rejected. Delete them, or enroll them properly.

@@ -23,9 +23,10 @@ import {
 import {
   PresenceService,
   StationIdentityMismatchError,
+  StationNotEnrolledError,
   UnknownStationError,
 } from '../station/services/presence.service.js';
-import { bearerToken, StationAuthService } from '../station/services/station-auth.service.js';
+import { StationAuthService } from '../station/services/station-auth.service.js';
 import { InvalidStationTokenError, type StationPrincipal } from '../station/services/station-token.service.js';
 import { catalogStatusPayloadSchema } from '../games/schemas/games.schemas.js';
 import { GamesService } from '../games/services/games.service.js';
@@ -78,13 +79,8 @@ const TELEMETRY_STREAM_TYPES: ReadonlySet<string> = new Set([
 
 interface AgentConnection {
   ip: string | null;
-  /**
-   * Who the verified station token says this is, from the upgrade request.
-   * null only under STATION_AUTH_DEV_BYPASS (the handshake serial decides).
-   */
-  principal: StationPrincipal | null;
-  /** `Authorization: Bearer` from the upgrade request; kept for the dev bypass's REST binding. */
-  bearerToken: string | null;
+  /** Who the verified station token says this is, from the upgrade request. */
+  principal: StationPrincipal;
   seqGuard: SeqGuard;
   telemetrySeqGuard: SeqGuard;
   outbound: OutboundSequencer;
@@ -102,8 +98,10 @@ interface AgentConnection {
  *
  * Station identity is the station JWT on the upgrade request
  * (`Authorization: Bearer`), verified before the upgrade completes; a missing
- * or invalid token gets a 401 and never becomes a socket. The handshake's
- * `serialNumber` must match the token's. Presence itself lives in the station
+ * or invalid token gets a 401 and never becomes a socket. A valid token whose
+ * MACHINE row is missing, not ENROLLED or no longer matches is closed with
+ * 1008 before any frame is read. The handshake's `serialNumber` must match
+ * the token's. Presence itself lives in the station
  * module; this gateway only translates frames into PresenceService calls.
  */
 @Injectable()
@@ -112,8 +110,11 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
   private wss?: WebSocketServer;
   private statusSub?: Subscription;
   private readonly connections = new WeakMap<WebSocket, AgentConnection>();
-  /** Upgrade request -> its verified principal, from verifyClient to 'connection'. */
-  private readonly principals = new WeakMap<IncomingMessage, StationPrincipal | null>();
+  /**
+   * Upgrade request -> its admitted principal, or the 1008 close reason for a
+   * valid token that was not admitted; from verifyClient to 'connection'.
+   */
+  private readonly principals = new WeakMap<IncomingMessage, StationPrincipal | { rejected: string }>();
 
   constructor(
     private readonly adapterHost: HttpAdapterHost,
@@ -149,7 +150,11 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     this.wss?.close();
   }
 
-  /** Runs before the upgrade completes: no valid station token, no socket. */
+  /**
+   * Runs before the upgrade completes: no valid station token, no socket
+   * (401). A valid token for a station that is not admitted is upgraded only
+   * so it can be closed with 1008 in handleConnection.
+   */
   private async verifyUpgrade(
     request: IncomingMessage,
     done: (result: boolean, code?: number, message?: string) => void,
@@ -158,8 +163,14 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
       this.principals.set(request, await this.stationAuth.authenticateAgent(request.headers.authorization));
       done(true);
     } catch (err) {
-      const invalid = err instanceof InvalidStationTokenError;
+      const rejected = admissionRejection(err);
       this.logger.warn(`agent-ws upgrade rejected (${remoteIp(request)}): ${(err as Error).message}`);
+      if (rejected) {
+        this.principals.set(request, { rejected });
+        done(true);
+        return;
+      }
+      const invalid = err instanceof InvalidStationTokenError;
       done(false, invalid ? 401 : 500, invalid ? 'Unauthorized' : 'Internal Server Error');
     }
   }
@@ -172,11 +183,14 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
       socket.close(CLOSE_POLICY_VIOLATION, 'unauthenticated');
       return;
     }
+    if ('rejected' in principal) {
+      socket.close(CLOSE_POLICY_VIOLATION, principal.rejected);
+      return;
+    }
 
     const conn: AgentConnection = {
       ip: remoteIp(request),
       principal,
-      bearerToken: bearerToken(request.headers.authorization),
       seqGuard: new SeqGuard(),
       telemetrySeqGuard: new SeqGuard(),
       outbound: new OutboundSequencer(),
@@ -282,7 +296,7 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     }
     const handshake = parsed.data;
 
-    if (conn.principal && handshake.serialNumber !== conn.principal.serialNumber) {
+    if (handshake.serialNumber !== conn.principal.serialNumber) {
       this.logger.warn(
         `rejected agent: handshake serial ${handshake.serialNumber} != token serial ${conn.principal.serialNumber} (${conn.ip})`,
       );
@@ -298,12 +312,11 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     const ready = this.presence.connect(handshake, conn.ip, conn.principal).then(
       () => true,
       (err: Error) => {
-        if (err instanceof StationIdentityMismatchError) {
+        // Admission is re-checked at handshake: enrollment may change after the upgrade.
+        const rejected = admissionRejection(err);
+        if (rejected) {
           this.logger.warn(`rejected agent: ${err.message} (${conn.ip})`);
-          socket.close(CLOSE_POLICY_VIOLATION, 'station token does not match the station');
-        } else if (err instanceof UnknownStationError) {
-          this.logger.warn(`rejected agent: ${err.message} (${conn.ip})`);
-          socket.close(4403, 'unknown station');
+          socket.close(CLOSE_POLICY_VIOLATION, rejected);
         } else {
           this.logger.error(`handshake failed for ${handshake.serialNumber}: ${err.message}`);
           socket.close(1011, 'handshake failed');
@@ -323,13 +336,8 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
 
     conn.serialNumber = handshake.serialNumber;
     this.registry.register(handshake.serialNumber, socket);
-    // Dev bypass only: lets GET /stations/me/games recognise a serial-identified agent by its token.
-    if (!conn.principal) this.stationAuth.bindDevToken(conn.bearerToken, handshake.serialNumber);
-    const identity = conn.principal
-      ? `machine ${conn.principal.machineId}, branch ${conn.principal.branchId}`
-      : 'UNVERIFIED, dev bypass';
     this.logger.log(
-      `agent connected: ${handshake.serialNumber} [${identity}] (${handshake.machineName ?? '?'}, v${handshake.agentVersion ?? '?'}) from ${conn.ip}`,
+      `agent connected: ${handshake.serialNumber} [machine ${conn.principal.machineId}, branch ${conn.principal.branchId}] (${handshake.machineName ?? '?'}, v${handshake.agentVersion ?? '?'}) from ${conn.ip}`,
     );
     this.send(socket, conn, SERVER_MESSAGE_TYPES.HANDSHAKE_ACK, {});
   }
@@ -471,4 +479,11 @@ function remoteIp(request: IncomingMessage): string | null {
   };
   const ip = header('x-real-ip') ?? header('x-forwarded-for') ?? request.socket.remoteAddress ?? null;
   return ip?.replace(/^::ffff:/, '') ?? null;
+}
+
+/** The 1008 close reason for a valid station token that is not admitted, or null for any other error. */
+function admissionRejection(err: unknown): string | null {
+  if (err instanceof UnknownStationError || err instanceof StationNotEnrolledError) return 'station not enrolled';
+  if (err instanceof StationIdentityMismatchError) return 'station token does not match the station';
+  return null;
 }

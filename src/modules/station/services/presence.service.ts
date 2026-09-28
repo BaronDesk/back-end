@@ -4,7 +4,7 @@ import { Redis } from 'ioredis';
 import { Subject } from 'rxjs';
 
 import { REDIS } from '../../../infra/redis/redis.module.js';
-import type { MachineStatus } from '../../../generated/prisma/index.js';
+import type { Machine, MachineStatus } from '../../../generated/prisma/index.js';
 import { MachinesRepository } from '../repository/machines.repository.js';
 import type { HandshakePayload, HeartbeatPayload, StateReportPayload } from '../schemas/presence.schemas.js';
 import type { StationPrincipal } from './station-token.service.js';
@@ -65,9 +65,17 @@ interface PresenceState {
   lastPersistedAt: number;
 }
 
+/** The station token's machine has no MACHINE row. */
 export class UnknownStationError extends Error {
-  constructor(serialNumber: string) {
-    super(`unknown station serial: ${serialNumber}`);
+  constructor(machineId: string) {
+    super(`no MACHINE row for station ${machineId}`);
+  }
+}
+
+/** The MACHINE row exists but its enrollmentStatus is not ENROLLED. */
+export class StationNotEnrolledError extends Error {
+  constructor(machineId: string, status: string) {
+    super(`station ${machineId} is not enrolled (${status})`);
   }
 }
 
@@ -75,6 +83,23 @@ export class UnknownStationError extends Error {
 export class StationIdentityMismatchError extends Error {
   constructor(machineId: string) {
     super(`station token for ${machineId} does not match its MACHINE row`);
+  }
+}
+
+/**
+ * The one admission rule for a verified station token: its MACHINE row must
+ * exist, be ENROLLED, and still carry the token's serial and branch.
+ */
+export function assertStationAdmitted(
+  machine: Machine | null,
+  principal: StationPrincipal,
+): asserts machine is Machine {
+  if (!machine) throw new UnknownStationError(principal.machineId);
+  if (machine.enrollmentStatus !== 'ENROLLED') {
+    throw new StationNotEnrolledError(principal.machineId, machine.enrollmentStatus);
+  }
+  if (machine.serialNumber !== principal.serialNumber || machine.branchId !== principal.branchId) {
+    throw new StationIdentityMismatchError(principal.machineId);
   }
 }
 
@@ -103,7 +128,6 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
   private readonly offlineAfterMs: number;
   private readonly watchdogIntervalMs: number;
   private readonly persistIntervalMs: number;
-  private readonly allowProvisional: boolean;
 
   constructor(
     private readonly machines: MachinesRepository,
@@ -113,7 +137,6 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
     this.offlineAfterMs = Number(config.get('PRESENCE_OFFLINE_AFTER_MS') ?? 45_000);
     this.watchdogIntervalMs = Number(config.get('PRESENCE_WATCHDOG_INTERVAL_MS') ?? 10_000);
     this.persistIntervalMs = Number(config.get('PRESENCE_PERSIST_INTERVAL_MS') ?? 15_000);
-    this.allowProvisional = config.get('NODE_ENV') !== 'production';
   }
 
   onModuleInit(): void {
@@ -128,28 +151,16 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * handshake: resolve the machine, mark it ONLINE. With a verified station
-   * token the machine is the token's machineId, and its row must still match
-   * the token's serial and branch. `principal: null` (dev bypass only)
-   * resolves by the handshake serial, as before station credentials.
+   * handshake: the machine is the verified token's machineId, never the
+   * handshake serial. Admission is re-checked here (enrollment may have
+   * changed since the upgrade); an unknown station is rejected, never created.
    */
-  async connect(handshake: HandshakePayload, ip: string | null, principal: StationPrincipal | null = null): Promise<void> {
+  async connect(handshake: HandshakePayload, ip: string | null, principal: StationPrincipal): Promise<void> {
     const { serialNumber } = handshake;
     const name = handshake.machineName?.trim() || null;
 
-    let machine = principal
-      ? await this.machines.findById(principal.machineId)
-      : await this.machines.findBySerial(serialNumber);
-    if (principal) {
-      if (!machine) throw new UnknownStationError(serialNumber);
-      if (machine.serialNumber !== principal.serialNumber || machine.branchId !== principal.branchId) {
-        throw new StationIdentityMismatchError(principal.machineId);
-      }
-    } else if (!machine) {
-      if (!this.allowProvisional) throw new UnknownStationError(serialNumber);
-      this.logger.warn(`unknown station ${serialNumber}: creating provisional MACHINE row (dev only)`);
-      machine = await this.machines.createProvisional(serialNumber, name);
-    }
+    const machine = await this.machines.findById(principal.machineId);
+    assertStationAdmitted(machine, principal);
 
     const now = new Date();
     const updated = await this.machines.markOnline(machine.id, { lastSeen: now, ipAddress: ip, name });
@@ -255,16 +266,6 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
       if (state.machineId === machineId) return toRef(state);
     }
     const machine = await this.machines.findById(machineId);
-    return machine
-      ? { machineId: machine.id, branchId: machine.branchId, serialNumber: machine.serialNumber }
-      : null;
-  }
-
-  /** Resolves any station by serial; falls back to Postgres when not in memory. */
-  async resolveBySerial(serialNumber: string): Promise<StationRef | null> {
-    const known = this.resolve(serialNumber);
-    if (known) return known;
-    const machine = await this.machines.findBySerial(serialNumber);
     return machine
       ? { machineId: machine.id, branchId: machine.branchId, serialNumber: machine.serialNumber }
       : null;

@@ -45,9 +45,21 @@
 //       runs the physical-test cases against /agent-ws and GET /stations/me/games.
 //       Case a with the real agent: give it a minted token and watch it come ONLINE here.
 //       Never handshakes as the station, so the real agent stays connected.
-import { createHmac } from 'node:crypto';
+//
+// Enrollment gating (Step 6). Only ENROLLED MACHINE rows are admitted; nothing
+// is auto-created. These talk to Postgres directly (DATABASE_URL from the env,
+// else ./.env), standing in for enrollment. On Windows a local Postgres often
+// shadows :5432, so run them inside the backend container:
+//   docker exec -it cstam-ninety-backend-backend-1 npm run monitor -- ...
+//   npm run monitor -- station-enroll <serial> [status=ENROLLED|PENDING|INACTIVE|DEACTIVATED] [branch=<uuid>]
+//       sets enrollmentStatus; creates the row (oldest branch unless branch=) when the serial is new.
+//   TOKEN=... npm run monitor -- station-auth <station>
+//       also runs the Step 6 cases: flips the row to PENDING / DEACTIVATED and back,
+//       points a token at a machineId with no row, and checks no row is ever created.
+import { createHmac, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 
+import pg from 'pg';
 import { io } from 'socket.io-client';
 import WebSocket from 'ws';
 
@@ -434,17 +446,72 @@ async function exitSoon(code: number): Promise<never> {
   process.exit(code);
 }
 
-/** JWT_ACCESS_SECRET from the env, else the backend's ./.env. */
-function accessSecret(): string {
-  if (process.env.JWT_ACCESS_SECRET) return process.env.JWT_ACCESS_SECRET;
+/** `name` from the env, else the backend's ./.env. */
+function envValue(name: string): string {
+  const fromEnv = process.env[name];
+  if (fromEnv) return fromEnv;
   const line = existsSync('.env')
-    ? readFileSync('.env', 'utf8').split(/\r?\n/).find((l) => l.startsWith('JWT_ACCESS_SECRET='))
+    ? readFileSync('.env', 'utf8').split(/\r?\n/).find((l) => l.startsWith(`${name}=`))
     : undefined;
   if (!line) {
-    console.error('JWT_ACCESS_SECRET not set and not found in ./.env');
+    console.error(`${name} not set and not found in ./.env`);
     process.exit(1);
   }
-  return line.slice('JWT_ACCESS_SECRET='.length).trim().replace(/^["']|["']$/g, '');
+  return line.slice(name.length + 1).trim().replace(/^["']|["']$/g, '');
+}
+
+function accessSecret(): string {
+  return envValue('JWT_ACCESS_SECRET');
+}
+
+/** One query against the backend's Postgres: stands in for enrollment in the physical test. */
+async function sql<T extends Record<string, unknown>>(text: string, values: unknown[] = []): Promise<T[]> {
+  const client = new pg.Client({ connectionString: envValue('DATABASE_URL').replace(/[?&]schema=[^&]*/, '') });
+  await client.connect();
+  try {
+    return (await client.query<T>(text, values)).rows;
+  } finally {
+    await client.end();
+  }
+}
+
+const ENROLLMENT_STATUSES = new Set(['PENDING', 'ENROLLED', 'INACTIVE', 'DEACTIVATED']);
+
+async function setEnrollment(machineId: string, status: string): Promise<void> {
+  await sql('UPDATE machines SET enrollment_status = $1::"MachineEnrollmentStatus" WHERE id = $2::uuid', [status, machineId]);
+}
+
+async function machineCount(where: { id?: string; serialNumber?: string }): Promise<number> {
+  const [row] = await sql<{ n: string }>('SELECT count(*) AS n FROM machines WHERE id::text = $1 OR serial_number = $2', [
+    where.id ?? '',
+    where.serialNumber ?? '',
+  ]);
+  return Number(row?.n ?? 0);
+}
+
+/** `station-enroll`: what enrollment would leave behind, written directly. */
+async function stationEnroll(args: string[]): Promise<never> {
+  const [serial, ...rest] = args;
+  const option = (key: string) => rest.find((a) => a.startsWith(`${key}=`))?.slice(key.length + 1);
+  const status = (option('status') ?? 'ENROLLED').toUpperCase();
+  if (!serial || !ENROLLMENT_STATUSES.has(status)) {
+    console.error('usage: npm run monitor -- station-enroll <serial> [status=ENROLLED|PENDING|INACTIVE|DEACTIVATED] [branch=<uuid>]');
+    process.exit(1);
+  }
+  const branch = option('branch') ?? (await sql<{ id: string }>('SELECT id FROM branches ORDER BY created_at LIMIT 1'))[0]?.id;
+  if (!branch) {
+    console.error('no branch to put the station on; pass branch=<uuid>');
+    process.exit(1);
+  }
+  const [row] = await sql<{ id: string; branch_id: string; enrollment_status: string }>(
+    `INSERT INTO machines (id, serial_number, branch_id, agent_public_key, enrollment_status, updated_at)
+       VALUES ($1::uuid, $2, $3::uuid, '', $4::"MachineEnrollmentStatus", now())
+     ON CONFLICT (serial_number) DO UPDATE SET enrollment_status = EXCLUDED.enrollment_status, updated_at = now()
+     RETURNING id, branch_id, enrollment_status`,
+    [randomUUID(), serial, branch, status],
+  );
+  console.log(`${serial}  machine ${row?.id}  branch ${row?.branch_id}  enrollmentStatus ${row?.enrollment_status}`);
+  return exitSoon(0);
 }
 
 /** HS256, the JwtModule default: what enrollment would mint. */
@@ -507,36 +574,100 @@ function handshakeResult(token: string, serial: string): Promise<number | 'ack'>
   });
 }
 
-async function catalogStatus(headers: Record<string, string>): Promise<number> {
-  return (await fetch(`${URL}/stations/me/games`, { headers })).status;
+async function catalogStatus(headers: Record<string, string>, query = ''): Promise<number> {
+  return (await fetch(`${URL}/stations/me/games${query}`, { headers })).status;
 }
 
-/** `station-auth`: the Step 5 physical-test cases, PASS/FAIL per line. */
+/**
+ * Whether /agent-ws admits `token`, without handshaking: 'open' if the socket
+ * is still up after a moment, the close code if the server closed it (1008 =
+ * not admitted), or the upgrade's HTTP status if it was refused.
+ */
+function admission(token: string | null): Promise<number | 'open'> {
+  const socket = new WebSocket(WS_URL, token ? { headers: { Authorization: `Bearer ${token}` } } : {});
+  return new Promise((resolve) => {
+    let timer: NodeJS.Timeout | undefined;
+    socket.on('open', () => {
+      timer = setTimeout(() => {
+        resolve('open');
+        socket.close();
+      }, 750);
+    });
+    socket.on('close', (code: number) => {
+      clearTimeout(timer);
+      resolve(code);
+    });
+    socket.on('unexpected-response', (_req, res) => {
+      resolve(res.statusCode ?? 0);
+      socket.terminate();
+    });
+    socket.on('error', () => undefined);
+  });
+}
+
+/** `station-auth`: the Step 5 + Step 6 physical-test cases, PASS/FAIL per line. */
 async function stationAuthCases(station: StationRow & { branchId?: string }): Promise<never> {
+  const machineId = station.id ?? '';
   const valid = stationToken(station, 300);
   const expired = stationToken(station, -60);
   let failed = 0;
   const check = (label: string, actual: unknown, expected: unknown) => {
     const ok = actual === expected;
     if (!ok) failed++;
-    console.log(`${ok ? `${GREEN}PASS${RESET}` : `${RED}FAIL${RESET}`}  ${pad(label, 60)} got ${actual}, want ${expected}`);
+    console.log(`${ok ? `${GREEN}PASS${RESET}` : `${RED}FAIL${RESET}`}  ${pad(label, 64)} got ${actual}, want ${expected}`);
   };
+  const [row] = await sql<{ enrollment_status: string }>('SELECT enrollment_status FROM machines WHERE id = $1::uuid', [machineId]);
+  const original = row?.enrollment_status ?? 'ENROLLED';
 
-  console.log(`station ${station.serialNumber}  machine ${station.id}  branch ${station.branchId}\n`);
-  check('a. valid station token: WSS upgrade', await upgradeStatus(valid), 101);
-  check('a. valid station token: GET /stations/me/games', await catalogStatus({ Authorization: `Bearer ${valid}` }), 200);
-  check('b. no token: WSS upgrade', await upgradeStatus(null), 401);
-  check('b. no token: GET /stations/me/games', await catalogStatus({}), 401);
-  check('b. garbage token: WSS upgrade', await upgradeStatus('garbage'), 401);
-  check('b. garbage token: GET /stations/me/games', await catalogStatus({ Authorization: 'Bearer garbage' }), 401);
-  check('b. expired token: WSS upgrade', await upgradeStatus(expired), 401);
-  check('b. expired token: GET /stations/me/games', await catalogStatus({ Authorization: `Bearer ${expired}` }), 401);
-  check('c. user access token (TOKEN): WSS upgrade', await upgradeStatus(TOKEN ?? null), 401);
-  check('c. user access token (TOKEN): GET /stations/me/games', await catalogStatus({ Authorization: `Bearer ${TOKEN}` }), 401);
-  check('d. token serial != handshake serial: close code', await handshakeResult(valid, `${station.serialNumber}-X`), 1008);
-  check('e. serial only (x-station-serial): GET /stations/me/games', await catalogStatus({ 'x-station-serial': station.serialNumber }), 401);
-  check('e. serial only (no token): WSS upgrade', await upgradeStatus(null), 401);
-  console.log(`\n${failed ? `${RED}${failed} failed${RESET}` : `${GREEN}all passed${RESET}`}  ${DIM}(e expects STATION_AUTH_DEV_BYPASS off)${RESET}`);
+  console.log(`station ${station.serialNumber}  machine ${machineId}  branch ${station.branchId}  (was ${original})\n`);
+  try {
+    // a. ENROLLED + valid token: admitted, listed by presence, catalog served.
+    await setEnrollment(machineId, 'ENROLLED');
+    check('a. ENROLLED + valid token: /agent-ws stays open', await admission(valid), 'open');
+    check('a. ENROLLED + valid token: GET /stations/me/games', await catalogStatus({ Authorization: `Bearer ${valid}` }), 200);
+    const listed = await get<StationRow & { enrollmentStatus?: string }>(`/api/v1/stations/${machineId}`);
+    check('a. presence lists the station as ENROLLED', listed?.enrollmentStatus, 'ENROLLED');
+    console.log(`${DIM}      presence status ${listed?.status ?? '?'} (ONLINE when the real agent is connected)${RESET}`);
+
+    // b. Same station, not ENROLLED: 1008 on the socket, 403 on REST.
+    for (const status of ['PENDING', 'DEACTIVATED']) {
+      await setEnrollment(machineId, status);
+      check(`b. ${status}: /agent-ws close code`, await admission(valid), 1008);
+      check(`b. ${status}: GET /stations/me/games`, await catalogStatus({ Authorization: `Bearer ${valid}` }), 403);
+    }
+    await setEnrollment(machineId, 'ENROLLED');
+    check('b. back to ENROLLED: /agent-ws stays open', await admission(valid), 'open');
+
+    // c. Valid signature, machineId with no MACHINE row: rejected, nothing created.
+    const ghostId = randomUUID();
+    const ghostSerial = `GHOST-${ghostId.slice(0, 8)}`;
+    const ghost = stationToken({ ...station, id: ghostId, serialNumber: ghostSerial }, 300);
+    check('c. no MACHINE row: /agent-ws close code', await admission(ghost), 1008);
+    check('c. no MACHINE row: handshake close code', await handshakeResult(ghost, ghostSerial), 1008);
+    check('c. no MACHINE row: GET /stations/me/games', await catalogStatus({ Authorization: `Bearer ${ghost}` }), 403);
+    check('c. no MACHINE row created', await machineCount({ id: ghostId, serialNumber: ghostSerial }), 0);
+
+    // d. Unknown serial, no token: rejected, never auto-created (dev included).
+    const unknownSerial = `UNKNOWN-${randomUUID().slice(0, 8)}`;
+    check('d. unknown serial, no token: WSS upgrade', await upgradeStatus(null), 401);
+    check('d. unknown serial, no token: GET ?serialNumber=', await catalogStatus({}, `?serialNumber=${unknownSerial}`), 401);
+    check('d. no MACHINE row created for the unknown serial', await machineCount({ serialNumber: unknownSerial }), 0);
+
+    // e. The old serial-trust bypass authenticates nothing; bad tokens stay 401.
+    const bySerial = { 'x-station-serial': station.serialNumber };
+    check('e. x-station-serial only: GET /stations/me/games', await catalogStatus(bySerial), 401);
+    check('e. ?serialNumber= only: GET /stations/me/games', await catalogStatus({}, `?serialNumber=${station.serialNumber}`), 401);
+    check('e. garbage token + x-station-serial: GET', await catalogStatus({ Authorization: 'Bearer garbage', ...bySerial }), 401);
+    check('e. garbage token: WSS upgrade', await upgradeStatus('garbage'), 401);
+    check('e. expired token: WSS upgrade', await upgradeStatus(expired), 401);
+    check('e. expired token: GET /stations/me/games', await catalogStatus({ Authorization: `Bearer ${expired}` }), 401);
+    check('e. user access token (TOKEN): WSS upgrade', await upgradeStatus(TOKEN ?? null), 401);
+    check('e. user access token (TOKEN): GET /stations/me/games', await catalogStatus({ Authorization: `Bearer ${TOKEN}` }), 401);
+    check('e. token serial != handshake serial: close code', await handshakeResult(valid, `${station.serialNumber}-X`), 1008);
+  } finally {
+    await setEnrollment(machineId, original);
+  }
+  console.log(`\n${failed ? `${RED}${failed} failed${RESET}` : `${GREEN}all passed${RESET}`}  ${DIM}(enrollmentStatus restored to ${original})${RESET}`);
   return exitSoon(failed ? 2 : 0);
 }
 
@@ -621,6 +752,9 @@ const CATALOG_COMMANDS = new Set([
   'station-auth',
 ]);
 
+if (process.argv[2] === 'station-enroll') {
+  await stationEnroll(process.argv.slice(3));
+}
 if (process.argv[2] === 'cmd') {
   await issueCommand(process.argv[3], process.argv[4], process.argv.slice(5));
 }

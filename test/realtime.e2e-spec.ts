@@ -69,7 +69,7 @@ describe('realtime gateways (e2e)', () => {
   }
 
   async function createMachine(serialNumber: string) {
-    return prisma.machine.create({ data: { serialNumber, branchId, agentPublicKey: '' } });
+    return prisma.machine.create({ data: { serialNumber, branchId, agentPublicKey: '', enrollmentStatus: 'ENROLLED' } });
   }
 
   /** `token` rides on the upgrade request, like the real agent's station JWT. */
@@ -269,6 +269,43 @@ describe('realtime gateways (e2e)', () => {
 
     const code = await new Promise<number>((resolve) => agent.socket.on('close', (closeCode: number) => resolve(closeCode)));
     expect(code).toBe(1008);
+  });
+
+  /** Resolves with the close code of an agent socket whose upgrade was accepted. */
+  function closeCode(socket: WebSocket): Promise<number> {
+    return new Promise((resolve) => socket.on('close', (code: number) => resolve(code)));
+  }
+
+  it('closes 1008 for a valid token whose station is not ENROLLED', async () => {
+    const machine = await createMachine(`STATION-${randomUUID()}`);
+    const token = mintStationToken(app, machine);
+
+    for (const enrollmentStatus of ['PENDING', 'DEACTIVATED'] as const) {
+      await prisma.machine.update({ where: { id: machine.id }, data: { enrollmentStatus } });
+      const agent = await openAgent(token);
+      const closed = closeCode(agent.socket);
+      agent.socket.send(makeFrame(envelope('handshake', 1, { serialNumber: machine.serialNumber })));
+      expect(await closed).toBe(1008);
+      expect(agent.frames).toEqual([]);
+    }
+    expect((await prisma.machine.findUniqueOrThrow({ where: { id: machine.id } })).status).toBe('OFFLINE');
+  });
+
+  it('closes 1008 for a valid token with no MACHINE row, and creates no row', async () => {
+    const serialNumber = `GHOST-${randomUUID()}`;
+    const token = mintStationToken(app, { id: randomUUID(), serialNumber, branchId });
+    const agent = await openAgent(token);
+    const closed = closeCode(agent.socket);
+    agent.socket.send(makeFrame(envelope('handshake', 1, { serialNumber })));
+
+    expect(await closed).toBe(1008);
+    expect(await prisma.machine.count({ where: { serialNumber } })).toBe(0);
+  });
+
+  it('never auto-creates a station for an unknown serial without a token', async () => {
+    const serialNumber = `GHOST-${randomUUID()}`;
+    expect(await upgradeStatus(null)).toBe(401);
+    expect(await prisma.machine.count({ where: { serialNumber } })).toBe(0);
   });
 
   it('rejects a dashboard connection with no token', async () => {

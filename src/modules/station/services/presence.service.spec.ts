@@ -1,16 +1,44 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { PresenceService, type SessionEndedEvent, type StationStatusEvent } from './presence.service.js';
+import {
+  assertStationAdmitted,
+  PresenceService,
+  StationIdentityMismatchError,
+  StationNotEnrolledError,
+  UnknownStationError,
+  type SessionEndedEvent,
+  type StationStatusEvent,
+} from './presence.service.js';
 
 const MACHINE = {
   id: 'm1',
   branchId: 'b1',
   serialNumber: 'SN-1',
+  enrollmentStatus: 'ENROLLED',
   name: 'PC-1',
   status: 'ONLINE',
   lastSeen: new Date(),
   ipAddress: null,
 };
+const PRINCIPAL = { machineId: 'm1', serialNumber: 'SN-1', branchId: 'b1' };
+
+describe('assertStationAdmitted', () => {
+  it('admits an ENROLLED row matching the token', () => {
+    expect(() => assertStationAdmitted(MACHINE as any, PRINCIPAL)).not.toThrow();
+  });
+
+  it('rejects a missing row, a non-ENROLLED row and a mismatched row', () => {
+    expect(() => assertStationAdmitted(null, PRINCIPAL)).toThrow(UnknownStationError);
+    for (const enrollmentStatus of ['PENDING', 'INACTIVE', 'DEACTIVATED']) {
+      expect(() => assertStationAdmitted({ ...MACHINE, enrollmentStatus } as any, PRINCIPAL)).toThrow(
+        StationNotEnrolledError,
+      );
+    }
+    expect(() => assertStationAdmitted({ ...MACHINE, serialNumber: 'SN-2' } as any, PRINCIPAL)).toThrow(
+      StationIdentityMismatchError,
+    );
+  });
+});
 
 describe('PresenceService agent-reported state', () => {
   let service: PresenceService;
@@ -19,7 +47,7 @@ describe('PresenceService agent-reported state', () => {
 
   beforeEach(async () => {
     const machines = {
-      findBySerial: vi.fn(async () => MACHINE),
+      findById: vi.fn(async () => MACHINE),
       markOnline: vi.fn(async () => MACHINE),
       setStatus: vi.fn(async () => MACHINE),
       touchLastSeen: vi.fn(async () => MACHINE),
@@ -31,7 +59,7 @@ describe('PresenceService agent-reported state', () => {
     ended = [];
     service.statusChanges.subscribe((e) => statuses.push(e));
     service.sessionEnded.subscribe((e) => ended.push(e));
-    await service.connect({ serialNumber: 'SN-1' }, null);
+    await service.connect({ serialNumber: 'SN-1' }, null, PRINCIPAL);
     statuses.length = 0;
   });
 

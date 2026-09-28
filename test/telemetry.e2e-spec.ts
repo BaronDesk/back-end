@@ -81,7 +81,7 @@ describe('telemetry & alerts (e2e)', () => {
   /** Connected, handshaken agent for a fresh MACHINE row. */
   async function connectAgent() {
     const serialNumber = `TEL-${randomUUID()}`;
-    const machine = await prisma.machine.create({ data: { serialNumber, branchId, agentPublicKey: '' } });
+    const machine = await prisma.machine.create({ data: { serialNumber, branchId, agentPublicKey: '', enrollmentStatus: 'ENROLLED' } });
     const socket = new WebSocket(`${baseUrl.replace('http', 'ws')}/agent-ws`, {
       headers: { authorization: `Bearer ${mintStationToken(app, machine)}` },
     });
