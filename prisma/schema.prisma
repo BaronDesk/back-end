@@ -420,6 +420,8 @@ model Membership {
   id               String           @id @default(uuid()) @db.Uuid
   gamerProfileId   String           @map("gamer_profile_id") @db.Uuid
   membershipPlanId String           @map("membership_plan_id") @db.Uuid
+  discountPercentSnapshot Decimal   @map("discount_percent_snapshot") @db.Decimal(5, 2)
+  idempotencyKey   String?          @map("idempotency_key")
   startDate        DateTime         @map("start_date") @db.Date
   endDate          DateTime         @map("end_date") @db.Date
   status           MembershipStatus @default(ACTIVE)
@@ -435,6 +437,7 @@ model Membership {
   @@index([status])
   @@index([startDate])
   @@index([endDate])
+  @@unique([gamerProfileId, idempotencyKey])
   @@map("memberships")
 }
 

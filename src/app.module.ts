@@ -12,9 +12,18 @@ import { HealthModule } from './health/health.module.js';
 import { IdentityModule } from './modules/identity/identity.module.js';
 import { OpsModule } from './modules/ops/ops.module.js';
 import { WalletModule } from './modules/wallet/wallet.module.js';
+import { MembershipModule } from './modules/membership/membership.module.js';
 
 @Module({
-  imports: [AppConfigModule, PrismaModule, IdentityModule, OpsModule, WalletModule, HealthModule],
+  imports: [
+    AppConfigModule,
+    PrismaModule,
+    IdentityModule,
+    OpsModule,
+    WalletModule,
+    MembershipModule,
+    HealthModule,
+  ],
   controllers: [AppController],
   providers: [
     AppService,
