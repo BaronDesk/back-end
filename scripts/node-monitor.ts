@@ -141,7 +141,10 @@ const RESET = '\x1b[0m';
 
 const rows = new Map<string, StationRow>();
 const telemetry = new Map<string, TelemetryUpdate>();
-const alerts: string[] = [];
+/** Rendered alert lines by alert id, oldest first. */
+const alerts = new Map<string, string>();
+/** telemetry_update pushes seen per serial since the monitor started. */
+const telemetryFrames = new Map<string, number>();
 const commands = new Map<string, CommandEvent>();
 const games = new Map<string, GameRow>();
 /** serial -> last catalog_status: what the station says it can launch. */
@@ -199,22 +202,31 @@ function renderStations(): string[] {
 }
 
 function renderTelemetry(): string[] {
-  const header = `${pad('SERIAL', 24)} ${pad('CPU°C', 7)} ${pad('GPU°C', 14)} ${pad('FAN RPM', 16)} UPDATED`;
+  const header = `${pad('SERIAL', 24)} ${pad('CPU°C', 7)} ${pad('CPU%', 6)} ${pad('GPU°C', 14)} ${pad('GPU%', 10)} ${pad('MEM%', 6)} ${pad('FAN RPM', 16)} ${pad('FRAMES', 7)} ${pad('SAMPLED', 10)} UPDATED`;
   const lines = [...telemetry.values()]
     .sort((a, b) => a.serialNumber.localeCompare(b.serialNumber))
     .map((t) => {
       const cpu = t.metrics['cpu.temperature_c'];
+      const cpuLoad = t.metrics['cpu.load_percent'];
+      const mem = t.metrics['memory.usage_percent'];
       const gpus = indexed(t.metrics, 'gpu', 'temperature_c');
+      const gpuLoads = indexed(t.metrics, 'gpu', 'load_percent');
       const fans = indexed(t.metrics, 'fan', 'speed_rpm');
       const cpuText = cpu === undefined ? '-' : cpu.toFixed(1);
       const gpuText = gpus.length ? gpus.map((g) => g.toFixed(0)).join('/') : '-';
+      const gpuLoadText = gpuLoads.length ? gpuLoads.map((g) => g.toFixed(0)).join('/') : '-';
       const fanText = fans.length ? fans.map((f) => f.toFixed(0)).join('/') : '-';
       const stale = Date.now() - new Date(t.receivedAt).getTime() > 30_000;
       return [
         pad(t.serialNumber, 24),
         cell(cpuText, 7, cpu !== undefined && cpu > CPU_MAX ? RED : undefined),
+        pad(cpuLoad === undefined ? '-' : cpuLoad.toFixed(0), 6),
         cell(gpuText, 14, gpus.some((g) => g > GPU_MAX) ? RED : undefined),
+        pad(gpuLoadText, 10),
+        pad(mem === undefined ? '-' : mem.toFixed(0), 6),
         pad(fanText, 16),
+        pad(String(telemetryFrames.get(t.serialNumber) ?? 0), 7),
+        pad(time(t.timestamp), 10),
         stale ? `${DIM}${relative(t.receivedAt)} (expired)${RESET}` : relative(t.receivedAt),
       ].join(' ');
     });
@@ -223,14 +235,18 @@ function renderTelemetry(): string[] {
 
 function alertLine(a: AlertEvent): string {
   const v = a.value ?? {};
+  // Agent `alert` frames carry `message`; the legacy shapes are kept for old rows.
   const detail =
-    a.category === 'anti_theft'
-      ? `${v.deviceType ?? '?'} '${v.deviceName ?? '?'}' pid=${v.productId ?? '?'}`
-      : a.category === 'hardware'
-        ? `${v.metric ?? '?'}=${v.value ?? '?'} > ${v.threshold ?? '?'}`
-        : JSON.stringify(v);
-  const color = a.category === 'anti_theft' ? RED : YELLOW;
-  return `${pad(time(a.createdAt), 11)} ${pad(a.serialNumber ?? '-', 24)} ${cell(a.category, 11, color)} ${pad(a.type, 20)} ${detail}  ${DIM}${a.id.slice(0, 8)}${RESET}`;
+    typeof v.message === 'string'
+      ? v.message
+      : a.category === 'anti_theft'
+        ? `${v.deviceType ?? '?'} '${v.deviceName ?? '?'}' pid=${v.productId ?? '?'}`
+        : a.category === 'hardware'
+          ? `${v.metric ?? '?'}=${v.value ?? '?'} > ${v.threshold ?? '?'}`
+          : JSON.stringify(v);
+  const repeat = typeof v.repeatCount === 'number' ? ` x${v.repeatCount}` : '';
+  const color = a.category === 'hardware' ? YELLOW : RED;
+  return `${pad(time(a.createdAt), 11)} ${pad(a.serialNumber ?? '-', 24)} ${cell(a.category, 11, color)} ${pad(a.severity, 9)} ${pad(a.type, 20)} ${detail}${repeat}  ${DIM}${a.id.slice(0, 8)}${RESET}`;
 }
 
 const COMMAND_COLOR: Record<string, string> = {
@@ -273,7 +289,7 @@ function render(): void {
   console.log(`node monitor  ${DIM}${URL}  [${connection}]  thresholds CPU>${CPU_MAX} GPU>${GPU_MAX}${RESET}\n`);
   console.log(renderStations().join('\n'));
   console.log(`\n${renderTelemetry().join('\n')}`);
-  const alertHeader = `${pad('TIME', 11)} ${pad('SERIAL', 24)} ${pad('CATEGORY', 11)} ${pad('TYPE', 20)} DETAIL`;
+  const alertHeader = `${pad('TIME', 11)} ${pad('SERIAL', 24)} ${pad('CATEGORY', 11)} ${pad('SEVERITY', 9)} ${pad('TYPE', 20)} DETAIL`;
   console.log(`\nALERTS\n${alertHeader}\n${'-'.repeat(alertHeader.length + 20)}`);
   console.log(alerts.length ? alerts.slice(-10).join('\n') : `${DIM}(no alerts)${RESET}`);
   console.log(
@@ -314,8 +330,8 @@ async function seed(): Promise<void> {
     }
   }
   const open = (await get<AlertEvent[]>('/api/v1/alerts?status=open&limit=10')) ?? [];
-  alerts.length = 0;
-  for (const a of open.reverse()) alerts.push(alertLine(a));
+  alerts.clear();
+  for (const a of open.reverse()) alerts.set(a.id, alertLine(a));
   for (const station of rows.values()) {
     if (!station.id) continue;
     for (const c of (await get<CommandEvent[]>(`/api/v1/stations/${station.id}/commands?limit=5`)) ?? []) {
@@ -667,11 +683,16 @@ socket.on('catalog_status', (event: CatalogStatusEvent) => {
 });
 socket.on('telemetry_update', (event: TelemetryUpdate) => {
   telemetry.set(event.serialNumber, event);
+  telemetryFrames.set(event.serialNumber, (telemetryFrames.get(event.serialNumber) ?? 0) + 1);
   render();
 });
 socket.on('alert', (event: AlertEvent) => {
-  alerts.push(alertLine(event));
-  log.push(`${new Date().toLocaleTimeString()}  ALERT ${event.category}/${event.type} on ${event.serialNumber ?? '?'}`);
+  // A repeat of an open alert arrives with the same id: replace its line.
+  alerts.set(event.id, alertLine(event));
+  const repeat = typeof event.value?.repeatCount === 'number' ? ` (repeat x${event.value.repeatCount})` : '';
+  log.push(
+    `${new Date().toLocaleTimeString()}  ALERT ${event.category}/${event.type} ${event.severity} on ${event.serialNumber ?? '?'}${repeat}`,
+  );
   render();
 });
 socket.on('command_update', (event: CommandEvent) => {

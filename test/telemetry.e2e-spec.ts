@@ -73,8 +73,7 @@ describe('telemetry & alerts (e2e)', () => {
   function telemetry(values: Record<string, number>) {
     const now = new Date().toISOString();
     return {
-      timestamp: now,
-      metrics: Object.entries(values).map(([metric, value]) => ({ metric, value, sampledAt: now })),
+      samples: Object.entries(values).map(([metric, value]) => ({ metric, value, sampledAt: now })),
     };
   }
 
@@ -175,49 +174,105 @@ describe('telemetry & alerts (e2e)', () => {
     agent.socket.close();
   });
 
-  it('raises one debounced hardware alert per crossing', async () => {
+  it('skips a malformed reading, merges delta frames and stamps the newest sampledAt', async () => {
+    const agent = await connectAgent();
+    const older = new Date(Date.now() - 2_000).toISOString();
+    const newer = new Date().toISOString();
+    agent.send('telemetry', {
+      samples: [
+        { metric: 'cpu.load_percent', value: 10, sampledAt: older },
+        { metric: 'ram.used_percent', value: 'high', sampledAt: newer }, // malformed
+        { metric: 'gpu.0.load_percent', value: 40, sampledAt: newer },
+      ],
+    });
+    await vi.waitFor(async () => expect(await redis.exists(`telemetry:${agent.serialNumber}`)).toBe(1));
+    agent.send('telemetry', telemetry({ 'cpu.load_percent': 25 })); // delta: gpu unchanged
+    await vi.waitFor(async () => {
+      const cached = JSON.parse((await redis.get(`telemetry:${agent.serialNumber}`)) ?? '{}');
+      expect(cached.metrics).toEqual({ 'cpu.load_percent': 25, 'gpu.0.load_percent': 40 });
+    });
+
+    // A frame without `samples` (old shape) is dropped, not crashed on.
+    agent.send('telemetry', { timestamp: newer, metrics: [] });
+    agent.send('heartbeat', { locked: false, sessionId: null });
+    await vi.waitFor(() => expect(agent.frames.map((f) => f.type)).toContain('heartbeat_ack'));
+    agent.socket.close();
+  });
+
+  it('does not derive hardware alerts from telemetry: the agent sends them', async () => {
     const client = await dashboard();
     const alerts = collect(client, 'alert');
     const agent = await connectAgent();
-    const hardwareRows = () =>
-      prisma.telemetryAlert.count({ where: { machineId: agent.machine.id, category: 'HARDWARE' } });
 
     agent.send('telemetry', telemetry({ 'gpu.0.temperature_c': 97 }));
-    agent.send('telemetry', telemetry({ 'gpu.0.temperature_c': 98 }));
+    agent.send('alert', {
+      category: 'hardware',
+      type: 'TEMPERATURE_WARNING',
+      severity: 'HIGH',
+      detail: 'GPU 0 at 97 C',
+      occurredAt: new Date().toISOString(),
+    });
     await vi.waitFor(() => expect(alerts.filter((a) => a.serialNumber === agent.serialNumber)).toHaveLength(1));
-    expect(alerts[0]).toMatchObject({ category: 'hardware', type: 'temperature_high' });
-    expect(await hardwareRows()).toBe(1);
-
-    agent.send('telemetry', telemetry({ 'gpu.0.temperature_c': 70 })); // clears
-    agent.send('telemetry', telemetry({ 'gpu.0.temperature_c': 95 })); // fires again
-    await vi.waitFor(async () => expect(await hardwareRows()).toBe(2));
+    await new Promise((r) => setTimeout(r, 300));
+    const rows = await prisma.telemetryAlert.findMany({ where: { machineId: agent.machine.id } });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ category: 'HARDWARE', type: 'TEMPERATURE_WARNING', severity: 'HIGH' });
+    expect(rows[0].value).toMatchObject({ message: 'GPU 0 at 97 C' });
 
     agent.socket.close();
     client.close();
   });
 
-  it('turns a device Disconnected into one anti_theft alert that staff can resolve', async () => {
+  it('stores unknown category/severity strings and drops a malformed alert frame', async () => {
+    const agent = await connectAgent();
+    agent.send('alert', { category: 'hardware' }); // malformed
+    agent.send('alert', {
+      category: 'tampering',
+      type: 'CASE_OPEN',
+      severity: 'SEVERE',
+      detail: 'chassis intrusion',
+      occurredAt: new Date().toISOString(),
+    });
+    await vi.waitFor(async () =>
+      expect(await prisma.telemetryAlert.count({ where: { machineId: agent.machine.id } })).toBe(1),
+    );
+    const row = await prisma.telemetryAlert.findFirstOrThrow({ where: { machineId: agent.machine.id } });
+    expect(row).toMatchObject({ category: 'HARDWARE', severity: 'MEDIUM', type: 'CASE_OPEN' });
+    expect(row.value).toMatchObject({ agentCategory: 'tampering', agentSeverity: 'SEVERE' });
+    agent.socket.close();
+  });
+
+  it('stores an anti_theft alert once across resends, and staff can resolve it', async () => {
     const client = await dashboard();
     const alerts = collect(client, 'alert');
     const agent = await connectAgent();
-    const disconnected = {
-      timestamp: new Date().toISOString(),
-      deviceType: 'Mouse',
-      deviceName: 'USB Optical Mouse',
-      productId: 'C077',
-      eventType: 'Disconnected',
+    const occurredAt = new Date(Date.now() - 1_000).toISOString();
+    const unplugged = {
+      category: 'anti_theft',
+      type: 'HARDWARE_FAILURE',
+      severity: 'CRITICAL',
+      detail: "USB device 'USB Optical Mouse' removed",
+      occurredAt,
     };
 
-    agent.send('device_event', disconnected);
-    agent.send('device_event', disconnected); // agent retry: must not duplicate
-    agent.send('device_event', { ...disconnected, eventType: 'Connected', timestamp: new Date().toISOString() });
+    agent.send('alert', unplugged);
+    agent.send('alert', unplugged); // outbox resend after reconnect: must not duplicate
 
     await vi.waitFor(() => expect(alerts.filter((a) => a.serialNumber === agent.serialNumber)).toHaveLength(1));
     await new Promise((r) => setTimeout(r, 300));
     const rows = await prisma.telemetryAlert.findMany({ where: { machineId: agent.machine.id } });
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ category: 'ANTI_THEFT', type: 'device_disconnected', branchId });
-    expect(rows[0].value).toMatchObject({ deviceName: 'USB Optical Mouse', productId: 'C077' });
+    expect(rows[0]).toMatchObject({ category: 'ANTI_THEFT', type: 'HARDWARE_FAILURE', severity: 'CRITICAL', branchId });
+    expect(rows[0].createdAt.toISOString()).toBe(occurredAt);
+    expect(rows[0].value).toMatchObject({ message: "USB device 'USB Optical Mouse' removed" });
+
+    // Same kind again inside the window: the open alert is updated, not duplicated.
+    agent.send('alert', { ...unplugged, detail: "USB device 'Keyboard' removed", occurredAt: new Date().toISOString() });
+    await vi.waitFor(async () => {
+      const [row] = await prisma.telemetryAlert.findMany({ where: { machineId: agent.machine.id } });
+      expect(row.value).toMatchObject({ repeatCount: 2, message: "USB device 'Keyboard' removed" });
+    });
+    expect(await prisma.telemetryAlert.count({ where: { machineId: agent.machine.id } })).toBe(1);
 
     const open = await app.inject({ method: 'GET', url: '/api/v1/alerts?status=open', headers: auth() });
     expect(open.json()).toContainEqual(expect.objectContaining({ id: rows[0].id, category: 'anti_theft' }));
