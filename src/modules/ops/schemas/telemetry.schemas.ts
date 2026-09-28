@@ -11,12 +11,32 @@ export const telemetryReadingSchema = z.object({
   sampledAt: z.string().optional(),
 });
 
+/**
+ * The agent sends only the samples that changed, plus a periodic full
+ * snapshot, so a frame may carry any subset of metrics. There is no
+ * frame-level timestamp: each reading carries its own `sampledAt`.
+ */
 export const telemetryPayloadSchema = z.object({
-  timestamp: z.string().min(1),
-  metrics: z.array(z.unknown()),
+  samples: z.array(z.unknown()),
 });
 export type TelemetryPayload = z.infer<typeof telemetryPayloadSchema>;
 
+/**
+ * An `alert` frame: the agent raises hardware and anti-theft alerts itself.
+ * Values are kept as open strings on purpose (known: category hardware |
+ * anti_theft | security_violation, severity LOW..CRITICAL) so a new agent
+ * value is stored, not rejected.
+ */
+export const alertPayloadSchema = z.object({
+  category: z.string().trim().min(1),
+  type: z.string().trim().min(1),
+  severity: z.string().trim().min(1),
+  detail: z.string().default(''),
+  occurredAt: z.string().min(1),
+});
+export type AlertPayload = z.infer<typeof alertPayloadSchema>;
+
+/** Legacy: the current agent no longer sends `device_event` (see `alert`). */
 export const DEVICE_EVENT_TYPES = { CONNECTED: 'Connected', DISCONNECTED: 'Disconnected' } as const;
 
 export const deviceEventPayloadSchema = z.object({

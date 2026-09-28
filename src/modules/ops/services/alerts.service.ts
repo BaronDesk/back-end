@@ -11,10 +11,28 @@ import type { AlertCategory, AlertSeverity, Prisma, TelemetryAlert } from '../..
 import type { StationRef } from '../../station/services/presence.service.js';
 import { DashboardGateway } from '../dashboard.gateway.js';
 import { OpsRepository } from '../repository/ops.repository.js';
-import { DEVICE_EVENT_TYPES, type DeviceEventPayload, type ListAlertsQuery } from '../schemas/telemetry.schemas.js';
+import {
+  DEVICE_EVENT_TYPES,
+  type AlertPayload,
+  type DeviceEventPayload,
+  type ListAlertsQuery,
+} from '../schemas/telemetry.schemas.js';
 
 /** The agent retries device events on reconnect; remember each one this long. */
 const DEVICE_EVENT_DEDUPE_TTL_S = 24 * 60 * 60;
+
+/**
+ * An open alert of the same kind on the same machine this recent is updated
+ * instead of duplicated (the agent's outbox resends alerts on reconnect).
+ */
+const AGENT_ALERT_DEDUPE_WINDOW_MS = 5 * 60_000;
+
+const ALERT_CATEGORIES: Record<string, AlertCategory> = {
+  hardware: 'HARDWARE',
+  anti_theft: 'ANTI_THEFT',
+  security_violation: 'SECURITY_VIOLATION',
+};
+const ALERT_SEVERITIES: ReadonlySet<string> = new Set(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']);
 
 export interface NewAlert {
   category: AlertCategory;
@@ -71,6 +89,82 @@ export class AlertsService {
   }
 
   /**
+   * `alert` frames are the source of truth for hardware and anti-theft alerts.
+   * Unknown category/severity strings are stored as HARDWARE / MEDIUM (raw
+   * value kept in `value`) rather than rejected. `detail` lands in
+   * `value.message`, `occurredAt` becomes `createdAt`.
+   */
+  async onAgentAlert(station: StationRef, alert: AlertPayload) {
+    const rawCategory = alert.category.toLowerCase();
+    const rawSeverity = alert.severity.toUpperCase();
+    const knownCategory = ALERT_CATEGORIES[rawCategory];
+    const knownSeverity = ALERT_SEVERITIES.has(rawSeverity);
+    const category = knownCategory ?? 'HARDWARE';
+    const severity = (knownSeverity ? rawSeverity : 'MEDIUM') as AlertSeverity;
+    if (!knownCategory || !knownSeverity) {
+      this.logger.warn(
+        `alert with unknown category/severity '${alert.category}'/'${alert.severity}' from ${station.serialNumber}; stored as ${category}/${severity}`,
+      );
+    }
+
+    const parsedAt = new Date(alert.occurredAt);
+    const occurredAt = Number.isNaN(parsedAt.getTime()) ? new Date() : parsedAt;
+    const details: Record<string, unknown> = {
+      serialNumber: station.serialNumber,
+      message: alert.detail,
+      occurredAt: occurredAt.toISOString(),
+      ...(knownCategory ? {} : { agentCategory: alert.category }),
+      ...(knownSeverity ? {} : { agentSeverity: alert.severity }),
+    };
+
+    const existing = await this.repo.findRecentOpenAlert({
+      machineId: station.machineId,
+      category,
+      type: alert.type,
+      since: new Date(occurredAt.getTime() - AGENT_ALERT_DEDUPE_WINDOW_MS),
+    });
+
+    if (existing) {
+      const prev = (existing.value ?? {}) as Record<string, unknown>;
+      if (prev.occurredAt === details.occurredAt && prev.message === details.message) {
+        this.logger.debug(`duplicate alert ${alert.category}/${alert.type} from ${station.serialNumber} ignored`);
+        return toAlertDto(existing);
+      }
+      const repeatCount = (typeof prev.repeatCount === 'number' ? prev.repeatCount : 1) + 1;
+      const row = await this.repo.updateAlert(existing.id, {
+        severity,
+        value: {
+          ...prev,
+          ...details,
+          firstOccurredAt: prev.firstOccurredAt ?? prev.occurredAt ?? null,
+          repeatCount,
+        } as Prisma.InputJsonValue,
+      });
+      const dto = toAlertDto(row);
+      this.logger.warn(`alert ${dto.category}/${dto.type} on ${station.serialNumber} repeated (${row.id}, x${repeatCount})`);
+      this.dashboard.publishToBranch(station.branchId, DASHBOARD_EVENTS.ALERT, dto);
+      return dto;
+    }
+
+    const row = await this.repo.createAlert({
+      machineId: station.machineId,
+      branchId: station.branchId,
+      category,
+      type: alert.type,
+      severity,
+      value: details as Prisma.InputJsonValue,
+      createdAt: occurredAt,
+    });
+    const dto = toAlertDto(row);
+    this.logger.warn(`alert ${dto.category}/${dto.type} on ${station.serialNumber} (${row.id})`);
+    // TODO: Redis pub/sub if multi-instance — in-process publish only reaches
+    // dashboards connected to this instance.
+    this.dashboard.publishToBranch(station.branchId, DASHBOARD_EVENTS.ALERT, dto);
+    return dto;
+  }
+
+  /**
+   * Legacy: the current agent sends `alert` instead.
    * device_event is the anti-theft source. A peripheral going away raises an
    * ANTI_THEFT alert; one coming back is informational only.
    */
