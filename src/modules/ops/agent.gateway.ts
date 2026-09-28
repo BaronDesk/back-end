@@ -1,4 +1,5 @@
-import type { IncomingMessage } from 'node:http';
+import type { IncomingMessage, Server as HttpServer } from 'node:http';
+import type { Duplex } from 'node:stream';
 
 import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
@@ -32,6 +33,7 @@ import { CommandsService } from './services/commands.service.js';
 import { TelemetryService } from './services/telemetry.service.js';
 
 const HANDSHAKE_TIMEOUT_MS = 10_000;
+const AGENT_WS_PATH = '/agent-ws';
 
 /** `simulate: 'stale_ts'` backdates the frame well past any replay window. */
 const SIMULATED_STALE_MS = 10 * 60_000;
@@ -79,6 +81,7 @@ interface AgentConnection {
 export class AgentGateway implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(AgentGateway.name);
   private wss?: WebSocketServer;
+  private httpServer?: HttpServer;
   private statusSub?: Subscription;
   private readonly connections = new WeakMap<WebSocket, AgentConnection>();
 
@@ -92,9 +95,13 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   onModuleInit(): void {
-    const httpServer = this.adapterHost.httpAdapter.getHttpServer();
+    this.httpServer = this.adapterHost.httpAdapter.getHttpServer() as HttpServer;
 
-    this.wss = new WebSocketServer({ server: httpServer, path: '/agent-ws' });
+    // noServer: with `{ server, path }`, ws answers every other upgrade on the
+    // shared HTTP server with a 400, which corrupts Socket.IO's /dashboard-io
+    // handshake. Only claim our own path and leave the rest to Socket.IO.
+    this.wss = new WebSocketServer({ noServer: true });
+    this.httpServer.on('upgrade', this.onUpgrade);
     this.wss.on('connection', (socket: WebSocket, request: IncomingMessage) =>
       this.handleConnection(socket, request),
     );
@@ -102,13 +109,20 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     this.statusSub = this.presence.statusChanges.subscribe((event) =>
       this.dashboard.publishToBranch(event.branchId, DASHBOARD_EVENTS.STATION_STATUS, event),
     );
-    this.logger.log('agent-ws attached at /agent-ws');
+    this.logger.log(`agent-ws attached at ${AGENT_WS_PATH}`);
   }
 
   onModuleDestroy(): void {
     this.statusSub?.unsubscribe();
+    this.httpServer?.off('upgrade', this.onUpgrade);
     this.wss?.close();
   }
+
+  private readonly onUpgrade = (request: IncomingMessage, socket: Duplex, head: Buffer): void => {
+    const wss = this.wss;
+    if (!wss || new URL(request.url ?? '/', 'http://localhost').pathname !== AGENT_WS_PATH) return;
+    wss.handleUpgrade(request, socket, head, (ws) => wss.emit('connection', ws, request));
+  };
 
   // STUB: verifyStation per ADR-003 goes here. The agent may send
   // `Authorization: Bearer <stationToken>`; it is ignored until station
