@@ -160,11 +160,10 @@ model Branch {
 }
 
 model Pricing {
-  id           String  @id @default(uuid()) @db.Uuid
-  branchId     String  @map("branch_id") @db.Uuid
-  paygRate     Decimal @map("payg_rate") @db.Decimal(10, 2)
-  bookingRate  Decimal @map("booking_rate") @db.Decimal(10, 2)
-  currency     String  @default("USD")
+  id           String   @id @default(uuid()) @db.Uuid
+  branchId     String   @map("branch_id") @db.Uuid
+  paygRate     Int      @map("payg_rate")
+  bookingRate  Int      @map("booking_rate")
   createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
   updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz
 
