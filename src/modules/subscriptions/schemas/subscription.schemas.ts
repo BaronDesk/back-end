@@ -1,0 +1,39 @@
+import { z } from 'zod';
+
+const timeSchema = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/);
+const benefitWindowSchema = z.object({
+  daysOfWeek: z.array(z.number().int().min(0).max(6)).min(1).max(7),
+  startTime: timeSchema,
+  endTime: timeSchema,
+  discountPercent: z.number().min(0).max(100),
+});
+
+export const idParamSchema = z.string().uuid();
+export const createSubscriptionPlanSchema = z.object({
+  name: z.string().trim().min(1).max(100),
+  price: z.number().finite().min(0).max(99_999_999.99),
+  durationDays: z.number().int().positive().max(3650),
+  benefits: z
+    .object({ windows: z.array(benefitWindowSchema).max(50) })
+    .strict(),
+});
+export type CreateSubscriptionPlanDto = z.infer<
+  typeof createSubscriptionPlanSchema
+>;
+
+export const updateSubscriptionPlanSchema = createSubscriptionPlanSchema
+  .partial()
+  .refine(
+    (value) => Object.keys(value).length > 0,
+    'at least one field is required',
+  );
+export type UpdateSubscriptionPlanDto = z.infer<
+  typeof updateSubscriptionPlanSchema
+>;
+
+export const purchaseSubscriptionSchema = z.object({
+  idempotencyKey: z.string().trim().min(1).max(128).optional(),
+});
+export type PurchaseSubscriptionDto = z.infer<
+  typeof purchaseSubscriptionSchema
+>;
