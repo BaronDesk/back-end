@@ -8,7 +8,8 @@ import type { AccessTokenPayload, RefreshTokenPayload } from '../../../common/ty
 import { ROLE_SCOPE, type Role } from '../../../common/utils/scope.js';
 
 /**
- * Single source of truth for signing/verifying both token kinds. Registered
+ * Single source of truth for signing/verifying user tokens, and for checking
+ * the access-key signature of station tokens (StationTokenService). Registered
  * once here and reused everywhere a token must be checked (HTTP guard,
  * dashboard-io handshake) so there is exactly one place that knows the
  * claim shape and the two secrets.
@@ -38,7 +39,22 @@ export class TokenService {
   }
 
   async verifyAccessToken(token: string): Promise<AccessTokenPayload> {
-    return this.jwt.verifyAsync<AccessTokenPayload>(token, {
+    const payload = await this.verifyAccessKeySignature(token);
+    // Station tokens share the access key but carry `type: "station"`; user
+    // access tokens carry no `type`. A station must never pass as a user.
+    if ('type' in payload || typeof payload.role !== 'string' || typeof payload.scope !== 'string') {
+      throw new Error('not a user access token');
+    }
+    return payload as unknown as AccessTokenPayload;
+  }
+
+  /**
+   * Signature + expiry check against the access key, claims untouched. For
+   * other token kinds signed with the same key (station tokens); callers must
+   * check the claim shape themselves.
+   */
+  async verifyAccessKeySignature(token: string): Promise<Record<string, unknown>> {
+    return this.jwt.verifyAsync<Record<string, unknown>>(token, {
       secret: this.config.getOrThrow('JWT_ACCESS_SECRET'),
     });
   }
