@@ -45,7 +45,7 @@ $env:Agent__ServerUrl = "wss://localhost/agent-ws"
 
 1. On the **server PC**, find its LAN IP:
    ```powershell
-   ipconfig   # e.g. IPv4 Address . . . : 192.168.1.50
+   ipconfig   # e.g. IPv4 Address . . . : 192.168.137.1
    ```
 2. On the **server PC**, allow inbound 443 (run in an admin terminal):
    ```powershell
