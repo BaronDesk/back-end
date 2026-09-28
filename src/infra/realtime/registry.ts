@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import type { WebSocket } from 'ws';
 
 /**
- * In-memory serialNumber -> socket map for connected agents. Foundation-level
+ * In-memory machineId -> socket map for connected agents. Foundation-level
  * only: no cross-instance sync. A second app instance means agents split
  * across two disjoint registries.
  */
@@ -10,27 +10,20 @@ import type { WebSocket } from 'ws';
 export class AgentRegistry {
   private readonly sockets = new Map<string, WebSocket>();
 
-  register(serialNumber: string, socket: WebSocket): void {
-    this.sockets.get(serialNumber)?.close(4000, 'replaced by new connection');
-    this.sockets.set(serialNumber, socket);
+  register(machineId: string, socket: WebSocket): void {
+    this.sockets.get(machineId)?.close(4000, 'replaced by new connection');
+    this.sockets.set(machineId, socket);
   }
 
-  /**
-   * Removes the mapping only if it still points at this socket. Returns false
-   * when a newer connection has already replaced it, so the caller can skip
-   * marking the station offline.
-   */
-  deregister(serialNumber: string, socket: WebSocket): boolean {
-    if (this.sockets.get(serialNumber) !== socket) return false;
-    this.sockets.delete(serialNumber);
-    return true;
+  deregister(machineId: string, socket: WebSocket): void {
+    if (this.sockets.get(machineId) === socket) this.sockets.delete(machineId);
   }
 
-  get(serialNumber: string): WebSocket | undefined {
-    return this.sockets.get(serialNumber);
+  get(machineId: string): WebSocket | undefined {
+    return this.sockets.get(machineId);
   }
 
-  has(serialNumber: string): boolean {
-    return this.sockets.has(serialNumber);
+  has(machineId: string): boolean {
+    return this.sockets.has(machineId);
   }
 }

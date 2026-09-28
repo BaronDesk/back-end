@@ -42,8 +42,7 @@
     "caddy:validate": "npm run dc -- exec reverse-proxy caddy validate --config /etc/caddy/Caddyfile",
     "caddy:reload": "npm run dc -- exec reverse-proxy caddy reload --config /etc/caddy/Caddyfile",
     "caddy:ca": "npm run dc -- cp reverse-proxy:/data/caddy/pki/authorities/local/root.crt ./caddy-root.crt",
-    "test:int": "npm run dc -- exec backend npx vitest run --config ./vitest.config.e2e.ts",
-    "monitor": "tsx scripts/node-monitor.ts"
+    "test:int": "npm run dc -- exec backend npx vitest run --config ./vitest.config.e2e.ts"
   },
   "dependencies": {
     "@fastify/static": "^10.1.3",
