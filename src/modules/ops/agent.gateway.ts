@@ -28,7 +28,11 @@ import {
   type CommandSimulation,
   type StationCommandType,
 } from './schemas/command.schemas.js';
-import { deviceEventPayloadSchema, telemetryPayloadSchema } from './schemas/telemetry.schemas.js';
+import {
+  alertPayloadSchema,
+  deviceEventPayloadSchema,
+  telemetryPayloadSchema,
+} from './schemas/telemetry.schemas.js';
 import { CommandsService } from './services/commands.service.js';
 import { TelemetryService } from './services/telemetry.service.js';
 
@@ -207,7 +211,11 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
         case AGENT_MESSAGE_TYPES.TELEMETRY:
           await this.onTelemetry(conn.serialNumber, envelope);
           return;
+        case AGENT_MESSAGE_TYPES.ALERT:
+          await this.onAlert(conn.serialNumber, envelope);
+          return;
         case AGENT_MESSAGE_TYPES.DEVICE_EVENT:
+          // Legacy: the current agent sends `alert` instead.
           await this.onDeviceEvent(conn.serialNumber, envelope);
           return;
         case AGENT_MESSAGE_TYPES.COMMAND_ACK:
@@ -304,6 +312,17 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
       return;
     }
     await this.telemetry.ingest(serialNumber, parsed.data);
+  }
+
+  // alert gets no ack either: the agent's outbox resends on reconnect and
+  // AlertsService folds repeats into the open alert.
+  private async onAlert(serialNumber: string, envelope: Envelope): Promise<void> {
+    const parsed = alertPayloadSchema.safeParse(envelope.payload);
+    if (!parsed.success) {
+      this.logger.warn(`malformed alert payload from ${serialNumber}`);
+      return;
+    }
+    await this.telemetry.onAlert(serialNumber, parsed.data);
   }
 
   private async onDeviceEvent(serialNumber: string, envelope: Envelope): Promise<void> {
