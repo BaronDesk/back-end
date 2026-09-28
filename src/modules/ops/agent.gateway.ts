@@ -1,4 +1,5 @@
-import type { IncomingMessage } from 'node:http';
+import type { IncomingMessage, Server as HttpServer } from 'node:http';
+import type { Duplex } from 'node:stream';
 
 import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
@@ -38,11 +39,16 @@ import {
   type CommandSimulation,
   type StationCommandType,
 } from './schemas/command.schemas.js';
-import { deviceEventPayloadSchema, telemetryPayloadSchema } from './schemas/telemetry.schemas.js';
+import {
+  alertPayloadSchema,
+  deviceEventPayloadSchema,
+  telemetryPayloadSchema,
+} from './schemas/telemetry.schemas.js';
 import { CommandsService } from './services/commands.service.js';
 import { TelemetryService } from './services/telemetry.service.js';
 
 const HANDSHAKE_TIMEOUT_MS = 10_000;
+const AGENT_WS_PATH = '/agent-ws';
 
 /** RFC 6455 policy violation: the station's credential does not fit the connection. */
 const CLOSE_POLICY_VIOLATION = 1008;
@@ -108,6 +114,7 @@ interface AgentConnection {
 export class AgentGateway implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(AgentGateway.name);
   private wss?: WebSocketServer;
+  private httpServer?: HttpServer;
   private statusSub?: Subscription;
   private readonly connections = new WeakMap<WebSocket, AgentConnection>();
   /**
@@ -128,13 +135,17 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   onModuleInit(): void {
-    const httpServer = this.adapterHost.httpAdapter.getHttpServer();
+    this.httpServer = this.adapterHost.httpAdapter.getHttpServer() as HttpServer;
 
+    // noServer: with `{ server, path }`, ws answers every other upgrade on the
+    // shared HTTP server with a 400, which corrupts Socket.IO's /dashboard-io
+    // handshake. Only claim our own path and leave the rest to Socket.IO.
+    // verifyClient still runs inside handleUpgrade in noServer mode.
     this.wss = new WebSocketServer({
-      server: httpServer,
-      path: '/agent-ws',
+      noServer: true,
       verifyClient: (info, done) => void this.verifyUpgrade(info.req, done),
     });
+    this.httpServer.on('upgrade', this.onUpgrade);
     this.wss.on('connection', (socket: WebSocket, request: IncomingMessage) =>
       this.handleConnection(socket, request),
     );
@@ -142,19 +153,22 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     this.statusSub = this.presence.statusChanges.subscribe((event) =>
       this.dashboard.publishToBranch(event.branchId, DASHBOARD_EVENTS.STATION_STATUS, event),
     );
-    this.logger.log('agent-ws attached at /agent-ws');
+    this.logger.log(`agent-ws attached at ${AGENT_WS_PATH}`);
   }
 
   onModuleDestroy(): void {
     this.statusSub?.unsubscribe();
+    this.httpServer?.off('upgrade', this.onUpgrade);
     this.wss?.close();
   }
 
-  /**
-   * Runs before the upgrade completes: no valid station token, no socket
-   * (401). A valid token for a station that is not admitted is upgraded only
-   * so it can be closed with 1008 in handleConnection.
-   */
+  private readonly onUpgrade = (request: IncomingMessage, socket: Duplex, head: Buffer): void => {
+    const wss = this.wss;
+    if (!wss || new URL(request.url ?? '/', 'http://localhost').pathname !== AGENT_WS_PATH) return;
+    wss.handleUpgrade(request, socket, head, (ws) => wss.emit('connection', ws, request));
+  };
+
+  /** Runs before the upgrade completes: no valid station token, no socket. */
   private async verifyUpgrade(
     request: IncomingMessage,
     done: (result: boolean, code?: number, message?: string) => void,
@@ -268,7 +282,11 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
         case AGENT_MESSAGE_TYPES.TELEMETRY:
           await this.onTelemetry(conn.serialNumber, envelope);
           return;
+        case AGENT_MESSAGE_TYPES.ALERT:
+          await this.onAlert(conn.serialNumber, envelope);
+          return;
         case AGENT_MESSAGE_TYPES.DEVICE_EVENT:
+          // Legacy: the current agent sends `alert` instead.
           await this.onDeviceEvent(conn.serialNumber, envelope);
           return;
         case AGENT_MESSAGE_TYPES.COMMAND_ACK:
@@ -378,6 +396,17 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
       return;
     }
     await this.telemetry.ingest(serialNumber, parsed.data);
+  }
+
+  // alert gets no ack either: the agent's outbox resends on reconnect and
+  // AlertsService folds repeats into the open alert.
+  private async onAlert(serialNumber: string, envelope: Envelope): Promise<void> {
+    const parsed = alertPayloadSchema.safeParse(envelope.payload);
+    if (!parsed.success) {
+      this.logger.warn(`malformed alert payload from ${serialNumber}`);
+      return;
+    }
+    await this.telemetry.onAlert(serialNumber, parsed.data);
   }
 
   private async onDeviceEvent(serialNumber: string, envelope: Envelope): Promise<void> {

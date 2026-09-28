@@ -29,8 +29,27 @@ export class OpsRepository extends BaseRepository {
     type: string;
     severity: AlertSeverity;
     value: Prisma.InputJsonValue;
+    createdAt?: Date;
   }) {
     return this.prisma.telemetryAlert.create({ data });
+  }
+
+  /** Newest unacknowledged alert of this kind on the machine created at or after `since`. */
+  findRecentOpenAlert(filter: { machineId: string; category: AlertCategory; type: string; since: Date }) {
+    return this.prisma.telemetryAlert.findFirst({
+      where: {
+        machineId: filter.machineId,
+        category: filter.category,
+        type: filter.type,
+        acknowledged: false,
+        createdAt: { gte: filter.since },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  updateAlert(id: string, data: { severity: AlertSeverity; value: Prisma.InputJsonValue }) {
+    return this.prisma.telemetryAlert.update({ where: { id }, data });
   }
 
   findAlertById(id: string) {

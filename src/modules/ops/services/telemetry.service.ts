@@ -8,6 +8,7 @@ import { PresenceService, type StationRef } from '../../station/services/presenc
 import { DashboardGateway } from '../dashboard.gateway.js';
 import {
   telemetryReadingSchema,
+  type AlertPayload,
   type DeviceEventPayload,
   type TelemetryPayload,
 } from '../schemas/telemetry.schemas.js';
@@ -22,7 +23,7 @@ export interface TelemetrySnapshot {
   serialNumber: string;
   machineId: string;
   branchId: string;
-  /** The agent's sample time for the frame. */
+  /** Newest `sampledAt` among the frame's readings, or `receivedAt` if none is usable. */
   timestamp: string;
   receivedAt: string;
   metrics: Record<string, number>;
@@ -33,7 +34,9 @@ const GPU_TEMP_METRIC = /^gpu\.\d+\.temperature_c$/;
 
 /**
  * Live telemetry: cache-only, never Postgres (the history job thins it into
- * `node_telemetry`). Also derives HARDWARE alerts from temperature readings.
+ * `node_telemetry`). The agent raises its own HARDWARE alerts (`alert`
+ * frames), so deriving them here from temperature readings is off unless
+ * TELEMETRY_DERIVED_ALERTS=true.
  */
 @Injectable()
 export class TelemetryService {
@@ -41,6 +44,7 @@ export class TelemetryService {
   private readonly cacheTtlS: number;
   private readonly cpuThresholdC: number;
   private readonly gpuThresholdC: number;
+  private readonly derivedAlerts: boolean;
   /** `<machineId>:<metric>` currently over threshold; an alert has already fired for it. */
   private readonly overheating = new Set<string>();
 
@@ -54,6 +58,7 @@ export class TelemetryService {
     this.cacheTtlS = Number(config.get('TELEMETRY_CACHE_TTL_S') ?? 30);
     this.cpuThresholdC = Number(config.get('CPU_TEMP_THRESHOLD_C') ?? 85);
     this.gpuThresholdC = Number(config.get('GPU_TEMP_THRESHOLD_C') ?? 90);
+    this.derivedAlerts = String(config.get('TELEMETRY_DERIVED_ALERTS') ?? 'false') === 'true';
   }
 
   async ingest(serialNumber: string, payload: TelemetryPayload): Promise<void> {
@@ -65,20 +70,30 @@ export class TelemetryService {
 
     const metrics: Record<string, number> = {};
     let rejected = 0;
-    for (const entry of payload.metrics) {
+    let newestSampledAt = Number.NEGATIVE_INFINITY;
+    for (const entry of payload.samples) {
       const reading = telemetryReadingSchema.safeParse(entry);
-      if (reading.success) metrics[reading.data.metric] = reading.data.value;
-      else rejected += 1;
+      if (!reading.success) {
+        rejected += 1;
+        continue;
+      }
+      metrics[reading.data.metric] = reading.data.value;
+      const sampledAt = reading.data.sampledAt ? Date.parse(reading.data.sampledAt) : Number.NaN;
+      if (sampledAt > newestSampledAt) newestSampledAt = sampledAt;
     }
     if (rejected) this.logger.debug(`${rejected} malformed telemetry reading(s) from ${serialNumber} skipped`);
 
+    const receivedAt = new Date().toISOString();
+    // Frames are deltas: merge onto the cached snapshot so unchanged metrics
+    // survive. The agent sends a full snapshot before any metric could expire.
+    const previous = await this.latest(serialNumber).catch(() => null);
     const snapshot: TelemetrySnapshot = {
       serialNumber,
       machineId: station.machineId,
       branchId: station.branchId,
-      timestamp: payload.timestamp,
-      receivedAt: new Date().toISOString(),
-      metrics,
+      timestamp: Number.isFinite(newestSampledAt) ? new Date(newestSampledAt).toISOString() : receivedAt,
+      receivedAt,
+      metrics: { ...(previous?.machineId === station.machineId ? previous.metrics : {}), ...metrics },
     };
 
     try {
@@ -91,9 +106,19 @@ export class TelemetryService {
     // dashboards connected to this instance.
     this.dashboard.publishToBranch(station.branchId, DASHBOARD_EVENTS.TELEMETRY_UPDATE, snapshot);
 
-    await this.checkThresholds(station, metrics);
+    if (this.derivedAlerts) await this.checkThresholds(station, metrics);
   }
 
+  async onAlert(serialNumber: string, alert: AlertPayload): Promise<void> {
+    const station = this.presence.resolve(serialNumber);
+    if (!station) {
+      this.logger.warn(`alert from unresolved station ${serialNumber} dropped`);
+      return;
+    }
+    await this.alerts.onAgentAlert(station, alert);
+  }
+
+  /** Legacy path: the current agent never sends `device_event`. */
   async onDeviceEvent(serialNumber: string, event: DeviceEventPayload): Promise<void> {
     const station = this.presence.resolve(serialNumber);
     if (!station) {
