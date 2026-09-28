@@ -5,7 +5,7 @@ import { Injectable, UnauthorizedException } from '@nestjs/common';
 import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
 import { RefreshTokenRepository } from '../repository/refresh-token.repository.js';
 import { UsersRepository } from '../repository/users.repository.js';
-import type { LoginDto, LogoutDto, RefreshDto } from '../schemas/auth.schemas.js';
+import type { ChangePasswordDto, LoginDto, LogoutDto, RefreshDto } from '../schemas/auth.schemas.js';
 import { PasswordService } from './password.service.js';
 import { TokenService } from './token.service.js';
 import { toPublicUser } from '../util/public-user.js';
@@ -57,6 +57,28 @@ export class AuthService {
     const user = await this.users.findById(caller.sub);
     if (!user) throw new UnauthorizedException({ code: 'INVALID_TOKEN', error: 'user no longer exists' });
     return toPublicUser(user);
+  }
+
+  /**
+   * Always operates on the caller's own account (no :id) — nobody, not even
+   * hq, can change someone else's password through this route. Revokes every
+   * other refresh token afterward, so a stolen session doesn't survive a
+   * password change.
+   */
+  async changePassword(caller: AccessTokenPayload, dto: ChangePasswordDto): Promise<{ success: true }> {
+    const user = await this.users.findById(caller.sub);
+    if (!user) throw new UnauthorizedException({ code: 'INVALID_TOKEN', error: 'user no longer exists' });
+
+    const valid = await this.passwords.verify(user.passwordHash, dto.currentPassword);
+    if (!valid) {
+      throw new UnauthorizedException({ code: 'INVALID_CURRENT_PASSWORD', error: 'current password is incorrect' });
+    }
+
+    const passwordHash = await this.passwords.hash(dto.newPassword);
+    await this.users.updatePasswordHash(caller.sub, passwordHash);
+    await this.refreshTokens.revokeAllForUser(caller.sub);
+
+    return { success: true };
   }
 
   private async verifyRefreshTokenOrThrow(token: string) {

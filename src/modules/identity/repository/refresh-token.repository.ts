@@ -23,4 +23,12 @@ export class RefreshTokenRepository extends BaseRepository {
       data: { revoked: true, ...(replacedByJti ? { replacedByJti } : {}) },
     });
   }
+
+  /** Kills every other active session for a user — used after a password change. */
+  revokeAllForUser(userId: string) {
+    return this.prisma.refreshToken.updateMany({
+      where: { userId, revoked: false },
+      data: { revoked: true },
+    });
+  }
 }

@@ -21,3 +21,22 @@ export const updateRoleSchema = z.object({
 export type UpdateRoleDto = z.infer<typeof updateRoleSchema>;
 
 export const idParamSchema = z.string().uuid();
+
+// branchId only has an effect for an hq caller — a non-hq caller is always
+// scoped to their own branch (see UsersService.list).
+export const listUsersQuerySchema = z.object({
+  role: z.enum(['GAMER', 'EMPLOYEE', 'MANAGER', 'ADMIN']).optional(),
+  accountStatus: z.enum(['ACTIVE', 'SUSPENDED', 'INACTIVE', 'DELETED']).optional(),
+  branchId: z.string().uuid().optional(),
+});
+export type ListUsersQueryDto = z.infer<typeof listUsersQuerySchema>;
+
+export const updateAccountStatusSchema = z.object({
+  accountStatus: z.enum(['ACTIVE', 'SUSPENDED', 'INACTIVE', 'DELETED']),
+});
+export type UpdateAccountStatusDto = z.infer<typeof updateAccountStatusSchema>;
+
+export const updateEmploymentStatusSchema = z.object({
+  employmentStatus: z.enum(['ACTIVE', 'INACTIVE', 'ON_LEAVE', 'TERMINATED']),
+});
+export type UpdateEmploymentStatusDto = z.infer<typeof updateEmploymentStatusSchema>;

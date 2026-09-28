@@ -4,7 +4,7 @@ export interface UserWithEmployeeProfile {
   role: string;
   accountStatus: string;
   createdAt: Date;
-  employeeProfile?: { managedBranchId: string | null } | null;
+  employeeProfile?: { managedBranchId: string | null; employmentStatus?: string } | null;
 }
 
 export function toPublicUser(user: UserWithEmployeeProfile) {
@@ -14,6 +14,7 @@ export function toPublicUser(user: UserWithEmployeeProfile) {
     role: user.role,
     accountStatus: user.accountStatus,
     branchId: user.employeeProfile?.managedBranchId ?? null,
+    employmentStatus: user.employeeProfile?.employmentStatus ?? null,
     createdAt: user.createdAt,
   };
 }

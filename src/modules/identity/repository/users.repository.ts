@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 
 import { BaseRepository } from '../../../common/repository/base.repository.js';
 import { PrismaService } from '../../../infra/prisma/prisma.service.js';
-import type { UserRole } from '../../../generated/prisma/index.js';
+import type { AccountStatus, EmploymentStatus, UserRole } from '../../../generated/prisma/index.js';
 
 const withEmployeeProfile = { employeeProfile: true } as const;
 
@@ -55,6 +55,38 @@ export class UsersRepository extends BaseRepository {
       },
       include: withEmployeeProfile,
     });
+  }
+
+  list(filter: { role?: UserRole; accountStatus?: AccountStatus; branchId?: string }) {
+    const { branchId, ...rest } = filter;
+    return this.prisma.user.findMany({
+      where: {
+        ...rest,
+        ...(branchId ? { employeeProfile: { managedBranchId: branchId } } : {}),
+      },
+      include: withEmployeeProfile,
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  updateAccountStatus(id: string, accountStatus: AccountStatus) {
+    return this.prisma.user.update({
+      where: { id },
+      data: { accountStatus },
+      include: withEmployeeProfile,
+    });
+  }
+
+  updateEmploymentStatus(id: string, employmentStatus: EmploymentStatus) {
+    return this.prisma.user.update({
+      where: { id },
+      data: { employeeProfile: { update: { employmentStatus } } },
+      include: withEmployeeProfile,
+    });
+  }
+
+  updatePasswordHash(id: string, passwordHash: string) {
+    return this.prisma.user.update({ where: { id }, data: { passwordHash } });
   }
 
   updateRole(id: string, role: UserRole, branchId?: string | null) {
