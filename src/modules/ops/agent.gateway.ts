@@ -139,13 +139,12 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     // noServer: with `{ server, path }`, ws answers every other upgrade on the
     // shared HTTP server with a 400, which corrupts Socket.IO's /dashboard-io
     // handshake. Only claim our own path and leave the rest to Socket.IO.
-    this.wss = new WebSocketServer({ noServer: true });
-    this.httpServer.on('upgrade', this.onUpgrade);
+    // verifyClient still runs inside handleUpgrade in noServer mode.
     this.wss = new WebSocketServer({
-      server: httpServer,
-      path: '/agent-ws',
+      noServer: true,
       verifyClient: (info, done) => void this.verifyUpgrade(info.req, done),
     });
+    this.httpServer.on('upgrade', this.onUpgrade);
     this.wss.on('connection', (socket: WebSocket, request: IncomingMessage) =>
       this.handleConnection(socket, request),
     );
