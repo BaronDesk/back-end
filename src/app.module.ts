@@ -11,9 +11,10 @@ import { PrismaModule } from './infra/prisma/prisma.module.js';
 import { HealthModule } from './health/health.module.js';
 import { IdentityModule } from './modules/identity/identity.module.js';
 import { OpsModule } from './modules/ops/ops.module.js';
+import { ReservationsModule } from './modules/reservations/reservations.module.js';
 
 @Module({
-  imports: [AppConfigModule, PrismaModule, IdentityModule, OpsModule, HealthModule],
+  imports: [AppConfigModule, PrismaModule, IdentityModule, OpsModule, ReservationsModule, HealthModule],
   controllers: [AppController],
   providers: [
     AppService,
