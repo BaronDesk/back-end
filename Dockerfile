@@ -9,11 +9,15 @@ WORKDIR /app
 # ---- deps ----
 FROM base AS deps
 COPY package.json package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm npm ci --ignore-scripts
+RUN --mount=type=cache,target=/root/.npm npm ci
 
 # ---- dev ----
 FROM deps AS dev
 ENV NODE_ENV=development
+ENV DATABASE_URL="postgresql://user:pass@localhost:5432/db"
+COPY prisma ./prisma
+COPY prisma.config.ts ./
+RUN --mount=type=cache,target=/root/.cache/prisma npx prisma generate
 COPY docker/dev-entrypoint.sh /usr/local/bin/dev-entrypoint
 RUN chmod +x /usr/local/bin/dev-entrypoint && chown -R node:node /app
 USER node
@@ -25,7 +29,8 @@ CMD ["npx", "nest", "start", "--watch", "--preserveWatchOutput"]
 FROM deps AS builder
 ENV DATABASE_URL="postgresql://user:pass@localhost:5432/db"
 COPY . .
-RUN npx prisma generate && npm run build \
+RUN --mount=type=cache,target=/root/.cache/prisma npx prisma generate \
+    && npm run build \
     && mkdir -p dist/generated \
     && cp -r src/generated/prisma dist/generated/
 
