@@ -8,10 +8,10 @@ import {
   Post,
 } from '@nestjs/common';
 
-import { CurrentUser } from '../../common/decorators/current-user.decorator.js';
-import { RequireScope } from '../../common/decorators/require-scope.decorator.js';
-import { ZodValidationPipe } from '../../common/pipes/zod-validation.pipe.js';
-import type { AccessTokenPayload } from '../../common/types/jwt-payload.js';
+import { CurrentUser } from '../../../common/decorators/current-user.decorator.js';
+import { RequireScope } from '../../../common/decorators/require-scope.decorator.js';
+import { ZodValidationPipe } from '../../../common/pipes/zod-validation.pipe.js';
+import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
 import {
   createMembershipPlanSchema,
   idParamSchema,
@@ -20,8 +20,8 @@ import {
   type CreateMembershipPlanDto,
   type PurchaseMembershipDto,
   type UpdateMembershipPlanDto,
-} from './membership.schemas.js';
-import { MembershipService } from './membership.service.js';
+} from '../schemas/membership.schemas.js';
+import { MembershipService } from '../services/membership.service.js';
 
 @Controller()
 export class MembershipController {

@@ -1,10 +1,12 @@
 import { Module } from '@nestjs/common';
 
-import { MembershipController } from './membership.controller.js';
-import { MembershipRepository } from './membership.repository.js';
-import { MembershipService } from './membership.service.js';
+import { WalletModule } from '../wallet/wallet.module.js';
+import { MembershipController } from './controllers/membership.controller.js';
+import { MembershipRepository } from './repository/membership.repository.js';
+import { MembershipService } from './services/membership.service.js';
 
 @Module({
+  imports: [WalletModule],
   controllers: [MembershipController],
   providers: [MembershipService, MembershipRepository],
   exports: [MembershipService],

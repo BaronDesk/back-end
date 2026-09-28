@@ -108,6 +108,7 @@ datasource db {
 generator client {
   provider = "prisma-client-js"
   output   = "../src/generated/prisma"
+  previewFeatures = ["partialIndexes"]
 }
 
 // ============================================================================
@@ -438,6 +439,8 @@ model Membership {
   @@index([startDate])
   @@index([endDate])
   @@unique([gamerProfileId, idempotencyKey])
+  // ADR-004 §4: at most one ACTIVE membership per gamer
+  @@unique([gamerProfileId], map: "memberships_one_active_per_gamer", where: raw("status = 'ACTIVE'"))
   @@map("memberships")
 }
 

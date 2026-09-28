@@ -1,11 +1,15 @@
+import { randomUUID } from 'node:crypto';
+
 import {
   ConflictException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { Prisma } from '../../../generated/prisma/index.js';
 
 import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
+import { WalletService } from '../../wallet/services/wallet.service.js';
 import { SubscriptionsRepository } from '../repository/subscriptions.repository.js';
 import type {
   CreateSubscriptionPlanDto,
@@ -15,7 +19,12 @@ import type {
 
 @Injectable()
 export class SubscriptionsService {
-  constructor(private readonly subscriptions: SubscriptionsRepository) {}
+  private readonly logger = new Logger(SubscriptionsService.name);
+
+  constructor(
+    private readonly subscriptions: SubscriptionsRepository,
+    private readonly wallet: WalletService,
+  ) {}
 
   listPlans() {
     return this.subscriptions.listPlans();
@@ -57,39 +66,74 @@ export class SubscriptionsService {
     dto: PurchaseSubscriptionDto,
   ) {
     const gamerProfileId = await this.resolveGamerProfileId(caller);
-    try {
-      const result = await this.subscriptions.purchase(
+    const key = dto.idempotencyKey;
+
+    if (key) {
+      const previous = await this.subscriptions.findByIdempotencyKey(
         gamerProfileId,
-        planId,
-        dto.idempotencyKey,
+        key,
       );
-      if ('kind' in result) {
-        if (result.kind === 'PLAN_NOT_FOUND') {
-          throw new NotFoundException({
-            code: 'SUBSCRIPTION_PLAN_NOT_FOUND',
-            error: 'subscription plan not found',
-          });
-        }
-        throw new ConflictException({
-          code: 'INSUFFICIENT_FUNDS',
-          error: 'wallet balance is insufficient',
-        });
-      }
-      return result;
+      if (previous) return previous;
+    }
+
+    const plan = await this.subscriptions.findPlan(planId);
+    if (!plan) {
+      throw new NotFoundException({
+        code: 'SUBSCRIPTION_PLAN_NOT_FOUND',
+        error: 'subscription plan not found',
+      });
+    }
+
+    const price = Math.round(Number(plan.price) * 100);
+    const ledgerKey = `subscription:${key ?? randomUUID()}`;
+    if (price > 0) {
+      await this.wallet.debit(gamerProfileId, {
+        amount: price,
+        type: 'PAYMENT',
+        idempotencyKey: ledgerKey,
+      });
+    }
+
+    const now = new Date();
+    try {
+      return await this.subscriptions.create({
+        gamerProfileId,
+        subscriptionPlanId: plan.id,
+        benefitsSnapshot: plan.benefits as Prisma.InputJsonValue,
+        idempotencyKey: key,
+        startDate: now,
+        endDate: new Date(now.getTime() + plan.durationDays * 86_400_000),
+      });
     } catch (error) {
+      // a concurrent retry with the same key won the insert and shares this debit: no refund
       if (
+        key &&
         error instanceof Prisma.PrismaClientKnownRequestError &&
-        error.code === 'P2002' &&
-        dto.idempotencyKey
+        error.code === 'P2002'
       ) {
-        const existing = (
-          await this.subscriptions.listForGamer(gamerProfileId)
-        ).find(
-          (subscription) => subscription.idempotencyKey === dto.idempotencyKey,
+        const winner = await this.subscriptions.findByIdempotencyKey(
+          gamerProfileId,
+          key,
         );
-        if (existing) return existing;
+        if (winner) return winner;
       }
+      if (price > 0) await this.refund(gamerProfileId, price, ledgerKey);
       throw error;
+    }
+  }
+
+  private async refund(gamerProfileId: string, amount: number, ledgerKey: string) {
+    try {
+      await this.wallet.credit(gamerProfileId, {
+        amount,
+        type: 'REFUND',
+        idempotencyKey: `${ledgerKey}:refund`,
+      });
+    } catch (error) {
+      this.logger.error(
+        `subscription purchase refund failed for gamer ${gamerProfileId} (${ledgerKey})`,
+        error instanceof Error ? error.stack : String(error),
+      );
     }
   }
 

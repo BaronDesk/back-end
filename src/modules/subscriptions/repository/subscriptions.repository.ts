@@ -8,6 +8,15 @@ import type {
   UpdateSubscriptionPlanDto,
 } from '../schemas/subscription.schemas.js';
 
+export interface CreateSubscriptionInput {
+  gamerProfileId: string;
+  subscriptionPlanId: string;
+  benefitsSnapshot: Prisma.InputJsonValue;
+  idempotencyKey?: string;
+  startDate: Date;
+  endDate: Date;
+}
+
 @Injectable()
 export class SubscriptionsRepository extends BaseRepository {
   constructor(prisma: PrismaService) {
@@ -44,64 +53,23 @@ export class SubscriptionsRepository extends BaseRepository {
     });
   }
 
-  async purchase(
-    gamerProfileId: string,
-    planId: string,
-    idempotencyKey?: string,
-  ) {
-    return this.prisma.$transaction(async (tx) => {
-      if (idempotencyKey) {
-        const existing = await tx.subscription.findUnique({
-          where: {
-            gamerProfileId_idempotencyKey: { gamerProfileId, idempotencyKey },
-          },
-          include: { subscriptionPlan: true },
-        });
-        if (existing) return existing;
-      }
+  findPlan(id: string) {
+    return this.prisma.subscriptionPlan.findUnique({ where: { id } });
+  }
 
-      const plan = await tx.subscriptionPlan.findUnique({
-        where: { id: planId },
-      });
-      if (!plan) return { kind: 'PLAN_NOT_FOUND' as const };
+  findByIdempotencyKey(gamerProfileId: string, idempotencyKey: string) {
+    return this.prisma.subscription.findUnique({
+      where: {
+        gamerProfileId_idempotencyKey: { gamerProfileId, idempotencyKey },
+      },
+      include: { subscriptionPlan: true },
+    });
+  }
 
-      const priceInMinorUnits = Math.round(Number(plan.price) * 100);
-      const wallet = await tx.wallet.upsert({
-        where: { gamerProfileId },
-        create: { gamerProfileId },
-        update: {},
-      });
-      const [updated] = await tx.$queryRaw<{ balance: number }[]>`
-        UPDATE wallets SET balance = balance - ${priceInMinorUnits}::integer, updated_at = now()
-        WHERE id = ${wallet.id}::uuid AND balance >= ${priceInMinorUnits}::integer
-        RETURNING balance
-      `;
-      if (!updated) return { kind: 'INSUFFICIENT_FUNDS' as const };
-
-      await tx.ledgerEntry.create({
-        data: {
-          walletId: wallet.id,
-          amount: -priceInMinorUnits,
-          balanceAfter: updated.balance,
-          type: 'DEBIT',
-          idempotencyKey: idempotencyKey
-            ? `subscription:${idempotencyKey}`
-            : undefined,
-        },
-      });
-
-      const now = new Date();
-      return tx.subscription.create({
-        data: {
-          gamerProfileId,
-          subscriptionPlanId: plan.id,
-          benefitsSnapshot: plan.benefits as Prisma.InputJsonValue,
-          idempotencyKey,
-          startDate: now,
-          endDate: new Date(now.getTime() + plan.durationDays * 86_400_000),
-        },
-        include: { subscriptionPlan: true },
-      });
+  create(data: CreateSubscriptionInput) {
+    return this.prisma.subscription.create({
+      data,
+      include: { subscriptionPlan: true },
     });
   }
 }
