@@ -148,6 +148,21 @@ describe('SessionsService', () => {
       expect(repo.create).not.toHaveBeenCalled();
     });
 
+    it('starts from a CONFIRMED walk-in (window starting now) just like a booking', async () => {
+      const now = Date.now();
+      repo.findReservationForStart.mockResolvedValueOnce(
+        reservation({ startTime: new Date(now), endTime: new Date(now + 30 * 60_000) }),
+      );
+      const result = await service.start(caller(), 'res-1');
+      expect(result).toMatchObject({ status: 'PENDING', pin: expect.stringMatching(/^\d{6}$/) });
+    });
+
+    it.each(['ACTIVE', 'CANCELLED', 'COMPLETED', 'NO_SHOW', 'PENDING'])('refuses to start a %s reservation', async (status) => {
+      repo.findReservationForStart.mockResolvedValueOnce(reservation({ status }));
+      await expect(service.start(caller(), 'res-1')).rejects.toMatchObject({ response: { code: 'RESERVATION_NOT_CONFIRMED' } });
+      expect(repo.create).not.toHaveBeenCalled();
+    });
+
     it('rejects a reservation with a live open session', async () => {
       repo.findActiveForReservation.mockResolvedValueOnce(sessionRow({ pinExpiresAt: new Date(Date.now() + 60_000) }));
       await expect(service.start(caller(), 'res-1')).rejects.toBeInstanceOf(ConflictException);

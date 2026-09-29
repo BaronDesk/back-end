@@ -376,6 +376,72 @@ describe('session billing (e2e)', () => {
     agent.socket.close();
   });
 
+  it('starts a session from a gamer booking and from a walk-in; the session, not the booking, makes it ACTIVE', async () => {
+    const gamer = await createGamer();
+    await creditWallet(gamer.profileId, 100_000);
+
+    const bookedMachine = await createMachine();
+    const bookedAgent = await connectAgent(bookedMachine);
+    const booking = await app.inject({
+      method: 'POST',
+      url: '/reservations',
+      headers: as(gamer.token),
+      payload: {
+        machineId: bookedMachine.id,
+        startTime: new Date(Date.now() + 60_000).toISOString(),
+        endTime: new Date(Date.now() + 61 * 60_000).toISOString(),
+      },
+    });
+    expect(booking.statusCode).toBe(201);
+    expect(booking.json().status).toBe('CONFIRMED');
+    await startAndLogIn(bookedAgent, booking.json().id);
+    expect(await reservationStatus(booking.json().id)).toBe('ACTIVE');
+    bookedAgent.socket.close();
+
+    const walkInMachine = await createMachine();
+    const walkInAgent = await connectAgent(walkInMachine);
+    const walkIn = await app.inject({
+      method: 'POST',
+      url: '/reservations/walk-in',
+      headers: as(gamer.token),
+      payload: { machineId: walkInMachine.id, durationMinutes: 30 },
+    });
+    expect(walkIn.statusCode).toBe(201);
+    expect(walkIn.json().status).toBe('CONFIRMED');
+    const sessionId = await startAndLogIn(walkInAgent, walkIn.json().id);
+    expect(await reservationStatus(walkIn.json().id)).toBe('ACTIVE');
+
+    // A reservation whose session is already running cannot start a second one.
+    const again = await start(walkIn.json().id);
+    expect(again.statusCode).toBe(409);
+    expect(again.json().code).toBe('RESERVATION_NOT_CONFIRMED');
+    expect((await get(sessionId)).json().status).toBe('ACTIVE');
+    walkInAgent.socket.close();
+  });
+
+  it('refuses to start a session from a CANCELLED reservation', async () => {
+    const gamer = await createGamer();
+    const machine = await createMachine();
+    const agent = await connectAgent(machine);
+    const booking = await app.inject({
+      method: 'POST',
+      url: '/reservations',
+      headers: as(gamer.token),
+      payload: {
+        machineId: machine.id,
+        startTime: new Date(Date.now() + 60 * 60_000).toISOString(),
+        endTime: new Date(Date.now() + 120 * 60_000).toISOString(),
+      },
+    });
+    const cancelled = await app.inject({ method: 'DELETE', url: `/reservations/${booking.json().id}`, headers: as(gamer.token) });
+    expect(cancelled.json().status).toBe('CANCELLED');
+
+    const res = await start(booking.json().id);
+    expect(res.statusCode).toBe(409);
+    expect(res.json().code).toBe('RESERVATION_NOT_CONFIRMED');
+    agent.socket.close();
+  });
+
   it('409s starting a session on a station that is not online', async () => {
     const gamer = await createGamer();
     const machine = await createMachine(); // no agent connected

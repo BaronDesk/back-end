@@ -20,6 +20,7 @@ import { WalletModule } from './modules/wallet/wallet.module.js';
 import { MembershipModule } from './modules/membership/membership.module.js';
 import { SubscriptionsModule } from './modules/subscriptions/subscriptions.module.js';
 import { SessionBillingModule } from './modules/session-billing/session-billing.module.js';
+import { ReservationsModule } from './modules/reservations/reservations.module.js';
 
 
 @Module({
@@ -36,6 +37,7 @@ import { SessionBillingModule } from './modules/session-billing/session-billing.
     WalletModule,
     MembershipModule,
     SubscriptionsModule,
+    ReservationsModule,
     SessionBillingModule,
     HealthModule,
   ],
