@@ -32,17 +32,16 @@ export const COMMAND_SIMULATIONS = ['stale_ts', 'duplicate_send', 'invalid_paylo
 export type CommandSimulation = (typeof COMMAND_SIMULATIONS)[number];
 
 /**
- * UNLOCK has two modes on the agent (UnlockCommandHandler):
- * - no payload / `{}`: direct (admin) unlock. The agent unlocks at once and
- *   grants the lease. This is the dashboard "unlock" button.
- * - `{ sessionId, pin }`: booking unlock. The agent starts the session but
- *   STAYS LOCKED until the user types the PIN on the station's LockUI.
+ * Session UNLOCK, sent by the backend only: after an accepted login_result,
+ * or to resume a session on reconnect. The agent binds `sessionId`, takes the
+ * lease and unlocks. It never carries a PIN: the PIN is checked server-side
+ * against the login_request. Staff cannot build one over REST.
  */
-export const bookingUnlockPayloadSchema = z.object({
-  sessionId: z.string().uuid(),
-  pin: z.string().min(1),
-});
-export type BookingUnlockPayload = z.infer<typeof bookingUnlockPayloadSchema>;
+export type SessionUnlockPayload = {
+  sessionId: string;
+  leaseSeconds: number;
+  serverTime: string;
+};
 
 /**
  * LAUNCH_GAME: `gameId` is the catalog's wire gameId, exactly as
@@ -54,16 +53,13 @@ export type BookingUnlockPayload = z.infer<typeof bookingUnlockPayloadSchema>;
 export const issueCommandBodySchema = z
   .object({
     type: z.enum(STATION_COMMAND_TYPES),
-    // `{}` is the explicit admin form; anything else must be a full booking payload.
-    payload: z.union([z.object({}).strict(), bookingUnlockPayloadSchema]).optional(),
+    // Only the empty admin form: a session UNLOCK is backend-issued after login.
+    payload: z.object({}).strict().optional(),
     gameId: z.string().trim().min(1).max(128).optional(),
     reason: z.string().trim().min(1).max(200).optional(),
     simulate: z.enum(COMMAND_SIMULATIONS).optional(),
   })
   .superRefine((body, ctx) => {
-    if (body.type !== 'UNLOCK' && body.payload && Object.keys(body.payload).length > 0) {
-      ctx.addIssue({ code: 'custom', message: 'payload is only accepted for UNLOCK', path: ['payload'] });
-    }
     if (body.type === 'LAUNCH_GAME' && !body.gameId) {
       ctx.addIssue({ code: 'custom', message: 'gameId is required for LAUNCH_GAME', path: ['gameId'] });
     }
@@ -74,11 +70,8 @@ export const issueCommandBodySchema = z
       ctx.addIssue({ code: 'custom', message: 'reason is only accepted for END_SESSION', path: ['reason'] });
     }
   })
-  .transform(({ payload, ...body }) => {
-    // Normalized: `payload` is set only for a booking unlock; admin form -> undefined.
-    const booking = bookingUnlockPayloadSchema.safeParse(payload);
-    return { ...body, payload: booking.success ? booking.data : undefined };
-  });
+  // The only accepted payload is empty: nothing of it goes on the wire.
+  .transform(({ payload: _payload, ...body }) => body);
 export type IssueCommandBody = z.infer<typeof issueCommandBodySchema>;
 
 export const listCommandsQuerySchema = z.object({
@@ -122,12 +115,12 @@ export type LaunchGamePayload = { gameId: string };
 /** END_SESSION wire payload. `{}` makes the agent default the reason to "normal". */
 export type EndSessionPayload = { reason?: string };
 
-export type CommandPayload = BookingUnlockPayload | LaunchGamePayload | EndSessionPayload | Record<string, never>;
+export type CommandPayload = SessionUnlockPayload | LaunchGamePayload | EndSessionPayload | Record<string, never>;
 
 /** What a BullMQ `commands` job carries. */
 export interface CommandJobData {
   commandId: string;
-  /** Wire payload. Lives only in the job (never in Postgres or logs): a booking unlock holds the PIN. */
+  /** Wire payload. Lives only in the job, never in Postgres or logs. */
   payload?: CommandPayload;
   simulate?: CommandSimulation;
 }

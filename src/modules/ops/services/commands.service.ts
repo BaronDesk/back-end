@@ -31,6 +31,7 @@ import {
   type CommandPayload,
   type CommandSimulation,
   type IssueCommandBody,
+  type SessionUnlockPayload,
   type StationCommandType,
   type ListCommandsQuery,
 } from '../schemas/command.schemas.js';
@@ -140,7 +141,7 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
     }
 
     // Every rejection happens here, before a row exists or anything is queued.
-    let payload: CommandPayload | undefined = body.payload;
+    let payload: CommandPayload | undefined;
     let gameId: string | undefined;
     if (body.type === 'LAUNCH_GAME') {
       const wireGameId = body.gameId!;
@@ -168,8 +169,6 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
     // separate stop command. Billing close-out is Member B's, not ours.
     if (body.type === 'END_SESSION') this.presence.expectSessionEnd(station.serialNumber, body.reason ?? 'normal');
 
-    // TODO(sessions): the booking flow (Member B) will build `payload` from
-    // the reservation instead of taking it from the request body.
     return this.dispatch(station, body.type, caller.sub, { payload, gameId, simulate: body.simulate });
   }
 
@@ -328,8 +327,7 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
           jobId: data.commandId,
           attempts: Number(this.config.get('COMMAND_MAX_ATTEMPTS') ?? 2),
           backoff: { type: 'fixed', delay: Number(this.config.get('COMMAND_RETRY_BACKOFF_MS') ?? 1_000) },
-          // Drop finished jobs: a booking UNLOCK's job data holds the PIN.
-          // The COMMAND row is the record of the outcome.
+          // Drop finished jobs: the COMMAND row is the record of the outcome.
           removeOnComplete: true,
           removeOnFail: true,
         }),
@@ -342,16 +340,53 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
 
   /** System-issued LOCK, bypassing the caller-scope checks in issue() — used by session-billing when a session's funds run out. */
   async issueSystemLock(machineId: string, reason: string): Promise<void> {
+    await this.issueSystem(machineId, 'LOCK', reason);
+  }
+
+  /**
+   * Session UNLOCK { sessionId, leaseSeconds, serverTime }. Session-billing
+   * issues it only after an accepted login_result, or to resume a session the
+   * station reports on reconnect. Station state still comes only from presence.
+   */
+  async issueSessionUnlock(machineId: string, payload: SessionUnlockPayload, reason: string): Promise<boolean> {
+    return this.issueSystem(machineId, 'UNLOCK', reason, payload);
+  }
+
+  /**
+   * System END_SESSION for a session that ended or ran past its window. Only
+   * while the station reports a session, and one open END_SESSION per station
+   * is enough. Settlement follows presence's session.ended as for any other end.
+   */
+  async issueSystemEndSession(machineId: string, reason: string): Promise<boolean> {
+    return this.issueSystem(machineId, 'END_SESSION', reason, { reason }, async (station) => {
+      if (!this.presence.sessionOf(station.serialNumber)) return false;
+      if (await this.repo.hasOpen(station.machineId, 'END_SESSION')) return false;
+      this.presence.expectSessionEnd(station.serialNumber, reason);
+      return true;
+    });
+  }
+
+  /** Dispatches a SYSTEM_ACTOR_ID command to an online station; false (logged) when it cannot be delivered. */
+  private async issueSystem(
+    machineId: string,
+    type: StationCommandType,
+    reason: string,
+    payload?: CommandPayload,
+    /** Last check before dispatch; false skips the command. */
+    beforeDispatch?: (station: StationRef) => Promise<boolean>,
+  ): Promise<boolean> {
     const station = await this.presence.resolveById(machineId);
     if (!station) {
-      this.logger.warn(`system LOCK for ${machineId} skipped: station not found (${reason})`);
-      return;
+      this.logger.warn(`system ${type} for ${machineId} skipped: station not found (${reason})`);
+      return false;
     }
     if (!this.presence.isOnline(station.serialNumber) || !this.registry.has(station.serialNumber)) {
-      this.logger.warn(`system LOCK for ${station.serialNumber} skipped: station offline (${reason})`);
-      return;
+      this.logger.warn(`system ${type} for ${station.serialNumber} skipped: station offline (${reason})`);
+      return false;
     }
-    await this.dispatch(station, 'LOCK', SYSTEM_ACTOR_ID, {});
+    if (beforeDispatch && !(await beforeDispatch(station))) return false;
+    await this.dispatch(station, type, SYSTEM_ACTOR_ID, { payload });
+    return true;
   }
 
 }

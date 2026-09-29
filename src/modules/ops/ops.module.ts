@@ -16,6 +16,7 @@ import { AlertsService } from './services/alerts.service.js';
 import { CommandAckTracker } from './services/command-ack-tracker.js';
 import { CommandProcessor } from './services/command.processor.js';
 import { COMMAND_QUEUE, CommandsService } from './services/commands.service.js';
+import { StationSessionPort } from './services/station-session.port.js';
 import { TelemetryHistoryService } from './services/telemetry-history.service.js';
 import { TelemetryService } from './services/telemetry.service.js';
 
@@ -34,7 +35,8 @@ import { TelemetryService } from './services/telemetry.service.js';
     CommandsService,
     CommandAckTracker,
     CommandProcessor,
+    StationSessionPort,
   ],
-  exports: [DashboardGateway, CommandsService],
+  exports: [DashboardGateway, CommandsService, StationSessionPort],
 })
 export class OpsModule {}

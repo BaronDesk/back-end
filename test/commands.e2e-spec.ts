@@ -215,27 +215,14 @@ describe('station commands (e2e)', () => {
     agent.socket.close();
   });
 
-  it('acks a booking UNLOCK without reporting the station unlocked', async () => {
+  it('refuses a session or PIN UNLOCK payload over REST: session unlocks follow an accepted login only', async () => {
     const agent = await connectAgent();
-    agent.send('heartbeat', { locked: true, sessionId: null });
-    const payload = { sessionId: randomUUID(), pin: '4821' };
-    const res = await issue(agent.machine.id, { type: 'UNLOCK', payload });
-    expect(res.statusCode).toBe(202);
-    expect(res.body).not.toContain('4821');
-    const { commandId } = res.json();
-
-    await vi.waitFor(async () => expect((await status(commandId)).status).toBe('ACKED'));
-    expect(agent.commands[0]).toMatchObject({ type: 'UNLOCK', id: commandId, payload });
-
-    // The agent stays locked until the PIN is typed; lock state follows its heartbeat.
-    agent.send('heartbeat', { locked: true, sessionId: payload.sessionId });
+    const sessionId = randomUUID();
+    expect((await issue(agent.machine.id, { type: 'UNLOCK', payload: { sessionId, pin: '4821' } })).statusCode).toBe(400);
+    expect((await issue(agent.machine.id, { type: 'UNLOCK', payload: { sessionId, leaseSeconds: 60 } })).statusCode).toBe(400);
+    expect((await issue(agent.machine.id, { type: 'LOCK', payload: { sessionId } })).statusCode).toBe(400);
     await new Promise((r) => setTimeout(r, 200));
-    const station = await app.inject({ method: 'GET', url: `/api/v1/stations/${agent.machine.id}`, headers: auth() });
-    expect(station.json().locked).toBe(true);
-
-    // A payload is UNLOCK-only, and a booking payload must be complete.
-    expect((await issue(agent.machine.id, { type: 'LOCK', payload })).statusCode).toBe(400);
-    expect((await issue(agent.machine.id, { type: 'UNLOCK', payload: { pin: '1' } })).statusCode).toBe(400);
+    expect(agent.commands).toHaveLength(0);
     agent.socket.close();
   });
 

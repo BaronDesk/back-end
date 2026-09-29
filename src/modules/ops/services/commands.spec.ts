@@ -209,13 +209,31 @@ describe('CommandsService', () => {
     );
   });
 
-  it('queues the booking-unlock payload with the job', async () => {
-    const payload = { sessionId: '7b0e7a57-2c4e-4d4f-9d5f-0e7c6a1f1a11', pin: '4821' };
-    const dto = await service.issue(caller(), 'm1', { type: 'UNLOCK', payload });
-    expect(queue.add).toHaveBeenCalledWith('dispatch', expect.objectContaining({ commandId: dto.commandId, payload }), expect.anything());
-    // The PIN never reaches the row or the dashboard push.
-    expect(JSON.stringify(dto)).not.toContain('4821');
-    expect(JSON.stringify(dashboard.publishToBranch.mock.calls)).not.toContain('4821');
+  it('issueSessionUnlock queues a system UNLOCK carrying the session and its lease, never a PIN', async () => {
+    const payload = { sessionId: '7b0e7a57-2c4e-4d4f-9d5f-0e7c6a1f1a11', leaseSeconds: 180, serverTime: new Date().toISOString() };
+    expect(await service.issueSessionUnlock('m1', payload, 'login accepted')).toBe(true);
+    expect(repo.create).toHaveBeenCalledWith(expect.objectContaining({ type: 'UNLOCK', issuedBy: SYSTEM_ACTOR_ID }));
+    expect(queue.add).toHaveBeenCalledWith('dispatch', expect.objectContaining({ payload }), expect.anything());
+    expect(queue.add.mock.calls[0][1].payload).not.toHaveProperty('pin');
+  });
+
+  it('issueSessionUnlock is refused for an offline station', async () => {
+    presence.isOnline.mockReturnValueOnce(false);
+    const payload = { sessionId: 's', leaseSeconds: 60, serverTime: new Date().toISOString() };
+    expect(await service.issueSessionUnlock('m1', payload, 'resume')).toBe(false);
+    expect(repo.create).not.toHaveBeenCalled();
+  });
+
+  it('issueSystemEndSession labels the session end, and sends one only while the station holds a session', async () => {
+    expect(await service.issueSystemEndSession('m1', 'reservation_ended')).toBe(true);
+    expect(presence.expectSessionEnd).toHaveBeenCalledWith('SN-1', 'reservation_ended');
+    expect(queue.add).toHaveBeenCalledWith('dispatch', expect.objectContaining({ payload: { reason: 'reservation_ended' } }), expect.anything());
+
+    repo.hasOpen.mockResolvedValueOnce(true);
+    expect(await service.issueSystemEndSession('m1', 'reservation_ended')).toBe(false);
+    presence.sessionOf.mockReturnValueOnce(null);
+    expect(await service.issueSystemEndSession('m1', 'reservation_ended')).toBe(false);
+    expect(repo.create).toHaveBeenCalledTimes(1);
   });
 
   it("ignores a reply for another station's command", async () => {
@@ -328,21 +346,14 @@ describe('issueCommandBodySchema', () => {
   const sessionId = '7b0e7a57-2c4e-4d4f-9d5f-0e7c6a1f1a11';
 
 it('treats no payload and {} as the direct (admin) unlock', () => {
-  expect(issueCommandBodySchema.parse({ type: 'UNLOCK' }).payload).toBeUndefined();
-  expect(issueCommandBodySchema.parse({ type: 'UNLOCK', payload: {} }).payload).toBeUndefined();
+  expect(issueCommandBodySchema.parse({ type: 'UNLOCK' })).not.toHaveProperty('payload');
+  expect(issueCommandBodySchema.parse({ type: 'UNLOCK', payload: {} })).not.toHaveProperty('payload');
 });
 
-it('accepts a full booking payload for UNLOCK', () => {
-  expect(issueCommandBodySchema.parse({ type: 'UNLOCK', payload: { sessionId, pin: '4821' } }).payload).toEqual({
-    sessionId,
-    pin: '4821',
-  });
-});
-
-it('rejects a partial booking payload, a non-uuid session, and a payload on other types', () => {
-  expect(issueCommandBodySchema.safeParse({ type: 'UNLOCK', payload: { pin: '4821' } }).success).toBe(false);
-  expect(issueCommandBodySchema.safeParse({ type: 'UNLOCK', payload: { sessionId: 'x', pin: '1' } }).success).toBe(false);
-  expect(issueCommandBodySchema.safeParse({ type: 'LOCK', payload: { sessionId, pin: '1' } }).success).toBe(false);
+it('rejects any session or PIN payload: a session UNLOCK is backend-issued after login', () => {
+  expect(issueCommandBodySchema.safeParse({ type: 'UNLOCK', payload: { sessionId, pin: '4821' } }).success).toBe(false);
+  expect(issueCommandBodySchema.safeParse({ type: 'UNLOCK', payload: { sessionId, leaseSeconds: 60 } }).success).toBe(false);
+  expect(issueCommandBodySchema.safeParse({ type: 'LOCK', payload: { sessionId } }).success).toBe(false);
 });
 
 it('requires a gameId for LAUNCH_GAME only, and takes reason on END_SESSION only', () => {

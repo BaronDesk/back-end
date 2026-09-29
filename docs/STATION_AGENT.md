@@ -148,8 +148,9 @@ Every frame, in both directions, is a JSON envelope:
 | type | Payload | Handling |
 |---|---|---|
 | `handshake` | `{ serialNumber, agentVersion?, osVersion?, machineName? }` | Admission, ONLINE, `handshake_ack` |
-| `heartbeat` | `{ locked, sessionId? }` | Bumps `lastSeen`, updates lock/session. Always answered with `heartbeat_ack { leaseExpiresAt: null }` |
-| `state_report` | `{ locked?, sessionId?, runningGameId?, leaseExpiresAt? }` | Updates lock / session / running game. Sent on (re)connect |
+| `heartbeat` | `{ locked, sessionId? }` | Bumps `lastSeen`, updates lock/session. Always answered with `heartbeat_ack` carrying a renewed lease (§3.6) |
+| `state_report` | `{ locked?, sessionId?, runningGameId?, leaseExpiresAt? }` | Updates lock / session / running game. Sent on (re)connect. A reported session is reconciled (§3.6) |
+| `login_request` | `{ method: "pin", credential }` | The lock screen relays the PIN; the agent validates nothing. Answered with `login_result`. A malformed frame is logged and dropped |
 | `telemetry` | `{ samples: [{ metric, value, sampledAt? }] }` | Ingested, cached, pushed to dashboards. No ack |
 | `alert` | `{ category, type, severity, detail, occurredAt }` | Stored as a `TelemetryAlert`, repeats folded into the open alert. No ack |
 | `device_event` | legacy | Kept for older agents |
@@ -162,7 +163,8 @@ Every frame, in both directions, is a JSON envelope:
 | type | Payload |
 |---|---|
 | `handshake_ack` | `{}` |
-| `heartbeat_ack` | `{ leaseExpiresAt: null }` (the agent then applies its default lease) |
+| `heartbeat_ack` | `{ leaseSeconds, serverTime }`: never null (§3.6) |
+| `login_result` | `{ requestId, accepted, reason? }`: `requestId` is the `login_request` envelope id. `reason`: `invalid_pin`, `pin_expired`, `pin_used`, `too_many_attempts`, `no_pending_session`, `unsupported_method`, `unavailable` |
 | `LOCK`, `UNLOCK`, `SHUTDOWN`, `LAUNCH_GAME`, `END_SESSION`, `CATALOG_UPDATE` | Command payload (§5) |
 
 ### 3.5 Close codes
@@ -175,6 +177,27 @@ Every frame, in both directions, is a JSON envelope:
 | 4400 | Malformed envelope, or invalid handshake payload |
 | 4408 | No handshake within 10 s |
 | 4409 | Serial number changed mid-connection |
+
+### 3.6 Login, lease and reconnect
+
+1. `POST /sessions` creates a `PENDING` session for a `CONFIRMED` reservation on an ONLINE
+   station and returns a 6-digit PIN once. Only its argon2 hash is stored. The PIN expires
+   after `SESSION_PIN_TTL_S` (never past the reservation end), is single-use, and is burned
+   after `SESSION_PIN_MAX_ATTEMPTS` wrong entries. Nothing is sent to the station.
+2. The gamer types the PIN; the agent sends `login_request`. The backend checks it against the
+   station's PENDING session and answers `login_result`. Only after an accepted result does it
+   send `UNLOCK { sessionId, leaseSeconds, serverTime }` through the command pipeline.
+3. The agent re-locks when its lease lapses. Every `heartbeat_ack` renews it:
+   `leaseSeconds` = the shorter of the remaining reservation window and `SESSION_LEASE_CAP_S`
+   for a logged-in, open session of this station; `0` otherwise. If a renewal cannot be
+   computed, the lease already granted is re-sent unextended.
+4. The session goes `ACTIVE` (reservation `CONFIRMED` to `ACTIVE`) only when the agent reports
+   `locked=false`, never from the UNLOCK ack.
+5. `state_report` with a `sessionId`: an open in-window session gets a fresh UNLOCK + lease; a
+   session past its window is settled and ended (`END_SESSION`); any other is ended.
+6. A sweep (`SESSION_SWEEP_INTERVAL_MS`) cancels PENDING sessions past their window (reservation
+   to `NO_SHOW`) and settles open sessions past their window. Settlement moves the reservation
+   to `COMPLETED`.
 
 ---
 
@@ -221,7 +244,7 @@ Every ONLINE/OFFLINE change and every change in `locked`, `sessionId` or
 Body:
 
 ```json
-{ "type": "UNLOCK", "payload": { "sessionId": "<uuid>", "pin": "4821" } }
+{ "type": "UNLOCK" }
 { "type": "LAUNCH_GAME", "gameId": "notepad" }
 { "type": "END_SESSION", "reason": "staff_end" }
 ```
@@ -229,7 +252,7 @@ Body:
 | type | Payload on the wire | Notes |
 |---|---|---|
 | `LOCK` | `{}` | |
-| `UNLOCK` | `{}` or `{ sessionId, pin }` | `{}` = direct admin unlock. With `sessionId` + `pin` = booking unlock: the station starts the session but stays locked until the PIN is typed on its LockUI. The PIN only lives in the BullMQ job, never in Postgres or logs |
+| `UNLOCK` | `{}` over REST; `{ sessionId, leaseSeconds, serverTime }` from the backend | REST takes only the empty admin form. The session form is backend-issued after an accepted `login_result` or on reconnect (§3.6). It never carries a PIN |
 | `SHUTDOWN` | `{}` | The agent's power-off is currently a stub that only logs |
 | `LAUNCH_GAME` | `{ gameId }` | The catalog's wire `gameId`. The agent launches from its synced catalog; no path goes on the wire |
 | `END_SESSION` | `{ reason? }` | The agent stops the tracked game, ends the session and locks. No separate stop command |

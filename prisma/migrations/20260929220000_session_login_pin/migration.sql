@@ -1,0 +1,5 @@
+ALTER TABLE "sessions"
+ADD COLUMN "pin_hash" TEXT,
+ADD COLUMN "pin_expires_at" TIMESTAMPTZ,
+ADD COLUMN "pin_used_at" TIMESTAMPTZ,
+ADD COLUMN "pin_attempts" INTEGER NOT NULL DEFAULT 0;

@@ -152,8 +152,9 @@ describe('realtime gateways (e2e)', () => {
     agent.socket.send(makeFrame(envelope('telemetry', 4, { anything: 1 }))); // unhandled: ignored, no reply
     agent.socket.send(makeFrame(envelope('heartbeat', 5, { locked: false, sessionId: null })));
 
-    expect(await agent.next()).toMatchObject({ type: 'heartbeat_ack', seq: 2, payload: { leaseExpiresAt: null } });
-    expect(await agent.next()).toMatchObject({ type: 'heartbeat_ack', seq: 3, payload: { leaseExpiresAt: null } });
+    // Always a lease, never null; zero while the station holds no session.
+    expect(await agent.next()).toMatchObject({ type: 'heartbeat_ack', seq: 2, payload: { leaseSeconds: 0, serverTime: expect.any(String) } });
+    expect(await agent.next()).toMatchObject({ type: 'heartbeat_ack', seq: 3, payload: { leaseSeconds: 0, serverTime: expect.any(String) } });
 
     const auth = { authorization: `Bearer ${accessToken}` };
     const list = await app.inject({ method: 'GET', url: '/api/v1/stations', headers: auth });

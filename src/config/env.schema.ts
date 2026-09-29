@@ -27,6 +27,17 @@ export const envSchema = z.object({
   // Final status of a command whose station has no live socket at send time.
   COMMAND_OFFLINE_STATUS: z.enum(['TIMEOUT', 'FAILED']).default('FAILED'),
   BULLMQ_PREFIX: z.string().min(1).default('bull'),
+  // Station login. The PIN staff hand the gamer is single-use, expires after
+  // SESSION_PIN_TTL_S (never past the reservation window) and is burned after
+  // SESSION_PIN_MAX_ATTEMPTS wrong entries.
+  SESSION_PIN_TTL_S: z.coerce.number().int().positive().default(900),
+  SESSION_PIN_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(20).default(5),
+  // Upper bound on any station lease, re-granted on every heartbeat_ack. The
+  // agent re-locks once its lease lapses, so this is how long a station stays
+  // unlocked after it loses the backend.
+  SESSION_LEASE_CAP_S: z.coerce.number().int().positive().default(180),
+  // How often reservations past their window are closed out (NO_SHOW / END_SESSION).
+  SESSION_SWEEP_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
 });
 
 export type EnvConfig = z.infer<typeof envSchema>;

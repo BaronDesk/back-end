@@ -22,4 +22,14 @@ export const stateReportPayloadSchema = z.object({
 });
 export type StateReportPayload = z.infer<typeof stateReportPayloadSchema>;
 
+/**
+ * login_request: the lock screen relays what the gamer typed; the agent
+ * validates nothing. Unknown extra fields are ignored.
+ */
+export const loginRequestPayloadSchema = z.object({
+  method: z.string().trim().min(1).max(32),
+  credential: z.string().min(1).max(128),
+});
+export type LoginRequestPayload = z.infer<typeof loginRequestPayloadSchema>;
+
 export const stationIdParamSchema = z.string().uuid();

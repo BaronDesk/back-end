@@ -19,10 +19,12 @@ export const AGENT_MESSAGE_TYPES = {
   COMMAND_NACK: 'command_nack',
   STATE_REPORT: 'state_report',
   CATALOG_STATUS: 'catalog_status',
+  LOGIN_REQUEST: 'login_request',
 } as const;
 export const SERVER_MESSAGE_TYPES = {
   HANDSHAKE_ACK: 'handshake_ack',
   HEARTBEAT_ACK: 'heartbeat_ack',
+  LOGIN_RESULT: 'login_result',
 } as const;
 
 export type AgentMessageType = (typeof AGENT_MESSAGE_TYPES)[keyof typeof AGENT_MESSAGE_TYPES];

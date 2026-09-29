@@ -19,10 +19,12 @@ import type { Envelope } from '../../infra/realtime/envelope.js';
 import {
   handshakePayloadSchema,
   heartbeatPayloadSchema,
+  loginRequestPayloadSchema,
   stateReportPayloadSchema,
 } from '../station/schemas/presence.schemas.js';
 import {
   PresenceService,
+  type StationRef,
   StationIdentityMismatchError,
   StationNotEnrolledError,
   UnknownStationError,
@@ -45,6 +47,7 @@ import {
   telemetryPayloadSchema,
 } from './schemas/telemetry.schemas.js';
 import { CommandsService } from './services/commands.service.js';
+import { StationSessionPort, type LoginDecision, type StationLease } from './services/station-session.port.js';
 import { TelemetryService } from './services/telemetry.service.js';
 
 const HANDSHAKE_TIMEOUT_MS = 10_000;
@@ -95,6 +98,8 @@ interface AgentConnection {
   /** Resolves when the handshake completes; later frames wait on it. */
   ready?: Promise<boolean>;
   handshakeTimer?: NodeJS.Timeout;
+  /** Epoch ms of the last lease sent; re-sent unchanged if a renewal cannot be computed. */
+  leaseExpiresAt?: number;
 }
 
 /**
@@ -132,6 +137,7 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     private readonly commands: CommandsService,
     private readonly games: GamesService,
     private readonly stationAuth: StationAuthService,
+    private readonly sessions: StationSessionPort,
   ) {}
 
   onModuleInit(): void {
@@ -277,7 +283,10 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
           await this.onHeartbeat(socket, conn, conn.serialNumber, envelope);
           return;
         case AGENT_MESSAGE_TYPES.STATE_REPORT:
-          await this.onStateReport(conn.serialNumber, envelope);
+          await this.onStateReport(conn, conn.serialNumber, envelope);
+          return;
+        case AGENT_MESSAGE_TYPES.LOGIN_REQUEST:
+          await this.onLoginRequest(socket, conn, envelope);
           return;
         case AGENT_MESSAGE_TYPES.TELEMETRY:
           await this.onTelemetry(conn.serialNumber, envelope);
@@ -372,18 +381,80 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     } else {
       this.logger.warn(`malformed heartbeat payload from ${serialNumber}`);
     }
-    // Always ack: the agent derives its session lease from heartbeat_ack
-    // (null => its default lease).
-    this.send(socket, conn, SERVER_MESSAGE_TYPES.HEARTBEAT_ACK, { leaseExpiresAt: null });
+    // Always ack, always with a lease: the agent re-locks the moment its lease
+    // lapses, so every heartbeat renews it.
+    const sessionId = parsed.success ? (parsed.data.sessionId ?? null) : this.presence.sessionOf(serialNumber);
+    const lease = await this.renewLease(conn, sessionId);
+    this.send(socket, conn, SERVER_MESSAGE_TYPES.HEARTBEAT_ACK, lease);
   }
 
-  private async onStateReport(serialNumber: string, envelope: Envelope): Promise<void> {
+  private async onStateReport(conn: AgentConnection, serialNumber: string, envelope: Envelope): Promise<void> {
     const parsed = stateReportPayloadSchema.safeParse(envelope.payload);
     if (!parsed.success) {
       this.logger.warn(`malformed state_report payload from ${serialNumber}`);
       return;
     }
     await this.presence.reportState(serialNumber, parsed.data);
+    await this.sessions.current?.reconcile(stationOf(conn), parsed.data);
+  }
+
+  /**
+   * login_request: the lock screen relays the gamer's PIN. Answered with
+   * login_result { requestId: <this envelope's id>, accepted, reason? }; only
+   * an accepted login is followed by the session UNLOCK, and only after the
+   * login_result is on the wire. The credential is never logged.
+   */
+  private async onLoginRequest(socket: WebSocket, conn: AgentConnection, envelope: Envelope): Promise<void> {
+    const parsed = loginRequestPayloadSchema.safeParse(envelope.payload);
+    if (!parsed.success) {
+      this.logger.warn(`malformed login_request payload from ${conn.serialNumber}; dropped`);
+      return;
+    }
+    const station = stationOf(conn);
+    const handler = this.sessions.current;
+
+    let decision: LoginDecision;
+    try {
+      decision = handler
+        ? await handler.login(station, parsed.data.method, parsed.data.credential)
+        : { accepted: false, reason: 'unavailable' };
+    } catch (err) {
+      this.logger.error(`login_request from ${station.serialNumber} failed: ${(err as Error).message}`);
+      decision = { accepted: false, reason: 'unavailable' };
+    }
+
+    const result: Record<string, unknown> = { requestId: envelope.id, accepted: decision.accepted };
+    if (!decision.accepted) result.reason = decision.reason;
+    this.send(socket, conn, SERVER_MESSAGE_TYPES.LOGIN_RESULT, result);
+    this.logger.log(
+      `login_request ${envelope.id} from ${station.serialNumber}: ${decision.accepted ? `accepted (session ${decision.sessionId})` : `rejected (${decision.reason})`}`,
+    );
+    if (!decision.accepted) return;
+
+    conn.leaseExpiresAt = leaseEnd(decision.lease);
+    const sent = await this.commands.issueSessionUnlock(
+      station.machineId,
+      { sessionId: decision.sessionId, ...decision.lease },
+      'login accepted',
+    );
+    if (!sent) this.logger.error(`session UNLOCK for ${decision.sessionId} not issued after accepted login`);
+  }
+
+  /** Fails closed: if the renewal cannot be computed, the lease already granted is re-sent unextended. */
+  private async renewLease(conn: AgentConnection, sessionId: string | null): Promise<StationLease> {
+    const handler = this.sessions.current;
+    try {
+      if (handler) {
+        const lease = await handler.lease(stationOf(conn), sessionId);
+        conn.leaseExpiresAt = leaseEnd(lease);
+        return lease;
+      }
+    } catch (err) {
+      this.logger.error(`lease renewal for ${conn.serialNumber} failed: ${(err as Error).message}`);
+    }
+    const now = Date.now();
+    const remaining = Math.max(Math.floor(((conn.leaseExpiresAt ?? now) - now) / 1000), 0);
+    return { leaseSeconds: remaining, serverTime: new Date(now).toISOString() };
   }
 
   // telemetry and device_event get no ack: the agent does not expect one.
@@ -494,6 +565,16 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     if (socket.readyState !== WebSocket.OPEN) return;
     socket.send(makeFrame(conn.outbound.next(type, payload)));
   }
+}
+
+/** The station this socket is, from its verified token; never from a frame. */
+function stationOf(conn: AgentConnection): StationRef {
+  const { machineId, branchId, serialNumber } = conn.principal;
+  return { machineId, branchId, serialNumber };
+}
+
+function leaseEnd(lease: StationLease): number {
+  return Date.parse(lease.serverTime) + lease.leaseSeconds * 1000;
 }
 
 function sendFrame(socket: WebSocket, frame: string): Promise<void> {

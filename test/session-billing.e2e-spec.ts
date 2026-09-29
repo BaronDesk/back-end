@@ -64,21 +64,28 @@ describe('session billing (e2e)', () => {
     return (await app.inject({ method: 'GET', url: `/wallets/${gamerProfileId}`, headers: as(adminToken) })).json().balance;
   }
 
-  /** Minimal fake agent: acks every command it receives, and exposes `send` for heartbeat/state_report. */
+  /**
+   * Minimal fake agent: acks every command it receives, records login_result
+   * and heartbeat_ack frames, and exposes `send` for any agent frame.
+   */
   async function connectAgent(machine: { id: string; serialNumber: string; branchId: string }) {
     const stationToken = mintStationToken(app, machine);
     const socket = new WebSocket(`${baseUrl.replace('http', 'ws')}/agent-ws`, {
       headers: { authorization: `Bearer ${stationToken}` },
     });
-    const commands: OutboundEnvelope[] = [];
+    const commands: OutboundEnvelope<Record<string, unknown>>[] = [];
+    const loginResults: OutboundEnvelope<{ requestId: string; accepted: boolean; reason?: string }>[] = [];
+    const heartbeatAcks: OutboundEnvelope<{ leaseSeconds: number; serverTime: string }>[] = [];
     let seq = 0;
     let handshaken = false;
-    const send = (type: string, payload: unknown) =>
-      socket.send(makeFrame({ type, id: randomUUID(), ts: new Date().toISOString(), seq: ++seq, payload }));
+    const send = (type: string, payload: unknown, id: string = randomUUID()) =>
+      socket.send(makeFrame({ type, id, ts: new Date().toISOString(), seq: ++seq, payload }));
 
     socket.on('message', (data: Buffer) => {
-      const frame = JSON.parse(data.toString()) as OutboundEnvelope;
+      const frame = JSON.parse(data.toString());
       if (frame.type === 'handshake_ack') handshaken = true;
+      if (frame.type === 'login_result') loginResults.push(frame);
+      if (frame.type === 'heartbeat_ack') heartbeatAcks.push(frame);
       if (!['LOCK', 'UNLOCK', 'SHUTDOWN', 'LAUNCH_GAME', 'END_SESSION', 'CATALOG_UPDATE'].includes(frame.type)) return;
       commands.push(frame);
       send('command_ack', { commandId: frame.id });
@@ -89,8 +96,32 @@ describe('session billing (e2e)', () => {
     });
     send('handshake', { serialNumber: machine.serialNumber });
     await vi.waitFor(() => expect(handshaken).toBe(true));
-    return { socket, commands, send };
+    return { socket, commands, loginResults, heartbeatAcks, send };
   }
+
+  type Agent = Awaited<ReturnType<typeof connectAgent>>;
+
+  /** The lock screen relays a PIN; resolves with the login_result answering it. */
+  async function typePin(agent: Agent, credential: string) {
+    const requestId = randomUUID();
+    agent.send('login_request', { method: 'pin', credential }, requestId);
+    await vi.waitFor(() => expect(agent.loginResults.some((r) => r.payload?.requestId === requestId)).toBe(true));
+    return agent.loginResults.find((r) => r.payload?.requestId === requestId)!.payload!;
+  }
+
+  /** Start + accepted login + the agent reporting itself unlocked: the session is ACTIVE. */
+  async function startAndLogIn(agent: Agent, reservationId: string): Promise<string> {
+    const { id: sessionId, pin } = (await start(reservationId)).json();
+    expect(await typePin(agent, pin)).toMatchObject({ accepted: true });
+    await vi.waitFor(() => expect(agent.commands.some((c) => c.type === 'UNLOCK')).toBe(true));
+    agent.send('heartbeat', { locked: false, sessionId });
+    await vi.waitFor(async () => expect((await get(sessionId)).json().status).toBe('ACTIVE'));
+    return sessionId;
+  }
+
+  const wrongPin = (pin: string) => (pin === '000000' ? '111111' : '000000');
+
+  const reservationStatus = async (id: string) => (await prisma.reservation.findUniqueOrThrow({ where: { id } })).status;
 
   const start = (reservationId: string, token = staffToken) =>
     app.inject({ method: 'POST', url: '/sessions', headers: as(token), payload: { reservationId } });
@@ -155,7 +186,7 @@ describe('session billing (e2e)', () => {
     await app.close();
   });
 
-  it('starts a session at the branch payg rate and sends a booking UNLOCK with a fresh PIN', async () => {
+  it('starts a PENDING session at the payg rate, returns the PIN once, stores only its hash, and sends nothing', async () => {
     const gamer = await createGamer();
     const machine = await createMachine();
     const reservation = await createConfirmedReservation(gamer.profileId, machine.id);
@@ -165,10 +196,79 @@ describe('session billing (e2e)', () => {
     expect(res.statusCode).toBe(201);
     const body = res.json();
     expect(body).toMatchObject({ status: 'PENDING', rateCentsPerMinute: 100, appliedMembershipId: null });
-    expect(body.pin).toMatch(/^\d{4}$/);
+    expect(body.pin).toMatch(/^\d{6}$/);
 
+    const row = await prisma.session.findUniqueOrThrow({ where: { id: body.id } });
+    expect(row.pinHash).toMatch(/^\$argon2id\$/);
+    expect(row.pinHash).not.toContain(body.pin);
+    expect(row.pinExpiresAt!.getTime()).toBeLessThanOrEqual(reservation.endTime.getTime());
+    expect((await get(body.id)).json()).not.toHaveProperty('pin');
+
+    await new Promise((r) => setTimeout(r, 300));
+    expect(agent.commands).toHaveLength(0);
+    expect(await prisma.command.count({ where: { machineId: machine.id } })).toBe(0);
+
+    agent.socket.close();
+  });
+
+  it('unlocks only after an accepted login: login_result first, then UNLOCK with a lease and no PIN', async () => {
+    const gamer = await createGamer();
+    const machine = await createMachine();
+    const reservation = await createConfirmedReservation(gamer.profileId, machine.id);
+    const agent = await connectAgent(machine);
+    const { id: sessionId, pin } = (await start(reservation.id)).json();
+
+    expect(await typePin(agent, wrongPin(pin))).toEqual({ requestId: expect.any(String), accepted: false, reason: 'invalid_pin' });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(agent.commands).toHaveLength(0);
+
+    expect(await typePin(agent, pin)).toEqual({ requestId: expect.any(String), accepted: true });
     await vi.waitFor(() => expect(agent.commands).toHaveLength(1));
-    expect(agent.commands[0]).toMatchObject({ type: 'UNLOCK', payload: { sessionId: body.id, pin: body.pin } });
+    const unlock = agent.commands[0];
+    expect(unlock).toMatchObject({ type: 'UNLOCK', payload: { sessionId, leaseSeconds: expect.any(Number), serverTime: expect.any(String) } });
+    expect(unlock.payload).not.toHaveProperty('pin');
+    expect(unlock.payload!.leaseSeconds).toBeGreaterThan(0);
+
+    // Single use: the same PIN never opens it again.
+    expect(await typePin(agent, pin)).toMatchObject({ accepted: false, reason: 'pin_used' });
+    // Active only once the station reports itself unlocked, never from the ack.
+    expect((await get(sessionId)).json().status).toBe('PENDING');
+    expect(await reservationStatus(reservation.id)).toBe('CONFIRMED');
+
+    agent.socket.close();
+  });
+
+  it('burns the PIN after too many wrong attempts', async () => {
+    const gamer = await createGamer();
+    const machine = await createMachine();
+    const reservation = await createConfirmedReservation(gamer.profileId, machine.id);
+    const agent = await connectAgent(machine);
+    const { pin } = (await start(reservation.id)).json();
+
+    for (let i = 0; i < 5; i++) expect(await typePin(agent, wrongPin(pin))).toMatchObject({ accepted: false, reason: 'invalid_pin' });
+    expect(await typePin(agent, pin)).toMatchObject({ accepted: false, reason: 'too_many_attempts' });
+    expect(agent.commands).toHaveLength(0);
+
+    agent.socket.close();
+  });
+
+  it('renews a non-null lease on every heartbeat_ack, zero when the station holds no session', async () => {
+    const gamer = await createGamer();
+    const machine = await createMachine();
+    const reservation = await createConfirmedReservation(gamer.profileId, machine.id);
+    const agent = await connectAgent(machine);
+
+    agent.send('heartbeat', { locked: true, sessionId: null });
+    await vi.waitFor(() => expect(agent.heartbeatAcks).toHaveLength(1));
+    expect(agent.heartbeatAcks[0].payload).toEqual({ leaseSeconds: 0, serverTime: expect.any(String) });
+
+    const sessionId = await startAndLogIn(agent, reservation.id);
+    const acked = agent.heartbeatAcks.length;
+    agent.send('heartbeat', { locked: false, sessionId });
+    await vi.waitFor(() => expect(agent.heartbeatAcks.length).toBeGreaterThan(acked));
+    const lease = agent.heartbeatAcks[agent.heartbeatAcks.length - 1].payload!;
+    expect(lease.leaseSeconds).toBeGreaterThan(0);
+    expect(lease.leaseSeconds).toBeLessThanOrEqual(180); // the cap; the window has ~60 minutes left
 
     agent.socket.close();
   });
@@ -196,10 +296,8 @@ describe('session billing (e2e)', () => {
     const reservation = await createConfirmedReservation(gamer.profileId, machine.id);
     const agent = await connectAgent(machine);
 
-    const { id: sessionId } = (await start(reservation.id)).json();
-
-    agent.send('heartbeat', { locked: false, sessionId });
-    await vi.waitFor(async () => expect((await get(sessionId)).json().status).toBe('ACTIVE'));
+    const sessionId = await startAndLogIn(agent, reservation.id);
+    expect(await reservationStatus(reservation.id)).toBe('ACTIVE');
 
     await new Promise((r) => setTimeout(r, 1100));
     agent.send('heartbeat', { locked: true, sessionId });
@@ -229,6 +327,8 @@ describe('session billing (e2e)', () => {
     expect(settled.billingBreakdown).toMatchObject({ rateCentsPerMinute: 100, totalCents: Math.round((settled.meteredSeconds / 60) * 100) });
     expect(await walletBalance(gamer.profileId)).toBe(before - settled.billingBreakdown.totalCents);
 
+    expect(await reservationStatus(reservation.id)).toBe('COMPLETED');
+
     const again = await end(sessionId);
     expect(again.statusCode).toBe(409);
     expect(again.json().code).toBe('SESSION_NOT_OPEN');
@@ -242,9 +342,7 @@ describe('session billing (e2e)', () => {
     const reservation = await createConfirmedReservation(gamer.profileId, machine.id);
     const agent = await connectAgent(machine);
 
-    const { id: sessionId } = (await start(reservation.id)).json();
-    agent.send('heartbeat', { locked: false, sessionId });
-    await vi.waitFor(async () => expect((await get(sessionId)).json().status).toBe('ACTIVE'));
+    const sessionId = await startAndLogIn(agent, reservation.id);
     await new Promise((r) => setTimeout(r, 1100));
 
     await end(sessionId);
@@ -278,15 +376,57 @@ describe('session billing (e2e)', () => {
     agent.socket.close();
   });
 
-  it('still returns a session with a PIN when the station has no connected agent', async () => {
+  it('409s starting a session on a station that is not online', async () => {
     const gamer = await createGamer();
     const machine = await createMachine(); // no agent connected
     const reservation = await createConfirmedReservation(gamer.profileId, machine.id);
 
     const res = await start(reservation.id);
-    expect(res.statusCode).toBe(201);
-    expect(res.json().pin).toMatch(/^\d{4}$/);
-    expect(await prisma.command.count({ where: { machineId: machine.id } })).toBe(0);
+    expect(res.statusCode).toBe(409);
+    expect(res.json().code).toBe('STATION_OFFLINE');
+    expect(await prisma.session.count({ where: { reservationId: reservation.id } })).toBe(0);
+  });
+
+  it('state_report on reconnect re-grants an open in-window session, and ends one that closed meanwhile', async () => {
+    const gamer = await createGamer();
+    const machine = await createMachine();
+    const reservation = await createConfirmedReservation(gamer.profileId, machine.id);
+    const first = await connectAgent(machine);
+    const sessionId = await startAndLogIn(first, reservation.id);
+    first.socket.close();
+
+    const resumed = await connectAgent(machine);
+    resumed.send('state_report', { locked: true, sessionId, runningGameId: null, leaseExpiresAt: null });
+    await vi.waitFor(() => expect(resumed.commands.some((c) => c.type === 'UNLOCK')).toBe(true));
+    expect(resumed.commands.find((c) => c.type === 'UNLOCK')).toMatchObject({
+      payload: { sessionId, leaseSeconds: expect.any(Number), serverTime: expect.any(String) },
+    });
+    resumed.socket.close();
+
+    await prisma.session.update({ where: { id: sessionId }, data: { status: 'COMPLETED' } });
+    const ended = await connectAgent(machine);
+    ended.send('state_report', { locked: false, sessionId, runningGameId: null, leaseExpiresAt: null });
+    await vi.waitFor(() => expect(ended.commands.some((c) => c.type === 'END_SESSION')).toBe(true));
+    expect(ended.commands.some((c) => c.type === 'UNLOCK')).toBe(false);
+    ended.socket.close();
+  });
+
+  it('sweep marks a reservation whose window passed without a login NO_SHOW and cancels its PENDING session', async () => {
+    const gamer = await createGamer();
+    const machine = await createMachine();
+    const endTime = new Date(Date.now() - 60_000);
+    const reservation = await createConfirmedReservation(gamer.profileId, machine.id, {
+      startTime: new Date(endTime.getTime() - 3_600_000),
+      endTime,
+    });
+    const session = await prisma.session.create({
+      data: { reservationId: reservation.id, startTime: reservation.startTime, endTime, rateCentsPerMinute: 100, pinHash: 'x', pinExpiresAt: endTime },
+    });
+
+    await app.get(SessionsService).sweep();
+
+    expect(await reservationStatus(reservation.id)).toBe('NO_SHOW');
+    expect(await prisma.session.findUniqueOrThrow({ where: { id: session.id } })).toMatchObject({ status: 'CANCELLED', pinHash: null });
   });
 
   it('404s for an unknown reservation and 409s a reservation that is not CONFIRMED', async () => {
@@ -326,9 +466,7 @@ describe('session billing (e2e)', () => {
     const reservation = await createConfirmedReservation(gamer.profileId, machine.id);
     const agent = await connectAgent(machine);
 
-    const { id: sessionId } = (await start(reservation.id)).json();
-    agent.send('heartbeat', { locked: false, sessionId });
-    await vi.waitFor(async () => expect((await get(sessionId)).json().status).toBe('ACTIVE'));
+    const sessionId = await startAndLogIn(agent, reservation.id);
 
     await app.get(SessionsService).lockForRunout(sessionId);
     await vi.waitFor(() => expect(agent.commands.some((c) => c.type === 'LOCK')).toBe(true));
