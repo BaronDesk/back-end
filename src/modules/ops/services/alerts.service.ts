@@ -88,6 +88,27 @@ export class AlertsService {
     return dto;
   }
 
+  /*
+   * lock helper for check-then-insert race
+   */
+  private async withAlertLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const lockKey = `alert_lock:${key}`;
+    const token = crypto.randomUUID();
+    let acquired = false;
+    for (let i = 0; i < 5 && !acquired; i++) {
+      acquired = (await this.redis.set(lockKey, token, 'PX', 3000, 'NX')) === 'OK';
+      if (!acquired) await new Promise((r) => setTimeout(r, 30));
+    }
+    if (!acquired) return fn(); // fail open, same philosophy as firstDelivery()
+
+    try {
+      return await fn();
+    } finally {
+      const releaseIfOwner = `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`;
+      await this.redis.eval(releaseIfOwner, 1, lockKey, token);
+    }
+  }
+
   /**
    * `alert` frames are the source of truth for hardware and anti-theft alerts.
    * Unknown category/severity strings are stored as HARDWARE / MEDIUM (raw
@@ -117,50 +138,52 @@ export class AlertsService {
       ...(knownSeverity ? {} : { agentSeverity: alert.severity }),
     };
 
-    const existing = await this.repo.findRecentOpenAlert({
-      machineId: station.machineId,
-      category,
-      type: alert.type,
-      since: new Date(occurredAt.getTime() - AGENT_ALERT_DEDUPE_WINDOW_MS),
-    });
+    return this.withAlertLock(`${station.machineId}:${category}:${alert.type}`, async () => {
+      const existing = await this.repo.findRecentOpenAlert({
+        machineId: station.machineId,
+        category,
+        type: alert.type,
+        since: new Date(occurredAt.getTime() - AGENT_ALERT_DEDUPE_WINDOW_MS),
+      });
 
-    if (existing) {
-      const prev = (existing.value ?? {}) as Record<string, unknown>;
-      if (prev.occurredAt === details.occurredAt && prev.message === details.message) {
-        this.logger.debug(`duplicate alert ${alert.category}/${alert.type} from ${station.serialNumber} ignored`);
-        return toAlertDto(existing);
+      if (existing) {
+        const prev = (existing.value ?? {}) as Record<string, unknown>;
+        if (prev.occurredAt === details.occurredAt && prev.message === details.message) {
+          this.logger.debug(`duplicate alert ${alert.category}/${alert.type} from ${station.serialNumber} ignored`);
+          return toAlertDto(existing);
+        }
+        const repeatCount = (typeof prev.repeatCount === 'number' ? prev.repeatCount : 1) + 1;
+        const row = await this.repo.updateAlert(existing.id, {
+          severity,
+          value: {
+            ...prev,
+            ...details,
+            firstOccurredAt: prev.firstOccurredAt ?? prev.occurredAt ?? null,
+            repeatCount,
+          } as Prisma.InputJsonValue,
+        });
+        const dto = toAlertDto(row);
+        this.logger.warn(`alert ${dto.category}/${dto.type} on ${station.serialNumber} repeated (${row.id}, x${repeatCount})`);
+        this.dashboard.publishToBranch(station.branchId, DASHBOARD_EVENTS.ALERT, dto);
+        return dto;
       }
-      const repeatCount = (typeof prev.repeatCount === 'number' ? prev.repeatCount : 1) + 1;
-      const row = await this.repo.updateAlert(existing.id, {
+
+      const row = await this.repo.createAlert({
+        machineId: station.machineId,
+        branchId: station.branchId,
+        category,
+        type: alert.type,
         severity,
-        value: {
-          ...prev,
-          ...details,
-          firstOccurredAt: prev.firstOccurredAt ?? prev.occurredAt ?? null,
-          repeatCount,
-        } as Prisma.InputJsonValue,
+        value: details as Prisma.InputJsonValue,
+        createdAt: occurredAt,
       });
       const dto = toAlertDto(row);
-      this.logger.warn(`alert ${dto.category}/${dto.type} on ${station.serialNumber} repeated (${row.id}, x${repeatCount})`);
+      this.logger.warn(`alert ${dto.category}/${dto.type} on ${station.serialNumber} (${row.id})`);
+      // TODO: Redis pub/sub if multi-instance — in-process publish only reaches
+      // dashboards connected to this instance.
       this.dashboard.publishToBranch(station.branchId, DASHBOARD_EVENTS.ALERT, dto);
       return dto;
-    }
-
-    const row = await this.repo.createAlert({
-      machineId: station.machineId,
-      branchId: station.branchId,
-      category,
-      type: alert.type,
-      severity,
-      value: details as Prisma.InputJsonValue,
-      createdAt: occurredAt,
     });
-    const dto = toAlertDto(row);
-    this.logger.warn(`alert ${dto.category}/${dto.type} on ${station.serialNumber} (${row.id})`);
-    // TODO: Redis pub/sub if multi-instance — in-process publish only reaches
-    // dashboards connected to this instance.
-    this.dashboard.publishToBranch(station.branchId, DASHBOARD_EVENTS.ALERT, dto);
-    return dto;
   }
 
   /**
