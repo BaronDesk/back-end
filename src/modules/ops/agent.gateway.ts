@@ -8,6 +8,8 @@ import { makeFrame, parseFrame } from '../../infra/realtime/frame.js';
 import { AgentRegistry } from '../../infra/realtime/registry.js';
 import { SeqGuard } from '../../infra/realtime/seq-guard.js';
 import type { Envelope } from '../../infra/realtime/envelope.js';
+import { MachinesRepository } from '../machines/repository/machines.repository.js';
+import { TokenService } from '../identity/services/token.service.js';
 
 interface AgentConnection {
   machineId: string;
@@ -28,6 +30,8 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly adapterHost: HttpAdapterHost,
     private readonly registry: AgentRegistry,
+    private readonly machines: MachinesRepository,
+    private readonly tokens: TokenService,
   ) {}
 
   onModuleInit(): void {
@@ -35,7 +39,7 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
 
     this.wss = new WebSocketServer({ server: httpServer, path: '/agent-ws' });
     this.wss.on('connection', (socket: WebSocket, request: IncomingMessage) =>
-      this.handleConnection(socket, request),
+      void this.handleConnection(socket, request),
     );
     this.logger.log('agent-ws attached at /agent-ws');
   }
@@ -44,15 +48,31 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     this.wss?.close();
   }
 
-  private handleConnection(socket: WebSocket, request: IncomingMessage): void {
+  private async handleConnection(socket: WebSocket, request: IncomingMessage): Promise<void> {
     const url = new URL(request.url ?? '', 'http://internal');
     const machineId = url.searchParams.get('machineId');
     const token = url.searchParams.get('token');
 
-    // STUB: verifyStation per ADR-003 goes here — a real station credential,
-    // not a MAC address, which is not authentication. Reject until wired up.
     if (!machineId || !token) {
       socket.close(4401, 'missing station credentials');
+      return;
+    }
+
+    try {
+      const claims = await this.tokens.verifyStationToken(token);
+      const machine = await this.machines.findById(machineId);
+      if (
+        claims.sub !== machineId ||
+        !machine ||
+        machine.enrollmentStatus !== 'ENROLLED' ||
+        machine.serialNumber !== claims.serialNumber ||
+        machine.branchId !== claims.branchId
+      ) {
+        socket.close(4401, 'invalid station credentials');
+        return;
+      }
+    } catch {
+      socket.close(4401, 'invalid station credentials');
       return;
     }
 

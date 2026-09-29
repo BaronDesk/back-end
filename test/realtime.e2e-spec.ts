@@ -2,13 +2,17 @@ import { randomUUID } from 'node:crypto';
 
 import { hash } from '@node-rs/argon2';
 import { Test, TestingModule } from '@nestjs/testing';
-import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
+import {
+  FastifyAdapter,
+  NestFastifyApplication,
+} from '@nestjs/platform-fastify';
 import { io as ioClient } from 'socket.io-client';
 import WebSocket from 'ws';
 
 import { AppModule } from '../src/app.module.js';
 import { PrismaService } from '../src/infra/prisma/prisma.service.js';
 import { DashboardGateway } from '../src/modules/ops/dashboard.gateway.js';
+import { TokenService } from '../src/modules/identity/services/token.service.js';
 import { makeFrame } from '../src/infra/realtime/frame.js';
 import type { Envelope } from '../src/infra/realtime/envelope.js';
 
@@ -18,6 +22,8 @@ describe('realtime gateways (e2e)', () => {
   let baseUrl: string;
   let branchId: string;
   let accessToken: string;
+  let stationId: string;
+  let stationToken: string;
 
   const username = `dash-${randomUUID()}`;
   const password = 'super-secret-1';
@@ -27,7 +33,9 @@ describe('realtime gateways (e2e)', () => {
       imports: [AppModule],
     }).compile();
 
-    app = moduleFixture.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    app = moduleFixture.createNestApplication<NestFastifyApplication>(
+      new FastifyAdapter(),
+    );
     await app.init();
     await app.listen(0, '127.0.0.1');
 
@@ -35,8 +43,19 @@ describe('realtime gateways (e2e)', () => {
     baseUrl = `http://127.0.0.1:${address.port}`;
 
     prisma = app.get(PrismaService);
-    const branch = await prisma.branch.create({ data: { name: `rt-branch-${randomUUID()}`, location: 'test' } });
+    const branch = await prisma.branch.create({
+      data: { name: `rt-branch-${randomUUID()}`, location: 'test' },
+    });
     branchId = branch.id;
+    const station = await prisma.machine.create({
+      data: {
+        serialNumber: `RT-${randomUUID()}`,
+        branchId,
+        agentPublicKey: 'test-public-key',
+        enrollmentStatus: 'ENROLLED',
+      },
+    });
+    stationId = station.id;
 
     const passwordHash = await hash(password);
     await prisma.user.create({
@@ -44,26 +63,46 @@ describe('realtime gateways (e2e)', () => {
         username,
         passwordHash,
         role: 'EMPLOYEE',
-        employeeProfile: { create: { managedBranchId: branchId, hireDate: new Date() } },
+        employeeProfile: {
+          create: { managedBranchId: branchId, hireDate: new Date() },
+        },
       },
     });
 
-    const login = await app.inject({ method: 'POST', url: '/auth/login', payload: { username, password } });
+    const login = await app.inject({
+      method: 'POST',
+      url: '/auth/login',
+      payload: { username, password },
+    });
     accessToken = login.json().accessToken;
+    stationToken = app.get(TokenService).signStationToken({
+      sub: station.id,
+      type: 'station',
+      serialNumber: station.serialNumber,
+      branchId,
+    });
   }, 30_000);
 
   afterAll(async () => {
+    if (!prisma) return;
+    await prisma.machine.deleteMany({ where: { branchId } });
     await prisma.user.deleteMany({ where: { username } });
-    await prisma.branch.delete({ where: { id: branchId } }).catch(() => undefined);
+    await prisma.branch
+      .delete({ where: { id: branchId } })
+      .catch(() => undefined);
     await app.close();
   });
 
-  function envelope(type: string, seq: number, payload: unknown = {}): Envelope {
+  function envelope(
+    type: string,
+    seq: number,
+    payload: unknown = {},
+  ): Envelope {
     return { type, id: randomUUID(), ts: Date.now(), seq, payload };
   }
 
   it('acks handshake and heartbeat, nacks a replayed seq', async () => {
-    const wsUrl = `${baseUrl.replace('http', 'ws')}/agent-ws?machineId=m-1&token=stub`;
+    const wsUrl = `${baseUrl.replace('http', 'ws')}/agent-ws?machineId=${stationId}&token=${stationToken}`;
     const socket = new WebSocket(wsUrl);
     const messages: Envelope[] = [];
 
@@ -72,8 +111,10 @@ describe('realtime gateways (e2e)', () => {
       socket.on('error', reject);
       socket.on('message', (data: Buffer) => {
         messages.push(JSON.parse(data.toString()) as Envelope);
-        if (messages.length === 1) socket.send(makeFrame(envelope('heartbeat', 1)));
-        else if (messages.length === 2) socket.send(makeFrame(envelope('heartbeat', 1))); // replay
+        if (messages.length === 1)
+          socket.send(makeFrame(envelope('heartbeat', 1)));
+        else if (messages.length === 2)
+          socket.send(makeFrame(envelope('heartbeat', 1))); // replay
         else resolve();
       });
     });
@@ -94,8 +135,21 @@ describe('realtime gateways (e2e)', () => {
     expect(code).toBe(4401);
   });
 
+  it('rejects an invalid station token', async () => {
+    const wsUrl = `${baseUrl.replace('http', 'ws')}/agent-ws?machineId=${stationId}&token=not-a-jwt`;
+    const socket = new WebSocket(wsUrl);
+    const code = await new Promise<number>((resolve) =>
+      socket.on('close', (closeCode: number) => resolve(closeCode)),
+    );
+    expect(code).toBe(4401);
+  });
+
   it('rejects a dashboard connection with no token', async () => {
-    const client = ioClient(baseUrl, { path: '/dashboard-io', reconnection: false, forceNew: true });
+    const client = ioClient(baseUrl, {
+      path: '/dashboard-io',
+      reconnection: false,
+      forceNew: true,
+    });
 
     const rejected = await new Promise<boolean>((resolve) => {
       client.on('connect_error', () => resolve(true));
@@ -119,7 +173,9 @@ describe('realtime gateways (e2e)', () => {
       client.on('connect_error', reject);
     });
 
-    const received = new Promise((resolve) => client.on('station_status', resolve));
+    const received = new Promise((resolve) =>
+      client.on('station_status', resolve),
+    );
 
     const gateway = app.get(DashboardGateway);
     gateway.publishToBranch(branchId, 'station_status', { ok: true });

@@ -4,9 +4,10 @@ import { IdentityModule } from '../identity/identity.module.js';
 import { AgentRegistry } from '../../infra/realtime/registry.js';
 import { AgentGateway } from './agent.gateway.js';
 import { DashboardGateway } from './dashboard.gateway.js';
+import { MachinesModule } from '../machines/machines.module.js';
 
 @Module({
-  imports: [IdentityModule],
+  imports: [IdentityModule, MachinesModule],
   providers: [AgentGateway, DashboardGateway, AgentRegistry],
   exports: [DashboardGateway],
 })

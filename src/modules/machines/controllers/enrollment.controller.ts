@@ -37,7 +37,7 @@ export class EnrollmentController {
 
   
   @Public()
-  @Post('machines/enroll')
+  @Post('enrollment/request')
   redeem(@Body(new ZodValidationPipe(redeemEnrollmentTokenSchema)) dto: RedeemEnrollmentTokenDto) {
     return this.enrollment.redeem(dto);
   }

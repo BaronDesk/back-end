@@ -20,7 +20,7 @@ export class MachinesRepository extends BaseRepository {
 
   create(data: { serialNumber: string; branchId: string; agentPublicKey: string; name: string | null }) {
     return this.prisma.machine.create({
-      data: { ...data, enrollmentStatus: 'PENDING' },
+      data: { ...data, enrollmentStatus: 'ENROLLED' },
     });
   }
 

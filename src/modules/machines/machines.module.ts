@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { IdentityModule } from '../identity/identity.module.js';
 
 import { EnrollmentController } from './controllers/enrollment.controller.js';
 import { MachinesController } from './controllers/machines.controller.js';
@@ -9,8 +10,9 @@ import { MachinesService } from './services/machines.service.js';
 
 
 @Module({
+  imports: [IdentityModule],
   controllers: [EnrollmentController, MachinesController],
   providers: [EnrollmentService, MachinesService, MachinesRepository, EnrollmentTokensRepository],
-  exports: [MachinesService],
+  exports: [MachinesService, MachinesRepository],
 })
 export class MachinesModule {}

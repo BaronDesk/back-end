@@ -4,7 +4,7 @@ import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 
-import type { AccessTokenPayload, RefreshTokenPayload } from '../../../common/types/jwt-payload.js';
+import type { AccessTokenPayload, RefreshTokenPayload, StationTokenPayload } from '../../../common/types/jwt-payload.js';
 import { ROLE_SCOPE, type Role } from '../../../common/utils/scope.js';
 
 /**
@@ -41,6 +41,23 @@ export class TokenService {
     return this.jwt.verifyAsync<AccessTokenPayload>(token, {
       secret: this.config.getOrThrow('JWT_ACCESS_SECRET'),
     });
+  }
+
+  signStationToken(claims: Omit<StationTokenPayload, 'iat' | 'exp'>): string {
+    return this.jwt.sign(claims, {
+      secret: this.config.getOrThrow('JWT_ACCESS_SECRET'),
+      expiresIn: '365d',
+    });
+  }
+
+  async verifyStationToken(token: string): Promise<StationTokenPayload> {
+    const payload = await this.jwt.verifyAsync<StationTokenPayload>(token, {
+      secret: this.config.getOrThrow('JWT_ACCESS_SECRET'),
+    });
+    if (payload.type !== 'station' || !payload.sub || !payload.serialNumber || !payload.branchId) {
+      throw new Error('invalid station token');
+    }
+    return payload;
   }
 
   signRefreshToken(userId: string, jti: string = randomUUID()): { token: string; jti: string } {

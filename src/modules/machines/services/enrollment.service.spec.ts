@@ -1,11 +1,21 @@
-import { ConflictException, NotFoundException, UnauthorizedException } from '@nestjs/common';
+import { ConflictException, NotFoundException } from '@nestjs/common';
+import { generateKeyPairSync, sign } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
 import { EnrollmentService } from './enrollment.service.js';
 
-function caller(overrides: Partial<AccessTokenPayload> = {}): AccessTokenPayload {
-  return { sub: 'admin-1', role: 'MANAGER', scope: 'admin', branchId: 'branch-a', jti: 'jti-1', ...overrides };
+function caller(
+  overrides: Partial<AccessTokenPayload> = {},
+): AccessTokenPayload {
+  return {
+    sub: 'admin-1',
+    role: 'MANAGER',
+    scope: 'admin',
+    branchId: 'branch-a',
+    jti: 'jti-1',
+    ...overrides,
+  };
 }
 
 function machine(overrides: Record<string, unknown> = {}) {
@@ -14,7 +24,7 @@ function machine(overrides: Record<string, unknown> = {}) {
     serialNumber: 'SN-1',
     branchId: 'branch-a',
     agentPublicKey: 'pk',
-    enrollmentStatus: 'PENDING',
+    enrollmentStatus: 'ENROLLED',
     name: null,
     status: 'OFFLINE',
     lastSeen: null,
@@ -37,6 +47,33 @@ describe('EnrollmentService', () => {
     rotateCredential: ReturnType<typeof vi.fn>;
   };
   let service: EnrollmentService;
+  let stationTokens: { signStationToken: ReturnType<typeof vi.fn> };
+  const keyPair = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const oneTimeToken = 'one-time-enrollment-token-123456';
+  function enrollmentDto(overrides: Record<string, unknown> = {}) {
+    const fields = {
+      oneTimeToken,
+      serialNumber: 'SN-1',
+      machineName: 'Station 1',
+      agentVersion: '1.0.0',
+      agentPublicKey: keyPair.publicKey
+        .export({ type: 'spki', format: 'pem' })
+        .toString(),
+      mac: '00:11:22:33:44:55',
+      ip: '192.0.2.1',
+      signedAt: Date.now(),
+      ...overrides,
+    };
+    const canonical = `BARONDESK-ENROLL-V1\n${fields.oneTimeToken}\n${fields.serialNumber}\n${fields.mac}\n${fields.ip}\n${fields.agentPublicKey}\n${fields.signedAt}`;
+    return {
+      ...fields,
+      signature: sign(
+        'sha256',
+        Buffer.from(canonical),
+        keyPair.privateKey,
+      ).toString('base64'),
+    };
+  }
 
   beforeEach(() => {
     tokensRepo = {
@@ -50,43 +87,69 @@ describe('EnrollmentService', () => {
       create: vi.fn(),
       rotateCredential: vi.fn(),
     };
-    service = new EnrollmentService(tokensRepo as any, machinesRepo as any);
+    stationTokens = {
+      signStationToken: vi.fn().mockReturnValue('signed-station-jwt'),
+    };
+    service = new EnrollmentService(
+      tokensRepo as any,
+      machinesRepo as any,
+      stationTokens as any,
+    );
   });
 
   describe('issueToken', () => {
     it('lets a MANAGER issue a token for their own branch', async () => {
-      const result = await service.issueToken(caller(), { branchId: 'branch-a' });
+      const result = await service.issueToken(caller(), {
+        branchId: 'branch-a',
+      });
 
       expect(tokensRepo.create).toHaveBeenCalledWith(
-        expect.objectContaining({ branchId: 'branch-a', machineId: null, issuedById: 'admin-1' }),
+        expect.objectContaining({
+          branchId: 'branch-a',
+          machineId: null,
+          issuedById: 'admin-1',
+        }),
       );
       expect(result.token).toBeTypeOf('string');
       expect(result.token.length).toBeGreaterThan(20);
     });
 
     it('blocks a MANAGER from issuing a token for another branch', async () => {
-      await expect(service.issueToken(caller(), { branchId: 'branch-b' })).rejects.toThrow();
+      await expect(
+        service.issueToken(caller(), { branchId: 'branch-b' }),
+      ).rejects.toThrow();
       expect(tokensRepo.create).not.toHaveBeenCalled();
     });
 
     it('lets an hq ADMIN issue a token for any branch', async () => {
-      await service.issueToken(caller({ scope: 'hq', role: 'ADMIN', branchId: null }), { branchId: 'branch-z' });
-      expect(tokensRepo.create).toHaveBeenCalledWith(expect.objectContaining({ branchId: 'branch-z' }));
+      await service.issueToken(
+        caller({ scope: 'hq', role: 'ADMIN', branchId: null }),
+        { branchId: 'branch-z' },
+      );
+      expect(tokensRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ branchId: 'branch-z' }),
+      );
     });
 
     it('caps a caller-supplied ttlMinutes at 24h', async () => {
-      await service.issueToken(caller(), { branchId: 'branch-a', ttlMinutes: 999_999 });
+      await service.issueToken(caller(), {
+        branchId: 'branch-a',
+        ttlMinutes: 999_999,
+      });
       const { expiresAt } = tokensRepo.create.mock.calls[0][0];
-      expect(expiresAt.getTime() - Date.now()).toBeLessThanOrEqual(24 * 60 * 60_000 + 1000);
+      expect(expiresAt.getTime() - Date.now()).toBeLessThanOrEqual(
+        24 * 60 * 60_000 + 1000,
+      );
     });
   });
 
   describe('redeem — fresh station', () => {
     it('rejects a token that does not exist', async () => {
       tokensRepo.findByHash.mockResolvedValue(null);
-      await expect(
-        service.redeem({ token: 'x'.repeat(30), serialNumber: 'SN-1', agentPublicKey: 'pk' }),
-      ).rejects.toThrow(UnauthorizedException);
+      await expect(service.redeem(enrollmentDto())).resolves.toEqual({
+        status: 'REJECTED',
+        reason: 'INVALID_ENROLLMENT_TOKEN',
+      });
     });
 
     it('rejects an already-consumed token', async () => {
@@ -97,9 +160,10 @@ describe('EnrollmentService', () => {
         consumedAt: new Date(),
         expiresAt: new Date(Date.now() + 60_000),
       });
-      await expect(
-        service.redeem({ token: 'x'.repeat(30), serialNumber: 'SN-1', agentPublicKey: 'pk' }),
-      ).rejects.toThrow(UnauthorizedException);
+      await expect(service.redeem(enrollmentDto())).resolves.toEqual({
+        status: 'REJECTED',
+        reason: 'INVALID_ENROLLMENT_TOKEN',
+      });
     });
 
     it('rejects an expired token', async () => {
@@ -110,12 +174,13 @@ describe('EnrollmentService', () => {
         consumedAt: null,
         expiresAt: new Date(Date.now() - 1000),
       });
-      await expect(
-        service.redeem({ token: 'x'.repeat(30), serialNumber: 'SN-1', agentPublicKey: 'pk' }),
-      ).rejects.toThrow(UnauthorizedException);
+      await expect(service.redeem(enrollmentDto())).resolves.toEqual({
+        status: 'REJECTED',
+        reason: 'INVALID_ENROLLMENT_TOKEN',
+      });
     });
 
-    it('creates a new PENDING machine and consumes the token', async () => {
+    it('creates an enrolled station and returns a station JWT', async () => {
       tokensRepo.findByHash.mockResolvedValue({
         id: 't1',
         branchId: 'branch-a',
@@ -126,13 +191,38 @@ describe('EnrollmentService', () => {
       machinesRepo.findBySerialNumber.mockResolvedValue(null);
       machinesRepo.create.mockResolvedValue(machine());
 
-      const result = await service.redeem({ token: 'x'.repeat(30), serialNumber: 'SN-1', agentPublicKey: 'pk' });
+      const result = await service.redeem(enrollmentDto());
 
       expect(tokensRepo.consume).toHaveBeenCalledWith('t1');
       expect(machinesRepo.create).toHaveBeenCalledWith(
-        expect.objectContaining({ serialNumber: 'SN-1', branchId: 'branch-a', agentPublicKey: 'pk' }),
+        expect.objectContaining({
+          serialNumber: 'SN-1',
+          branchId: 'branch-a',
+          name: 'Station 1',
+        }),
       );
-      expect(result).toMatchObject({ id: 'm1', enrollmentStatus: 'PENDING' });
+      expect(machinesRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ name: 'Station 1' }),
+      );
+      expect(stationTokens.signStationToken).toHaveBeenCalledWith({
+        sub: 'm1',
+        type: 'station',
+        serialNumber: 'SN-1',
+        branchId: 'branch-a',
+      });
+      expect(result).toEqual({
+        status: 'ENROLLED',
+        stationToken: 'signed-station-jwt',
+        machineId: 'm1',
+      });
+    });
+
+    it('rejects a request whose signature does not match its fields', async () => {
+      const dto = enrollmentDto();
+      await expect(
+        service.redeem({ ...dto, mac: '00:00:00:00:00:00' }),
+      ).resolves.toEqual({ status: 'REJECTED', reason: 'INVALID_SIGNATURE' });
+      expect(tokensRepo.findByHash).not.toHaveBeenCalled();
     });
 
     it('rejects a duplicate serial number', async () => {
@@ -145,9 +235,9 @@ describe('EnrollmentService', () => {
       });
       machinesRepo.findBySerialNumber.mockResolvedValue(machine());
 
-      await expect(
-        service.redeem({ token: 'x'.repeat(30), serialNumber: 'SN-1', agentPublicKey: 'pk' }),
-      ).rejects.toThrow(ConflictException);
+      await expect(service.redeem(enrollmentDto())).rejects.toThrow(
+        ConflictException,
+      );
       expect(machinesRepo.create).not.toHaveBeenCalled();
     });
   });
@@ -161,14 +251,25 @@ describe('EnrollmentService', () => {
         consumedAt: null,
         expiresAt: new Date(Date.now() + 60_000),
       });
-      machinesRepo.findById.mockResolvedValue(machine({ serialNumber: 'SN-1' }));
-      machinesRepo.rotateCredential.mockResolvedValue(machine({ agentPublicKey: 'new-pk', enrollmentStatus: 'ENROLLED' }));
+      machinesRepo.findById.mockResolvedValue(
+        machine({ serialNumber: 'SN-1' }),
+      );
+      machinesRepo.rotateCredential.mockResolvedValue(
+        machine({ agentPublicKey: 'new-pk', enrollmentStatus: 'ENROLLED' }),
+      );
 
-      const result = await service.redeem({ token: 'x'.repeat(30), serialNumber: 'SN-1', agentPublicKey: 'new-pk' });
+      const result = await service.redeem(enrollmentDto());
 
-      expect(machinesRepo.rotateCredential).toHaveBeenCalledWith('m1', 'new-pk');
+      expect(machinesRepo.rotateCredential).toHaveBeenCalledWith(
+        'm1',
+        keyPair.publicKey.export({ type: 'spki', format: 'pem' }).toString(),
+      );
       expect(machinesRepo.create).not.toHaveBeenCalled();
-      expect(result.agentPublicKey).toBe('new-pk');
+      expect(result).toEqual({
+        status: 'ENROLLED',
+        stationToken: 'signed-station-jwt',
+        machineId: 'm1',
+      });
     });
 
     it('rejects a rotation whose serial number does not match the bound machine', async () => {
@@ -179,10 +280,12 @@ describe('EnrollmentService', () => {
         consumedAt: null,
         expiresAt: new Date(Date.now() + 60_000),
       });
-      machinesRepo.findById.mockResolvedValue(machine({ serialNumber: 'SN-1' }));
+      machinesRepo.findById.mockResolvedValue(
+        machine({ serialNumber: 'SN-1' }),
+      );
 
       await expect(
-        service.redeem({ token: 'x'.repeat(30), serialNumber: 'WRONG-SN', agentPublicKey: 'new-pk' }),
+        service.redeem(enrollmentDto({ serialNumber: 'WRONG-SN' })),
       ).rejects.toThrow(ConflictException);
       expect(machinesRepo.rotateCredential).not.toHaveBeenCalled();
     });
@@ -191,24 +294,38 @@ describe('EnrollmentService', () => {
   describe('rotateToken', () => {
     it('404s for a machine that does not exist', async () => {
       machinesRepo.findById.mockResolvedValue(null);
-      await expect(service.rotateToken(caller(), 'missing')).rejects.toThrow(NotFoundException);
+      await expect(service.rotateToken(caller(), 'missing')).rejects.toThrow(
+        NotFoundException,
+      );
     });
 
     it('refuses to mint a rotation token for a machine that is not ENROLLED', async () => {
-      machinesRepo.findById.mockResolvedValue(machine({ enrollmentStatus: 'PENDING' }));
-      await expect(service.rotateToken(caller(), 'm1')).rejects.toThrow(ConflictException);
+      machinesRepo.findById.mockResolvedValue(
+        machine({ enrollmentStatus: 'PENDING' }),
+      );
+      await expect(service.rotateToken(caller(), 'm1')).rejects.toThrow(
+        ConflictException,
+      );
     });
 
     it('blocks a MANAGER from rotating another branch\u2019s machine', async () => {
-      machinesRepo.findById.mockResolvedValue(machine({ branchId: 'branch-b', enrollmentStatus: 'ENROLLED' }));
-      await expect(service.rotateToken(caller({ branchId: 'branch-a' }), 'm1')).rejects.toThrow();
+      machinesRepo.findById.mockResolvedValue(
+        machine({ branchId: 'branch-b', enrollmentStatus: 'ENROLLED' }),
+      );
+      await expect(
+        service.rotateToken(caller({ branchId: 'branch-a' }), 'm1'),
+      ).rejects.toThrow();
     });
 
     it('mints a token bound to an ENROLLED machine in the caller\u2019s own branch', async () => {
-      machinesRepo.findById.mockResolvedValue(machine({ enrollmentStatus: 'ENROLLED' }));
+      machinesRepo.findById.mockResolvedValue(
+        machine({ enrollmentStatus: 'ENROLLED' }),
+      );
       const result = await service.rotateToken(caller(), 'm1');
 
-      expect(tokensRepo.create).toHaveBeenCalledWith(expect.objectContaining({ machineId: 'm1', branchId: 'branch-a' }));
+      expect(tokensRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ machineId: 'm1', branchId: 'branch-a' }),
+      );
       expect(result.token).toBeTypeOf('string');
     });
   });
