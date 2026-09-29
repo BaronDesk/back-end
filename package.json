@@ -38,6 +38,7 @@
     "db:reset": "npm run dc -- run --rm migrate npx prisma migrate reset --force",
     "db:studio": "node scripts/db-studio.js",
     "db:psql": "npm run dc -- exec postgres psql -U cstam -d cstam",
+    "db:seed": "npm run dc -- run --rm migrate npx prisma db seed",
     "redis:cli": "npm run dc -- exec redis redis-cli",
     "caddy:validate": "npm run dc -- exec reverse-proxy caddy validate --config /etc/caddy/Caddyfile",
     "caddy:reload": "npm run dc -- exec reverse-proxy caddy reload --config /etc/caddy/Caddyfile",
