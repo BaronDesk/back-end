@@ -552,6 +552,8 @@ describe('station commands (e2e)', () => {
       agent.send('state_report', { locked: false, sessionId, runningGameId: 'cs2' });
       await vi.waitFor(() => expect(presence.sessionOf(agent.machine.serialNumber)).toBe(sessionId));
 
+      agent.commands.length = 0;
+
       const { commandId } = (await issue(agent.machine.id, { type: 'END_SESSION', reason: 'staff_end' })).json();
       await vi.waitFor(async () => expect((await status(commandId)).status).toBe('ACKED'));
       expect(agent.commands[0]).toMatchObject({ type: 'END_SESSION', id: commandId, payload: { reason: 'staff_end' } });

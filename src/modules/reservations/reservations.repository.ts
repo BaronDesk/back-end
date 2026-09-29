@@ -25,7 +25,7 @@ export class ReservationsRepository extends BaseRepository {
   async createIfAvailable(gamerProfileId: string, input: CreateReservationDto, walkIn = false) {
     return this.prisma.$transaction(async (tx) => {
       // Serialize slot checks for this machine; overlapping requests cannot both win.
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${input.machineId}))`;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${input.machineId}))`;
 
       const machine = await tx.machine.findUnique({
         where: { id: input.machineId },
