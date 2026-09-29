@@ -94,6 +94,10 @@ export function toCommandDto(command: Command) {
 /** Simulations that replace the wire LAUNCH_GAME to provoke an agent-side rejection. */
 const AGENT_REJECTION_SIMULATIONS: ReadonlySet<CommandSimulation> = new Set(['invalid_payload', 'exec_failed']);
 
+/** Nil UUID: commands issued by the system, no staff caller (e.g. a runout lock). Same "no FK" reasoning as any other issuedBy. */
+export const SYSTEM_ACTOR_ID = '00000000-0000-0000-0000-000000000000';
+
+
 @Injectable()
 export class CommandsService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(CommandsService.name);
@@ -335,4 +339,19 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
       clearTimeout(timer);
     }
   }
+
+  /** System-issued LOCK, bypassing the caller-scope checks in issue() — used by session-billing when a session's funds run out. */
+  async issueSystemLock(machineId: string, reason: string): Promise<void> {
+    const station = await this.presence.resolveById(machineId);
+    if (!station) {
+      this.logger.warn(`system LOCK for ${machineId} skipped: station not found (${reason})`);
+      return;
+    }
+    if (!this.presence.isOnline(station.serialNumber) || !this.registry.has(station.serialNumber)) {
+      this.logger.warn(`system LOCK for ${station.serialNumber} skipped: station offline (${reason})`);
+      return;
+    }
+    await this.dispatch(station, 'LOCK', SYSTEM_ACTOR_ID, {});
+  }
+
 }

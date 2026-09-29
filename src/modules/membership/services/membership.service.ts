@@ -152,6 +152,13 @@ export class MembershipService {
     }
   }
 
+  /** Internal accessor: the gamer's active membership discount, if any. */
+  async getActiveDiscountForGamer(gamerProfileId: string): Promise<{ membershipId: string; discountPercent: Prisma.Decimal } | null> {
+    const membership = await this.memberships.findActiveForGamer(gamerProfileId);
+    return membership ? { membershipId: membership.id, discountPercent: membership.discountPercentSnapshot } : null;
+  }
+
+
   private async refund(gamerProfileId: string, amount: number, ledgerKey: string) {
     try {
       await this.wallet.credit(gamerProfileId, {

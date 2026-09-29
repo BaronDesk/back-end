@@ -35,6 +35,6 @@ import { TelemetryService } from './services/telemetry.service.js';
     CommandAckTracker,
     CommandProcessor,
   ],
-  exports: [DashboardGateway],
+  exports: [DashboardGateway, CommandsService],
 })
 export class OpsModule {}

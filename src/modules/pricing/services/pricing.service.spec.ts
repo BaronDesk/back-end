@@ -56,4 +56,16 @@ describe('PricingService', () => {
       service.upsertForBranch('branch-b', { paygRate: 10, bookingRate: 25 }, caller()),
     ).rejects.toThrow(ForbiddenException);
   });
+
+  it('getRatesForBranch returns the raw payg/booking rates, with no caller or scope check', async () => {
+    const result = await service.getRatesForBranch('branch-a');
+    expect(result).toEqual({ paygRate: 10000, bookingRate: 25000 });
+    expect(repo.findByBranchId).toHaveBeenCalledWith('branch-a');
+  });
+
+  it('getRatesForBranch 404s with PRICING_NOT_SET when nothing is configured for the branch', async () => {
+    repo.findByBranchId.mockResolvedValue(null);
+    await expect(service.getRatesForBranch('branch-a')).rejects.toMatchObject({ response: { code: 'PRICING_NOT_SET' } });
+  });
+
 });

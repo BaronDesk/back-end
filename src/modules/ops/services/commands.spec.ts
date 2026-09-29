@@ -6,7 +6,7 @@ import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
 import { StationNotConnectedError } from '../agent.gateway.js';
 import { CommandAckTracker } from './command-ack-tracker.js';
 import { CommandProcessor } from './command.processor.js';
-import { CommandsService } from './commands.service.js';
+import { CommandsService, SYSTEM_ACTOR_ID } from './commands.service.js';
 import { issueCommandBodySchema } from '../schemas/command.schemas.js';
 
 const STATION = { machineId: 'm1', branchId: 'b1', serialNumber: 'SN-1' };
@@ -56,19 +56,19 @@ describe('CommandsService', () => {
   beforeEach(() => {
     repo = {
       create: vi.fn(async (data) => row(data)),
-      findById: vi.fn(async () => row({ status: 'SENT' })),
-      hasOpen: vi.fn(async () => false),
-      transition: vi.fn(async (_id, _from, data) => row(data)),
-      listForMachine: vi.fn(),
+             findById: vi.fn(async () => row({ status: 'SENT' })),
+             hasOpen: vi.fn(async () => false),
+             transition: vi.fn(async (_id, _from, data) => row(data)),
+             listForMachine: vi.fn(),
     };
     presence = {
       resolveById: vi.fn(async () => STATION),
-      resolve: vi.fn(() => STATION),
-      isOnline: vi.fn(() => true),
-      sessionOf: vi.fn(() => 'sess-1'),
-      agentStateOf: vi.fn(() => ({ locked: false, sessionId: 'sess-1', runningGameId: null })),
-      expectSessionEnd: vi.fn(),
-      onlineStations: vi.fn(() => [STATION]),
+             resolve: vi.fn(() => STATION),
+             isOnline: vi.fn(() => true),
+             sessionOf: vi.fn(() => 'sess-1'),
+             agentStateOf: vi.fn(() => ({ locked: false, sessionId: 'sess-1', runningGameId: null })),
+             expectSessionEnd: vi.fn(),
+             onlineStations: vi.fn(() => [STATION]),
     };
     games = { findLaunchable: vi.fn(async () => GAME), catalogChanges: new Subject() };
     registry = { has: vi.fn(() => true) };
@@ -83,7 +83,7 @@ describe('CommandsService', () => {
       tracker,
       queue as any,
       config({ NODE_ENV: 'development', COMMAND_MAX_ATTEMPTS: 2 }),
-      games as any,
+                                  games as any,
     );
   });
 
@@ -94,7 +94,7 @@ describe('CommandsService', () => {
     expect(queue.add).toHaveBeenCalledWith(
       'dispatch',
       expect.objectContaining({ commandId: dto.commandId, payload: { gameId: 'cs2' } }),
-      expect.anything(),
+                                           expect.anything(),
     );
   });
 
@@ -191,13 +191,13 @@ describe('CommandsService', () => {
     expect(repo.transition).toHaveBeenLastCalledWith(
       'c1',
       expect.any(Array),
-      expect.objectContaining({ status: 'NACKED', nackCode: 'STALE', nackReason: 'drift' }),
+                                                     expect.objectContaining({ status: 'NACKED', nackCode: 'STALE', nackReason: 'drift' }),
     );
     await service.onAgentReply('SN-1', 'c1', { kind: 'nack', code: 'EXEC_FAILED', reason: 'Game ID is required.' });
     expect(repo.transition).toHaveBeenLastCalledWith(
       'c1',
       expect.any(Array),
-      expect.objectContaining({ status: 'FAILED', nackCode: 'EXEC_FAILED', nackReason: 'Game ID is required.' }),
+                                                     expect.objectContaining({ status: 'FAILED', nackCode: 'EXEC_FAILED', nackReason: 'Game ID is required.' }),
     );
     await service.onAgentReply('SN-1', 'c1', { kind: 'nack', code: 'UNKNOWN_TYPE', reason: null });
     expect(repo.transition).toHaveBeenLastCalledWith('c1', expect.any(Array), expect.objectContaining({ status: 'FAILED' }));
@@ -205,7 +205,7 @@ describe('CommandsService', () => {
     expect(repo.transition).toHaveBeenLastCalledWith(
       'c1',
       expect.any(Array),
-      expect.objectContaining({ status: 'FAILED', nackCode: 'INVALID_PAYLOAD', nackReason: 'sessionId is required.' }),
+                                                     expect.objectContaining({ status: 'FAILED', nackCode: 'INVALID_PAYLOAD', nackReason: 'sessionId is required.' }),
     );
   });
 
@@ -223,6 +223,33 @@ describe('CommandsService', () => {
     await service.onAgentReply('SN-2', 'c1', { kind: 'ack' });
     expect(repo.transition).not.toHaveBeenCalled();
   });
+
+  it('issueSystemLock dispatches a LOCK issued by SYSTEM_ACTOR_ID for an online station', async () => {
+    await service.issueSystemLock('m1', 'runout');
+    expect(repo.create).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'LOCK', machineId: 'm1', branchId: 'b1', issuedBy: SYSTEM_ACTOR_ID }),
+    );
+    expect(queue.add).toHaveBeenCalledWith('dispatch', expect.objectContaining({ payload: undefined }), expect.anything());
+  });
+
+  it('issueSystemLock is a no-op when the station no longer exists', async () => {
+    presence.resolveById.mockResolvedValueOnce(null);
+    await service.issueSystemLock('gone', 'runout');
+    expect(repo.create).not.toHaveBeenCalled();
+    expect(queue.add).not.toHaveBeenCalled();
+  });
+
+  it('issueSystemLock is a no-op when the station is offline', async () => {
+    presence.isOnline.mockReturnValueOnce(false);
+    await service.issueSystemLock('m1', 'runout');
+    expect(repo.create).not.toHaveBeenCalled();
+  });
+
+  it('issueSystemLock is a no-op when the station has no live socket', async () => {
+    registry.has.mockReturnValueOnce(false);
+    await service.issueSystemLock('m1', 'runout');
+    expect(repo.create).not.toHaveBeenCalled();
+  });
 });
 
 describe('CommandProcessor', () => {
@@ -237,9 +264,9 @@ describe('CommandProcessor', () => {
   beforeEach(() => {
     commands = {
       findById: vi.fn(async () => row()),
-      markSent: vi.fn(async () => row({ status: 'SENT', attempts: 1 })),
-      finish: vi.fn(async () => row()),
-      fail: vi.fn(async () => row()),
+             markSent: vi.fn(async () => row({ status: 'SENT', attempts: 1 })),
+             finish: vi.fn(async () => row()),
+             fail: vi.fn(async () => row()),
     };
     gateway = { isConnected: vi.fn(() => true), sendCommand: vi.fn(async () => undefined) };
     presence = { resolveById: vi.fn(async () => STATION) };
@@ -300,33 +327,33 @@ describe('CommandProcessor', () => {
 describe('issueCommandBodySchema', () => {
   const sessionId = '7b0e7a57-2c4e-4d4f-9d5f-0e7c6a1f1a11';
 
-  it('treats no payload and {} as the direct (admin) unlock', () => {
-    expect(issueCommandBodySchema.parse({ type: 'UNLOCK' }).payload).toBeUndefined();
-    expect(issueCommandBodySchema.parse({ type: 'UNLOCK', payload: {} }).payload).toBeUndefined();
-  });
+it('treats no payload and {} as the direct (admin) unlock', () => {
+  expect(issueCommandBodySchema.parse({ type: 'UNLOCK' }).payload).toBeUndefined();
+  expect(issueCommandBodySchema.parse({ type: 'UNLOCK', payload: {} }).payload).toBeUndefined();
+});
 
-  it('accepts a full booking payload for UNLOCK', () => {
-    expect(issueCommandBodySchema.parse({ type: 'UNLOCK', payload: { sessionId, pin: '4821' } }).payload).toEqual({
-      sessionId,
-      pin: '4821',
-    });
+it('accepts a full booking payload for UNLOCK', () => {
+  expect(issueCommandBodySchema.parse({ type: 'UNLOCK', payload: { sessionId, pin: '4821' } }).payload).toEqual({
+    sessionId,
+    pin: '4821',
   });
+});
 
-  it('rejects a partial booking payload, a non-uuid session, and a payload on other types', () => {
-    expect(issueCommandBodySchema.safeParse({ type: 'UNLOCK', payload: { pin: '4821' } }).success).toBe(false);
-    expect(issueCommandBodySchema.safeParse({ type: 'UNLOCK', payload: { sessionId: 'x', pin: '1' } }).success).toBe(false);
-    expect(issueCommandBodySchema.safeParse({ type: 'LOCK', payload: { sessionId, pin: '1' } }).success).toBe(false);
-  });
+it('rejects a partial booking payload, a non-uuid session, and a payload on other types', () => {
+  expect(issueCommandBodySchema.safeParse({ type: 'UNLOCK', payload: { pin: '4821' } }).success).toBe(false);
+  expect(issueCommandBodySchema.safeParse({ type: 'UNLOCK', payload: { sessionId: 'x', pin: '1' } }).success).toBe(false);
+  expect(issueCommandBodySchema.safeParse({ type: 'LOCK', payload: { sessionId, pin: '1' } }).success).toBe(false);
+});
 
-  it('requires a gameId for LAUNCH_GAME only, and takes reason on END_SESSION only', () => {
-    expect(issueCommandBodySchema.safeParse({ type: 'LAUNCH_GAME' }).success).toBe(false);
-    expect(issueCommandBodySchema.safeParse({ type: 'LAUNCH_GAME', gameId: ' ' }).success).toBe(false);
-    expect(issueCommandBodySchema.safeParse({ type: 'LAUNCH_GAME', gameId: 'x'.repeat(129) }).success).toBe(false);
-    expect(issueCommandBodySchema.safeParse({ type: 'LAUNCH_GAME', gameId: 'cs2' }).success).toBe(true);
-    expect(issueCommandBodySchema.safeParse({ type: 'CATALOG_UPDATE' }).success).toBe(true);
-    expect(issueCommandBodySchema.safeParse({ type: 'LOCK', gameId: sessionId }).success).toBe(false);
-    expect(issueCommandBodySchema.safeParse({ type: 'END_SESSION' }).success).toBe(true);
-    expect(issueCommandBodySchema.parse({ type: 'END_SESSION', reason: ' closing ' }).reason).toBe('closing');
-    expect(issueCommandBodySchema.safeParse({ type: 'LOCK', reason: 'x' }).success).toBe(false);
-  });
+it('requires a gameId for LAUNCH_GAME only, and takes reason on END_SESSION only', () => {
+  expect(issueCommandBodySchema.safeParse({ type: 'LAUNCH_GAME' }).success).toBe(false);
+  expect(issueCommandBodySchema.safeParse({ type: 'LAUNCH_GAME', gameId: ' ' }).success).toBe(false);
+  expect(issueCommandBodySchema.safeParse({ type: 'LAUNCH_GAME', gameId: 'x'.repeat(129) }).success).toBe(false);
+  expect(issueCommandBodySchema.safeParse({ type: 'LAUNCH_GAME', gameId: 'cs2' }).success).toBe(true);
+  expect(issueCommandBodySchema.safeParse({ type: 'CATALOG_UPDATE' }).success).toBe(true);
+  expect(issueCommandBodySchema.safeParse({ type: 'LOCK', gameId: sessionId }).success).toBe(false);
+  expect(issueCommandBodySchema.safeParse({ type: 'END_SESSION' }).success).toBe(true);
+  expect(issueCommandBodySchema.parse({ type: 'END_SESSION', reason: ' closing ' }).reason).toBe('closing');
+  expect(issueCommandBodySchema.safeParse({ type: 'LOCK', reason: 'x' }).success).toBe(false);
+});
 });

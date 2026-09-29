@@ -34,4 +34,12 @@ export class PricingService {
       throw err;
     }
   }
+
+  /** Internal, caller-free accessor for other modules that already resolved their own scope (e.g. session-billing pricing a session). */
+  async getRatesForBranch(branchId: string) {
+    const row = await this.pricing.findByBranchId(branchId);
+    if (!row) throw new NotFoundException({ code: 'PRICING_NOT_SET', error: 'no pricing configured for this branch' });
+    return { paygRate: row.paygRate, bookingRate: row.bookingRate };
+  }
+
 }

@@ -19,6 +19,8 @@ import { StationModule } from './modules/station/station.module.js';
 import { WalletModule } from './modules/wallet/wallet.module.js';
 import { MembershipModule } from './modules/membership/membership.module.js';
 import { SubscriptionsModule } from './modules/subscriptions/subscriptions.module.js';
+import { SessionBillingModule } from './modules/session-billing/session-billing.module.js';
+
 
 @Module({
   imports: [
@@ -34,6 +36,7 @@ import { SubscriptionsModule } from './modules/subscriptions/subscriptions.modul
     WalletModule,
     MembershipModule,
     SubscriptionsModule,
+    SessionBillingModule,
     HealthModule,
   ],
 

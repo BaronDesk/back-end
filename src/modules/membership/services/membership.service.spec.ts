@@ -156,3 +156,31 @@ describe('MembershipService.purchase', () => {
     expect(repository.create).toHaveBeenCalled();
   });
 });
+
+describe('MembershipService.getActiveDiscountForGamer', () => {
+  let repository: { findActiveForGamer: ReturnType<typeof vi.fn> };
+  let service: MembershipService;
+
+  beforeEach(() => {
+    repository = { findActiveForGamer: vi.fn() };
+    service = new MembershipService(repository as any, {} as any);
+  });
+
+  it('returns null when the gamer has no active membership', async () => {
+    repository.findActiveForGamer.mockResolvedValue(null);
+    await expect(service.getActiveDiscountForGamer('gamer-1')).resolves.toBeNull();
+    expect(repository.findActiveForGamer).toHaveBeenCalledWith('gamer-1');
+  });
+
+  it('returns the membership id and its snapshotted discount when one is active', async () => {
+    repository.findActiveForGamer.mockResolvedValue({
+      id: 'membership-9',
+      discountPercentSnapshot: new Prisma.Decimal('15'),
+    });
+    await expect(service.getActiveDiscountForGamer('gamer-1')).resolves.toEqual({
+      membershipId: 'membership-9',
+      discountPercent: new Prisma.Decimal('15'),
+    });
+  });
+});
+

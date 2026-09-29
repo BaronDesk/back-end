@@ -511,6 +511,13 @@ model Session {
   startTime           DateTime      @map("start_time") @db.Timestamptz
   endTime             DateTime      @map("end_time") @db.Timestamptz
   status              SessionStatus @default(PENDING)
+  // --- billing (feat/session-billing) ---
+  lockedAt            DateTime?     @map("locked_at") @db.Timestamptz
+  meteringStartedAt   DateTime?     @map("metering_started_at") @db.Timestamptz
+  meteredSeconds      Int           @default(0) @map("metered_seconds")
+  rateCentsPerMinute  Int?          @map("rate_cents_per_minute")
+  billingBreakdown    Json?         @map("billing_breakdown")
+  settledAt           DateTime?     @map("settled_at") @db.Timestamptz
   createdAt           DateTime      @default(now()) @map("created_at") @db.Timestamptz
   updatedAt           DateTime      @updatedAt @map("updated_at") @db.Timestamptz
 
@@ -524,6 +531,7 @@ model Session {
   @@index([startTime])
   @@map("sessions")
 }
+
 
 // --- Memberships & Plans ---
 
