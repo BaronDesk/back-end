@@ -57,7 +57,20 @@ $env:CONSOLE_USER = "hq-admin"; $env:CONSOLE_PASS = "change-me-immediately"
 $env:STATION_SERIAL = "STATION-DEV-01"
 ```
 
-The console logs in, connects to `/dashboard-io`, and prints live events for the
+The menus follow the logged-in profile. Each item is shown only if the backend
+allows that role (`@RequireScope` on the route):
+
+| Profile (scope) | Sees |
+|---|---|
+| GAMER (self) | Own profile, own wallet and ledger, plans (browse, buy, own membership / subscriptions), games (browse), raw request. No station, no feed |
+| EMPLOYEE (staff) | + station commands except SHUTDOWN, telemetry, alerts, live feed, register a gamer, wallets by id (credit, debit), pricing (read), reservations, sessions |
+| MANAGER (admin) | + SHUTDOWN, enrollment, game catalog management, plan management, pricing change, create EMPLOYEE and change roles to GAMER / EMPLOYEE in its own branch |
+| ADMIN (hq) | Everything, every branch, and can create MANAGER / grant ADMIN |
+
+To check that the server itself refuses a hidden action (403), send it with
+raw request (`r`).
+
+For staff and above, the console logs in, connects to `/dashboard-io`, and prints live events for the
 selected station: `[station_status]`, `[command_update]`, `[catalog_status]`,
 `[alert]`, `[alert_resolved]` (`[telemetry_update]` is off by default, turn it on
 with `f`). After each command it waits for the final status and prints
@@ -238,6 +251,10 @@ Start: station ONLINE, session active and unlocked (3.4 + 3.6).
 | 7.7 | `curl -k https://localhost/stations/me/games -H "Authorization: Bearer <station jwt>"` | 200, resolved catalog | |
 | 7.8 | Same without the header / with a user token | 401 `MISSING_STATION_TOKEN` / `INVALID_STATION_TOKEN` | |
 | 7.9 | Same with a valid token after `enrollment_status='INACTIVE'` | 403 `STATION_NOT_ENROLLED` | |
+| 7.10 | Connect to `/dashboard-io` with a **GAMER** access token (for example a small socket.io client, or the old console behaviour) | Refused: a gamer must not see station status, commands, telemetry or alerts. **Known to fail today**: a gamer has no `branchId`, so the gateway puts it in `branch:all` and it receives every branch's events (see §14) | |
+| 7.11 | Console as GAMER (`CONSOLE_USER` = a gamer): main menu | Only profile, own wallet, plans (browse, buy), games (browse), raw request. No station, users admin, billing or enrollment items | |
+| 7.12 | Console as EMPLOYEE | No SHUTDOWN, no enrollment, no plan / game management, no staff account creation, no pricing change | |
+| 7.13 | Console as MANAGER: `u` | Can create EMPLOYEE only, in its own branch. Role change limited to GAMER / EMPLOYEE | |
 
 ---
 
@@ -425,3 +442,7 @@ One run through every part. Stop at the first failure and note the step.
 - A session started while the station is offline stays `PENDING`, and a second
   `POST /sessions` is refused (`SESSION_ALREADY_STARTED`). Resend the booking
   UNLOCK by hand (12.24).
+- **Security gap, to fix (7.10):** `/dashboard-io` accepts any user token and
+  puts a user without `branchId` in `branch:all`. A GAMER has no branch, so it
+  receives every branch's station, command, telemetry and alert events. The
+  gateway should refuse scopes below staff.

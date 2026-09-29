@@ -23,7 +23,9 @@
  */
 import { execFileSync } from 'node:child_process';
 import { createHmac, randomUUID } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
 
@@ -70,6 +72,45 @@ function log(...args) {
   console.log(...args);
 }
 
+// ---------------------------------------------------------------- who may see what
+//
+// Mirrors the backend's policy (src/common/utils/scope.ts and each route's
+// @RequireScope): GAMER = self, EMPLOYEE = staff, MANAGER = admin, ADMIN = hq.
+// A menu only lists what the logged-in profile is allowed to do, so a gamer
+// never sees "create employee" and an employee never sees "SHUTDOWN".
+// The server still enforces it: to test a 403 on purpose, use raw request (r).
+
+const ROLE_SCOPE = { GAMER: 'self', EMPLOYEE: 'staff', MANAGER: 'admin', ADMIN: 'hq' };
+const SCOPE_RANK = { self: 1, staff: 2, admin: 3, hq: 4 };
+
+const scope = () => ROLE_SCOPE[state.me?.role] ?? 'self';
+const can = (min) => SCOPE_RANK[scope()] >= SCOPE_RANK[min];
+const isGamerConsole = () => state.me?.role === 'GAMER';
+
+/**
+ * Menu of `items` ({ key, label, min, when, run } or { section }). Only the
+ * items the profile may use are listed, and only those keys are accepted.
+ */
+async function menu(title, items, { root = false } = {}) {
+  for (;;) {
+    const visible = items.filter((i) => (!i.min || can(i.min)) && (!i.when || i.when()));
+    // Drop section headers with nothing under them.
+    const shown = visible.filter((i, n) => !i.section || (visible[n + 1] && !visible[n + 1].section));
+    log(`\n${c.bold(typeof title === 'function' ? title() : title)}`);
+    for (const i of shown) log(i.section ? c.dim(`  -- ${i.section}`) : `  ${i.key.padEnd(2)} ${typeof i.label === 'function' ? i.label() : i.label}`);
+    log(root ? '  q  quit' : '  0  back');
+    const choice = (await ask('>')).toLowerCase();
+    if (root ? choice === 'q' : choice === '0' || choice === '') return;
+    const item = shown.find((i) => i.key === choice);
+    if (!item) continue;
+    try {
+      await item.run();
+    } catch (err) {
+      log(c.red(`error: ${err.message}`));
+    }
+  }
+}
+
 // ---------------------------------------------------------------- HTTP
 
 /** `as: 'gamer'` sends the request with the gamer login (see gamerLogin) instead of the staff one. */
@@ -114,7 +155,15 @@ async function login() {
   state.accessToken = res.data.accessToken;
   state.refreshToken = res.data.refreshToken;
   const me = await http('GET', '/auth/me', undefined, { quiet: true });
-  log(c.green(`logged in as ${USERNAME}`), c.dim(JSON.stringify(me.data)));
+  state.me = me.data;
+  log(c.green(`logged in as ${USERNAME}: ${state.me?.role} (scope ${scope()}${state.me?.branchId ? `, branch ${state.me.branchId}` : ''})`));
+  if (state.me?.branchId) state.branchId = state.me.branchId;
+  // A gamer console acts as that gamer: the gamer-side calls use its own token.
+  if (isGamerConsole()) {
+    state.gamer = { username: USERNAME, password: PASSWORD, accessToken: state.accessToken, gamerProfileId: null };
+    const wallet = await http('GET', '/wallets/me', undefined, { as: 'gamer', quiet: true });
+    if (wallet.ok) state.gamer.gamerProfileId = wallet.data.gamerProfileId;
+  }
 }
 
 async function refresh() {
@@ -355,30 +404,19 @@ async function editGame() {
   await http('PATCH', `/api/v1/games/${id}`, { [field]: value });
 }
 
-async function gamesMenu() {
-  for (;;) {
-    log(`
-${c.bold('Games')}
-  1. list global catalog            6. assign to branch
-  2. station catalog + catalog_status  7. unassign from branch
-  3. create game                    8. enable / disable game
-  4. assign to this station         9. edit game field
-  5. unassign from this station     0. back`);
-    const choice = await ask('>');
-    const actions = {
-      1: listGames,
-      2: stationCatalog,
-      3: createGame,
-      4: assignStation,
-      5: unassignStation,
-      6: () => branchAssignment('PUT'),
-      7: () => branchAssignment('DELETE'),
-      8: toggleGame,
-      9: editGame,
-    };
-    if (choice === '0' || choice === '') return;
-    await actions[choice]?.();
-  }
+function gamesMenu() {
+  return menu('Games', [
+    { key: '1', label: 'list global catalog', min: 'self', run: listGames },
+    { key: '2', label: 'station catalog + catalog_status', min: 'staff', when: () => !!state.station, run: stationCatalog },
+    { section: 'manage (manager / admin)' },
+    { key: '3', label: 'create game', min: 'admin', run: createGame },
+    { key: '4', label: 'assign to this station', min: 'admin', when: () => !!state.station, run: assignStation },
+    { key: '5', label: 'unassign from this station', min: 'admin', when: () => !!state.station, run: unassignStation },
+    { key: '6', label: 'assign to branch', min: 'admin', run: () => branchAssignment('PUT') },
+    { key: '7', label: 'unassign from branch', min: 'admin', run: () => branchAssignment('DELETE') },
+    { key: '8', label: 'enable / disable game', min: 'admin', run: toggleGame },
+    { key: '9', label: 'edit game field', min: 'admin', run: editGame },
+  ]);
 }
 
 // ---------------------------------------------------------------- telemetry / alerts
@@ -406,14 +444,14 @@ function psql(sql, { quiet = false } = {}) {
   try {
     const out = execFileSync(
       'docker',
-      [...COMPOSE, 'exec', '-T', 'postgres', 'psql', '-U', 'cstam', '-d', 'cstam', '-At', '-F', '|', '-v', 'ON_ERROR_STOP=1', '-c', sql],
+      [...COMPOSE, 'exec', '-T', 'postgres', 'psql', '-U', 'cstam', '-d', 'cstam', '-qAt', '-F', '|', '-v', 'ON_ERROR_STOP=1', '-c', sql],
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
     );
     if (!quiet) log(c.dim(`psql: ${sql.replace(/\s+/g, ' ').slice(0, 160)}`));
     return out
       .split('\n')
       .filter((line) => line.trim() !== '')
-      .map((line) => line.split('|'));
+      .map((line) => line.split('|').map((field) => field.trim()));
   } catch (err) {
     log(c.red(`psql failed (run from the repo root, stack up): ${(err.stderr || err.message).trim()}`));
     log(c.yellow(`run it yourself with npm run db:psql:\n${sql}`));
@@ -457,6 +495,11 @@ function accessSecret() {
 
 /** HS256, the JwtModule default: exactly what enrollment must mint (docs/ENROLLMENT_HANDOFF.md §3.2). */
 function signStationToken({ id, serialNumber, branchId }, ttlSeconds = 30 * 86_400) {
+  // A token without a valid sub / branchId is ~190 chars instead of ~320 and is rejected with 401.
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!uuid.test(id ?? '') || !uuid.test(branchId ?? '') || !serialNumber) {
+    throw new Error(`cannot mint: bad MACHINE row (id=${id}, branchId=${branchId}, serialNumber=${serialNumber})`);
+  }
   const b64 = (value) => Buffer.from(JSON.stringify(value)).toString('base64url');
   const now = Math.floor(Date.now() / 1000);
   const claims = { sub: id, type: 'station', serialNumber, branchId, iat: now, exp: now + ttlSeconds };
@@ -478,8 +521,10 @@ function setEnrollment(machineId, status) {
 async function enrollStation() {
   const serial = await ask('serial number (must equal Agent__SerialNumber)', state.station?.serialNumber ?? 'STATION-DEV-01');
   const status = (await ask(`enrollmentStatus ${ENROLLMENT_STATUSES.join('|')}`, 'ENROLLED')).toUpperCase();
-  const branches = psql('SELECT id, name FROM branches ORDER BY created_at', { quiet: true }) ?? [];
+  // A manager enrolls into its own branch only; hq into any.
+  const branches = (psql('SELECT id, name FROM branches ORDER BY created_at', { quiet: true }) ?? []).filter(([id]) => can('hq') || id === state.me?.branchId);
   if (branches.length === 0) {
+    if (!can('hq')) return log(c.red('your branch was not found'));
     if (!(await confirm('no branch exists. Create "Dev branch"?'))) return;
     psql(`INSERT INTO branches (id, name, location, updated_at) VALUES (gen_random_uuid(), 'Dev branch', 'Lab', now())`);
     return enrollStation();
@@ -504,9 +549,20 @@ async function mintToken(serialArg) {
   if (!machine) return log(c.red(`no MACHINE row for ${serial}: enroll it first (1)`));
   const days = Number(await ask('valid for days', 30));
   const token = signStationToken(machine, days * 86_400);
+  const claims = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
+  // Copying a long line out of a wrapped terminal is error-prone: the file holds the exact token.
+  const file = join(tmpdir(), `station-token-${serial}.txt`);
+  writeFileSync(file, token);
+  // Ask the backend itself: 200 = accepted, 403 = valid but not ENROLLED, 401 = rejected.
+  const check = await catalogStatus({ Authorization: `Bearer ${token}` }).catch(() => 0);
+  const verdict = { 200: c.green('200 accepted'), 403: c.yellow('403 valid, but the row is not ENROLLED'), 401: c.red('401 REJECTED (secret or claims wrong)') }[check] ?? c.red(`${check} (backend unreachable?)`);
   log(`
-${c.bold('Station token')} for ${serial} (${machine.enrollmentStatus}), valid ${days} days:
+${c.bold('Station token')} for ${serial} (${machine.enrollmentStatus}), valid ${days} days, ${token.length} chars ${c.dim('(normal: about 320)')}:
 ${token}
+
+claims: ${JSON.stringify(claims)}
+saved to: ${file}
+backend check (GET /stations/me/games): ${verdict}
 
 ${c.bold('On the gaming PC (PowerShell, agent folder):')}
 $env:Agent__ServerUrl    = "wss://localhost/agent-ws"   ${c.dim('# other PC: wss://cstam-server.local/agent-ws')}
@@ -668,19 +724,16 @@ function listMachines() {
   if (rows) console.table(rows.map(([serial, enrollment, status, branch, lastSeen, id]) => ({ serial, enrollment, status, branch, lastSeen, id })));
 }
 
-async function enrollmentMenu() {
-  for (;;) {
-    log(`
-${c.bold('Enrollment (stand-in, see docs/ENROLLMENT_HANDOFF.md)')}
-  1. enroll a station (create / update MACHINE row)   4. run admission cases (PASS/FAIL)
-  2. mint a station token for the agent                5. agent's view: GET /stations/me/games
-  3. set enrollmentStatus (revoke / restore)           6. list MACHINE rows
-  0. back`);
-    const choice = await ask('>');
-    if (choice === '0' || choice === '') return;
-    const actions = { 1: enrollStation, 2: () => mintToken(), 3: setStationEnrollment, 4: admissionCases, 5: agentCatalog, 6: listMachines };
-    await actions[choice]?.();
-  }
+// Enrollment is an admin+ action (docs/ENROLLMENT_HANDOFF.md §4.3).
+function enrollmentMenu() {
+  return menu('Enrollment (stand-in, see docs/ENROLLMENT_HANDOFF.md)', [
+    { key: '1', label: 'enroll a station (create / update MACHINE row)', min: 'admin', run: enrollStation },
+    { key: '2', label: 'mint a station token for the agent', min: 'admin', run: () => mintToken() },
+    { key: '3', label: 'set enrollmentStatus (revoke / restore)', min: 'admin', run: setStationEnrollment },
+    { key: '4', label: 'run admission cases (PASS/FAIL)', min: 'admin', run: admissionCases },
+    { key: '5', label: "agent's view: GET /stations/me/games", min: 'admin', run: agentCatalog },
+    { key: '6', label: 'list MACHINE rows', min: 'admin', run: listMachines },
+  ]);
 }
 
 // ---------------------------------------------------------------- users
@@ -704,12 +757,29 @@ async function createGamer() {
   }
 }
 
+// A MANAGER may only create / promote EMPLOYEEs (and demote to GAMER), in its
+// own branch; only an ADMIN (hq) hands out MANAGER or ADMIN, in any branch.
+const assignableRoles = (forCreate) =>
+  can('hq') ? (forCreate ? ['EMPLOYEE', 'MANAGER'] : ['GAMER', 'EMPLOYEE', 'MANAGER', 'ADMIN']) : forCreate ? ['EMPLOYEE'] : ['GAMER', 'EMPLOYEE'];
+
+async function pickRole(forCreate) {
+  const roles = assignableRoles(forCreate);
+  if (roles.length === 1) return roles[0];
+  const role = (await ask(`role ${roles.join('|')}`, roles[0])).toUpperCase();
+  return roles.includes(role) ? role : roles[0];
+}
+
+/** hq picks any branch; a manager's is fixed to its own. */
+async function pickBranch() {
+  return can('hq') ? ask('branchId', await branchId()) : state.me.branchId;
+}
+
 async function createEmployee() {
   const body = {
     username: await ask('username', `staff-${Date.now().toString(36)}`),
     password: await ask('password', 'staff-pass-123'),
-    role: (await ask('role EMPLOYEE|MANAGER', 'EMPLOYEE')).toUpperCase(),
-    branchId: await ask('branchId', await branchId()),
+    role: await pickRole(true),
+    branchId: await pickBranch(),
   };
   const res = await http('POST', '/employees', body);
   if (res.ok) log(c.green(`created ${body.role} ${body.username} / ${body.password} (${res.data.id}). Test with CONSOLE_USER / CONSOLE_PASS`));
@@ -717,38 +787,29 @@ async function createEmployee() {
 
 async function changeRole() {
   const id = await ask('user id');
-  const role = (await ask('role GAMER|EMPLOYEE|MANAGER|ADMIN', 'EMPLOYEE')).toUpperCase();
+  const role = await pickRole(false);
   const body = { role };
-  if (role === 'EMPLOYEE' || role === 'MANAGER') body.branchId = await ask('branchId', await branchId());
+  if (role === 'EMPLOYEE' || role === 'MANAGER') body.branchId = await pickBranch();
   await http('PATCH', `/users/${id}/role`, body);
 }
 
-async function usersMenu() {
-  for (;;) {
-    log(`
-${c.bold('Users')} ${c.dim(`(gamer: ${state.gamer?.username ?? 'none'})`)}
-  1. create gamer (POST /users) and log in as it   4. change a user's role
-  2. log in as an existing gamer                     5. get user by id
-  3. create employee / manager                       6. gamer /auth/me
-  0. back`);
-    const choice = await ask('>');
-    if (choice === '0' || choice === '') return;
-    const actions = {
-      1: createGamer,
-      2: async () => gamerLogin(await ask('username'), await ask('password')),
-      3: createEmployee,
-      4: changeRole,
-      5: async () => console.dir((await http('GET', `/users/${await ask('user id')}`)).data),
-      6: async () => console.dir((await http('GET', '/auth/me', undefined, { as: 'gamer' })).data),
-    };
-    await actions[choice]?.();
-  }
+function usersMenu() {
+  return menu(() => `Users ${c.dim(`(acting gamer: ${state.gamer?.username ?? 'none'})`)}`, [
+    { key: '1', label: 'my profile (GET /auth/me)', min: 'self', run: async () => console.dir((await http('GET', '/auth/me')).data) },
+    { section: 'front desk (staff)', when: () => !isGamerConsole() },
+    { key: '2', label: 'register a gamer (POST /users) and act as it', min: 'staff', run: createGamer },
+    { key: '3', label: 'act as an existing gamer (log in with its password)', min: 'staff', run: async () => gamerLogin(await ask('username'), await ask('password')) },
+    { key: '4', label: 'get a user by id (own branch)', min: 'staff', run: async () => console.dir((await http('GET', `/users/${await ask('user id')}`)).data) },
+    { section: 'staff accounts (manager / admin)' },
+    { key: '5', label: () => `create ${assignableRoles(true).join(' / ')}`, min: 'admin', run: createEmployee },
+    { key: '6', label: () => `change a user's role (${assignableRoles(false).join(' / ')})`, min: 'admin', run: changeRole },
+  ]);
 }
 
 // ---------------------------------------------------------------- wallet
 
 function requireGamer() {
-  if (!state.gamer?.gamerProfileId) log(c.yellow('no gamer yet: users menu (u), 1 or 2'));
+  if (!state.gamer?.gamerProfileId) log(c.yellow('no gamer yet: users menu (u), 2 or 3'));
   return state.gamer?.gamerProfileId;
 }
 
@@ -770,26 +831,19 @@ async function showEntries(as) {
   if (res.ok) console.table(rows.map((e) => ({ type: e.type, amount: e.amount, balanceAfter: e.balanceAfter, sessionId: e.sessionId ?? '', createdAt: e.createdAt })));
 }
 
-async function walletMenu() {
-  for (;;) {
-    log(`
-${c.bold('Wallet')} ${c.dim(`(gamer: ${state.gamer?.username ?? 'none'}, gamerProfileId ${state.gamer?.gamerProfileId ?? '-'})`)}
-  1. gamer: GET /wallets/me           4. staff: wallet by gamerProfileId
-  2. gamer: GET /wallets/me/entries   5. staff: entries by gamerProfileId
-  3. staff: credit                    6. staff: debit
-  0. back`);
-    const choice = await ask('>');
-    if (choice === '0' || choice === '') return;
-    const actions = {
-      1: async () => console.dir((await http('GET', '/wallets/me', undefined, { as: 'gamer' })).data),
-      2: () => showEntries('gamer'),
-      3: () => walletMove('credit'),
-      4: async () => console.dir((await http('GET', `/wallets/${await ask('gamerProfileId', state.gamer?.gamerProfileId ?? '')}`)).data),
-      5: () => showEntries('staff'),
-      6: () => walletMove('debit'),
-    };
-    await actions[choice]?.();
-  }
+/** "my ..." in a gamer console, "<name>'s ..." when staff acts as a gamer. */
+const gamerLabel = (what) => (isGamerConsole() ? `my ${what}` : `${state.gamer?.username}'s ${what} (acting as the gamer)`);
+
+function walletMenu() {
+  return menu(() => `Wallet ${c.dim(`(gamer: ${state.gamer?.username ?? 'none'}, gamerProfileId ${state.gamer?.gamerProfileId ?? '-'})`)}`, [
+    { key: '1', label: () => gamerLabel('wallet'), min: 'self', when: () => !!state.gamer, run: async () => console.dir((await http('GET', '/wallets/me', undefined, { as: 'gamer' })).data) },
+    { key: '2', label: () => gamerLabel('ledger'), min: 'self', when: () => !!state.gamer, run: () => showEntries('gamer') },
+    { section: 'front desk (staff)' },
+    { key: '3', label: 'wallet by gamerProfileId', min: 'staff', run: async () => console.dir((await http('GET', `/wallets/${await ask('gamerProfileId', state.gamer?.gamerProfileId ?? '')}`)).data) },
+    { key: '4', label: 'ledger by gamerProfileId', min: 'staff', run: () => showEntries('staff') },
+    { key: '5', label: 'credit (top up)', min: 'staff', run: () => walletMove('credit') },
+    { key: '6', label: 'debit', min: 'staff', run: () => walletMove('debit') },
+  ]);
 }
 
 // ---------------------------------------------------------------- membership / subscription plans
@@ -842,36 +896,24 @@ async function purchasePlan(kind) {
   if (res.ok) console.dir(res.data, { depth: 4 });
 }
 
-async function plansMenu() {
-  for (;;) {
-    log(`
-${c.bold('Plans')} ${c.dim(`(gamer: ${state.gamer?.username ?? 'none'})`)}
-  Membership                         Subscription
-  1. list                            6. list
-  2. create (admin)                  7. create (admin)
-  3. update (admin)                  8. update (admin)
-  4. delete (admin)                  9. delete (admin)
-  5. gamer: purchase                 p. gamer: purchase
-  m. gamer: GET /memberships/me      s. gamer: GET /subscriptions/me
-  0. back`);
-    const choice = (await ask('>')).toLowerCase();
-    if (choice === '0' || choice === '') return;
-    const actions = {
-      1: () => listPlans('membership'),
-      2: () => createPlan('membership'),
-      3: () => updatePlan('membership'),
-      4: () => deletePlan('membership'),
-      5: () => purchasePlan('membership'),
-      m: async () => console.dir((await http('GET', '/memberships/me', undefined, { as: 'gamer' })).data, { depth: 4 }),
-      6: () => listPlans('subscription'),
-      7: () => createPlan('subscription'),
-      8: () => updatePlan('subscription'),
-      9: () => deletePlan('subscription'),
-      p: () => purchasePlan('subscription'),
-      s: async () => console.dir((await http('GET', '/subscriptions/me', undefined, { as: 'gamer' })).data, { depth: 4 }),
-    };
-    await actions[choice]?.();
-  }
+function plansMenu() {
+  const gamer = () => !!state.gamer;
+  return menu(() => `Plans ${c.dim(`(gamer: ${state.gamer?.username ?? 'none'})`)}`, [
+    { section: 'membership' },
+    { key: '1', label: 'list membership plans', min: 'self', run: () => listPlans('membership') },
+    { key: '2', label: () => `buy a membership (${gamerLabel('wallet')})`, min: 'self', when: gamer, run: () => purchasePlan('membership') },
+    { key: '3', label: () => gamerLabel('membership'), min: 'self', when: gamer, run: async () => console.dir((await http('GET', '/memberships/me', undefined, { as: 'gamer' })).data, { depth: 4 }) },
+    { key: '4', label: 'create membership plan', min: 'admin', run: () => createPlan('membership') },
+    { key: '5', label: 'update membership plan', min: 'admin', run: () => updatePlan('membership') },
+    { key: '6', label: 'delete membership plan', min: 'admin', run: () => deletePlan('membership') },
+    { section: 'subscription' },
+    { key: '7', label: 'list subscription plans', min: 'self', run: () => listPlans('subscription') },
+    { key: '8', label: () => `buy a subscription (${gamerLabel('wallet')})`, min: 'self', when: gamer, run: () => purchasePlan('subscription') },
+    { key: '9', label: () => gamerLabel('subscriptions'), min: 'self', when: gamer, run: async () => console.dir((await http('GET', '/subscriptions/me', undefined, { as: 'gamer' })).data, { depth: 4 }) },
+    { key: 'c', label: 'create subscription plan', min: 'admin', run: () => createPlan('subscription') },
+    { key: 'u', label: 'update subscription plan', min: 'admin', run: () => updatePlan('subscription') },
+    { key: 'd', label: 'delete subscription plan', min: 'admin', run: () => deletePlan('subscription') },
+  ]);
 }
 
 // ---------------------------------------------------------------- pricing, reservations, sessions, billing
@@ -971,39 +1013,34 @@ async function listSessions() {
     console.table(rows.map(([id, status, metered, rate, lockedAt, settledAt, breakdown]) => ({ id, status, metered, rate, lockedAt, settledAt, breakdown })));
 }
 
-async function billingMenu() {
-  for (;;) {
-    log(`
-${c.bold('Sessions and billing')} ${c.dim(`(gamer: ${state.gamer?.username ?? 'none'}, reservation: ${state.reservationId ?? '-'}, session: ${state.session?.id ?? '-'})`)}
-  1. show branch pricing          6. start session (POST /sessions) -> PIN
-  2. set branch pricing (admin)   7. show session
-  3. create reservation (SQL)     8. watch session (poll every 5 s)
-  4. list station reservations    9. end session (POST /sessions/:id/end)
-  5. set reservation status (SQL) l. list station sessions (SQL)
-  0. back`);
-    const choice = (await ask('>')).toLowerCase();
-    if (choice === '0' || choice === '') return;
-    const actions = {
-      1: showPricing,
-      2: setPricing,
-      3: createReservation,
-      4: listReservations,
-      5: setReservationStatus,
-      6: startSession,
-      7: () => showSession(),
-      8: () => showSession({ watch: true }),
-      9: endSessionRest,
-      l: listSessions,
-    };
-    await actions[choice]?.();
-  }
+// Sessions have no gamer-facing route: the whole menu is staff+.
+function billingMenu() {
+  const station = () => !!state.station;
+  return menu(
+    () => `Sessions and billing ${c.dim(`(gamer: ${state.gamer?.username ?? 'none'}, reservation: ${state.reservationId ?? '-'}, session: ${state.session?.id ?? '-'})`)}`,
+    [
+      { section: 'pricing' },
+      { key: '1', label: 'show branch pricing', min: 'staff', run: showPricing },
+      { key: '2', label: 'set branch pricing', min: 'admin', run: setPricing },
+      { section: 'reservation (SQL: no REST route yet)' },
+      { key: '3', label: 'create reservation on this station', min: 'staff', when: station, run: createReservation },
+      { key: '4', label: 'list station reservations', min: 'staff', when: station, run: listReservations },
+      { key: '5', label: 'set reservation status', min: 'staff', when: station, run: setReservationStatus },
+      { section: 'session' },
+      { key: '6', label: 'start session (POST /sessions) -> PIN', min: 'staff', run: startSession },
+      { key: '7', label: 'show session', min: 'staff', run: () => showSession() },
+      { key: '8', label: 'watch session (poll every 5 s)', min: 'staff', run: () => showSession({ watch: true }) },
+      { key: '9', label: 'end session (POST /sessions/:id/end)', min: 'staff', run: endSessionRest },
+      { key: 'l', label: 'list station sessions', min: 'staff', when: station, run: listSessions },
+    ],
+  );
 }
 
 // ---------------------------------------------------------------- misc
 
 async function rawRequest() {
   const method = (await ask('method', 'POST')).toUpperCase();
-  const path = await ask('path', `/api/v1/stations/${state.station.id}/commands`);
+  const path = await ask('path', state.station ? `/api/v1/stations/${state.station.id}/commands` : '/auth/me');
   const raw = await ask('JSON body (empty = none)', '');
   const res = await http(method, path, raw ? JSON.parse(raw) : undefined);
   console.dir(res.data, { depth: 6 });
@@ -1018,58 +1055,56 @@ async function feedMenu() {
 async function main() {
   log(c.bold(`Station console -> ${BASE_URL}`));
   await login();
-  connectFeed();
-  await pickStation();
-  while (!state.station) {
-    if (!(await confirm('no station selected. Open the enrollment menu?'))) return;
-    await enrollmentMenu();
-    if (!state.station) await pickStation();
-  }
 
-  const actions = {
-    s: showStation,
-    1: () => issue({ type: 'LOCK' }),
-    2: () => issue({ type: 'UNLOCK' }),
-    3: unlockBooking,
-    4: launchGame,
-    5: endSession,
-    6: () => issue({ type: 'CATALOG_UPDATE' }),
-    7: shutdown,
-    8: simulate,
-    c: listCommands,
-    g: gamesMenu,
-    t: telemetry,
-    a: alerts,
-    r: rawRequest,
-    f: feedMenu,
-    p: pickStation,
-    u: usersMenu,
-    w: walletMenu,
-    m: plansMenu,
-    b: billingMenu,
-    e: enrollmentMenu,
-  };
-
-  for (;;) {
-    log(`
-${c.bold(`[${state.station.serialNumber}]`)} ${c.dim(`gamer: ${state.gamer?.username ?? 'none'} | session: ${state.session?.id ?? '-'}`)}
-  Station commands                                     Business flow
-  s. station status          1. LOCK                   u. users (gamer, employee, roles)
-  2. UNLOCK (admin)          3. UNLOCK (booking + PIN) w. wallet (credit, debit, ledger)
-  4. LAUNCH_GAME             5. END_SESSION (command)  m. membership / subscription plans
-  6. CATALOG_UPDATE          7. SHUTDOWN               b. pricing, reservation, session, billing
-  8. fault injection         c. recent commands
-  g. games / catalog         t. telemetry              a. alerts (list / resolve)
-  r. raw request             f. feed filters           p. pick another station
-  e. enrollment (station row, token, admission cases)  q. quit`);
-    const choice = (await ask('>')).toLowerCase();
-    if (choice === 'q') break;
-    try {
-      await actions[choice]?.();
-    } catch (err) {
-      log(c.red(`error: ${err.message}`));
+  // Stations, commands and the live feed are staff+. A gamer console skips them.
+  if (can('staff')) {
+    connectFeed();
+    await pickStation();
+    while (!state.station && can('admin')) {
+      if (!(await confirm('no station selected. Open the enrollment menu?'))) break;
+      await enrollmentMenu();
+      if (!state.station) await pickStation();
+    }
+    if (!state.station) {
+      log(c.yellow(can('admin') ? 'no station: station items hidden (e to enroll, p to pick)' : 'no station in your branch: ask a manager to enroll one'));
     }
   }
+
+  const station = () => !!state.station;
+  await menu(
+    () =>
+      `${state.me?.username} (${state.me?.role})` +
+      (state.station ? ` | station ${state.station.serialNumber}` : '') +
+      (isGamerConsole() ? '' : c.dim(` | acting gamer: ${state.gamer?.username ?? 'none'} | session: ${state.session?.id ?? '-'}`)),
+    [
+      { section: 'station commands', when: station },
+      { key: 's', label: 'station status', min: 'staff', when: station, run: showStation },
+      { key: '1', label: 'LOCK', min: 'staff', when: station, run: () => issue({ type: 'LOCK' }) },
+      { key: '2', label: 'UNLOCK (admin unlock)', min: 'staff', when: station, run: () => issue({ type: 'UNLOCK' }) },
+      { key: '3', label: 'UNLOCK (booking + PIN)', min: 'staff', when: station, run: unlockBooking },
+      { key: '4', label: 'LAUNCH_GAME', min: 'staff', when: station, run: launchGame },
+      { key: '5', label: 'END_SESSION (command)', min: 'staff', when: station, run: endSession },
+      { key: '6', label: 'CATALOG_UPDATE', min: 'staff', when: station, run: () => issue({ type: 'CATALOG_UPDATE' }) },
+      { key: '7', label: 'SHUTDOWN', min: 'admin', when: station, run: shutdown },
+      { key: '8', label: 'fault injection (dev)', min: 'staff', when: station, run: simulate },
+      { key: 'c', label: 'recent commands', min: 'staff', when: station, run: listCommands },
+      { key: 't', label: 'telemetry', min: 'staff', when: station, run: telemetry },
+      { section: 'station tools' },
+      { key: 'a', label: 'alerts (list / resolve)', min: 'staff', run: alerts },
+      { key: 'p', label: 'pick another station', min: 'staff', run: pickStation },
+      { key: 'f', label: 'live feed filters', min: 'staff', run: feedMenu },
+      { section: 'business' },
+      { key: 'u', label: () => (can('admin') ? 'users (profile, gamers, staff accounts)' : can('staff') ? 'users (profile, gamers)' : 'my profile'), min: 'self', run: usersMenu },
+      { key: 'w', label: () => (can('staff') ? 'wallet (top up, debit, ledger)' : 'my wallet'), min: 'self', run: walletMenu },
+      { key: 'm', label: () => (can('admin') ? 'membership / subscription plans' : 'membership / subscription plans (browse, buy)'), min: 'self', run: plansMenu },
+      { key: 'b', label: 'pricing, reservation, session, billing', min: 'staff', run: billingMenu },
+      { key: 'g', label: () => (can('admin') ? 'games / catalog' : 'games (browse)'), min: 'self', run: gamesMenu },
+      { section: 'tools' },
+      { key: 'e', label: 'enrollment (station row, token, admission cases)', min: 'admin', run: enrollmentMenu },
+      { key: 'r', label: 'raw request (test a 403 on purpose)', min: 'self', run: rawRequest },
+    ],
+    { root: true },
+  );
 }
 
 main()
