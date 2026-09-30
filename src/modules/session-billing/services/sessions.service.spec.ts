@@ -74,6 +74,8 @@ describe('SessionsService', () => {
       activate: vi.fn(async () => undefined),
       complete: vi.fn(async () => true),
       findOverdueOpen: vi.fn(async () => []),
+      findExpiredUnusedPins: vi.fn(async () => []),
+      expireAsNoShow: vi.fn(async () => true),
       markNoShows: vi.fn(async () => 0),
     };
     presence = { statusChanges: new Subject(), sessionEnded: new Subject(), isOnline: vi.fn(() => true) };
@@ -541,6 +543,93 @@ describe('SessionsService', () => {
       await expect(service.forceClose(caller(), 's1')).rejects.toBeInstanceOf(NotFoundException);
       await expect(service.forceClose(caller({ branchId: 'other' }), 's1')).rejects.toThrow();
       expect(repo.complete).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('sweep: early no-show when the PIN expires unused', () => {
+    /**
+     * In-memory sessions and reservation statuses. The repo mocks mirror the
+     * real where clauses, so the sweep and start() see one consistent station.
+     */
+    let sessions: Record<string, any>[];
+    let reservationStatus: Record<string, string>;
+    const OPEN = ['PENDING', 'ACTIVE', 'PAUSED'];
+
+    beforeEach(() => {
+      sessions = [];
+      reservationStatus = { 'res-1': 'CONFIRMED', 'res-2': 'CONFIRMED' };
+      repo.findExpiredUnusedPins.mockImplementation(async (now: Date) =>
+        sessions
+          .filter((x) => x.status === 'PENDING' && x.pinUsedAt === null && x.pinExpiresAt <= now)
+          .filter((x) => reservationStatus[x.reservationId] === 'CONFIRMED')
+          .map(({ id, reservationId }) => ({ id, reservationId })),
+      );
+      repo.expireAsNoShow.mockImplementation(async (id: string, reservationId: string) => {
+        const row = sessions.find((x) => x.id === id);
+        if (!row || row.status !== 'PENDING' || row.pinUsedAt !== null || reservationStatus[reservationId] !== 'CONFIRMED') return false;
+        Object.assign(row, { status: 'CANCELLED', pinHash: null });
+        reservationStatus[reservationId] = 'NO_SHOW';
+        return true;
+      });
+      repo.findOpenSessionForMachine.mockImplementation(async () => sessions.find((x) => OPEN.includes(x.status)) ?? null);
+      repo.create.mockImplementation(async (data: Record<string, unknown>) => {
+        const row = sessionRow({ id: `s${sessions.length + 1}`, ...data });
+        sessions.push(row);
+        return row;
+      });
+      repo.findReservationForStart.mockImplementation(async (id: string) => reservation({ id, status: reservationStatus[id] }));
+    });
+
+    const pending = (overrides: Record<string, unknown>) =>
+      sessionRow({ id: 's-old', reservationId: 'res-1', pinHash: '$argon2id$hash', ...overrides });
+
+    it('cancels the session and marks the reservation NO_SHOW before its window ends', async () => {
+      const row = pending({ pinExpiresAt: new Date(Date.now() - 1000) });
+      sessions.push(row);
+      expect(row.endTime.getTime()).toBeGreaterThan(Date.now()); // window still open
+
+      await service.sweep();
+
+      expect(row).toMatchObject({ status: 'CANCELLED', pinHash: null });
+      expect(reservationStatus['res-1']).toBe('NO_SHOW');
+      expect(repo.expireAsNoShow).toHaveBeenCalledWith('s-old', 'res-1');
+      expect(wallet.debit).not.toHaveBeenCalled();
+    });
+
+    it('leaves a session whose PIN was used alone', async () => {
+      sessions.push(pending({ pinExpiresAt: new Date(Date.now() - 1000), pinUsedAt: new Date(Date.now() - 2000), pinHash: null }));
+      sessions.push(sessionRow({ id: 's-active', reservationId: 'res-2', status: 'ACTIVE', pinUsedAt: new Date(), pinExpiresAt: new Date(Date.now() - 1000) }));
+
+      await service.sweep();
+
+      expect(sessions.map((x) => x.status)).toEqual(['PENDING', 'ACTIVE']);
+      expect(reservationStatus).toEqual({ 'res-1': 'CONFIRMED', 'res-2': 'CONFIRMED' });
+      expect(repo.expireAsNoShow).not.toHaveBeenCalled();
+    });
+
+    it('leaves a session still inside its PIN grace alone', async () => {
+      const row = pending({ pinExpiresAt: new Date(Date.now() + 5 * 60_000) });
+      sessions.push(row);
+
+      await service.sweep();
+
+      expect(row).toMatchObject({ status: 'PENDING', pinHash: '$argon2id$hash' });
+      expect(reservationStatus['res-1']).toBe('CONFIRMED');
+    });
+
+    it('frees the station: a new session starts on it right after the sweep', async () => {
+      sessions.push(pending({ pinExpiresAt: new Date(Date.now() - 1000) }));
+      await expect(service.start(caller(), 'res-2')).rejects.toMatchObject({ response: { code: 'MACHINE_BUSY' } });
+
+      await service.sweep();
+
+      await expect(service.start(caller(), 'res-2')).resolves.toMatchObject({ reservationId: 'res-2', status: 'PENDING' });
+      expect(sessions.filter((x) => OPEN.includes(x.status))).toHaveLength(1);
+    });
+
+    it('still runs the window-end pass for reservations that never started', async () => {
+      await service.sweep();
+      expect(repo.markNoShows).toHaveBeenCalledWith(expect.any(Date));
     });
   });
 

@@ -323,7 +323,12 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
   }
 
   /**
-   * Reservations past their window. A PENDING session nobody logged into is
+   * Early no-shows first: a started reservation whose PIN expired unused
+   * (pinExpiresAt, i.e. SESSION_PIN_TTL_S after the window opened) is closed
+   * as NO_SHOW with its session CANCELLED, so the station is free before the
+   * booked window ends.
+   *
+   * Then reservations past their window. A PENDING session nobody logged into is
    * cancelled (PIN expired) and its reservation becomes NO_SHOW. Any other
    * open session is settled at its window end — no lease reaches past it, so
    * the station is locked by then — and ended on the station.
@@ -331,6 +336,11 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
   async sweep(): Promise<void> {
     try {
       const now = new Date();
+      for (const expired of await this.repo.findExpiredUnusedPins(now)) {
+        if (await this.repo.expireAsNoShow(expired.id, expired.reservationId)) {
+          this.logger.log(`reservation ${expired.reservationId} NO_SHOW: PIN of session ${expired.id} expired unused; station freed`);
+        }
+      }
       for (const session of await this.repo.findOverdueOpen(now)) {
         if (session.status === 'PENDING' && !session.pinUsedAt) {
           await this.repo.cancelPending(session.id);

@@ -144,6 +144,34 @@ export class SessionsRepository extends BaseRepository {
     });
   }
 
+  /**
+   * Started reservations the gamer never logged into: the PIN expired unused
+   * (the no-show grace) while the reservation is still CONFIRMED, window open or not.
+   */
+  findExpiredUnusedPins(now: Date) {
+    return this.prisma.session.findMany({
+      where: { status: 'PENDING', pinUsedAt: null, pinExpiresAt: { lte: now }, reservation: { status: 'CONFIRMED' } },
+      select: { id: true, reservationId: true },
+    });
+  }
+
+  /**
+   * Early no-show, in one transaction: the unused-PIN session -> CANCELLED (PIN
+   * hash dropped) and its CONFIRMED reservation -> NO_SHOW, freeing the station.
+   * False if a login spent the PIN or the reservation moved on meanwhile.
+   */
+  expireAsNoShow(id: string, reservationId: string): Promise<boolean> {
+    return this.prisma.$transaction(async (tx) => {
+      const { count } = await tx.session.updateMany({
+        where: { id, status: 'PENDING', pinUsedAt: null, reservation: { status: 'CONFIRMED' } },
+        data: { status: 'CANCELLED', pinHash: null },
+      });
+      if (count === 0) return false;
+      await tx.reservation.updateMany({ where: { id: reservationId, status: 'CONFIRMED' }, data: { status: 'NO_SHOW' } });
+      return true;
+    });
+  }
+
   /** CONFIRMED reservations whose window passed without an accepted login -> NO_SHOW. */
   async markNoShows(now: Date): Promise<number> {
     const { count } = await this.prisma.reservation.updateMany({

@@ -67,3 +67,40 @@ describe('SessionsRepository.complete', () => {
     expect(tx.reservation.updateMany).not.toHaveBeenCalled();
   });
 });
+
+describe('SessionsRepository early no-show', () => {
+  it('finds PENDING sessions whose PIN expired unused on a still-CONFIRMED reservation', async () => {
+    const prisma = { session: { findMany: vi.fn(async (_args: any) => []) } };
+    const now = new Date();
+    await new SessionsRepository(prisma as any).findExpiredUnusedPins(now);
+    expect(prisma.session.findMany.mock.calls[0][0].where).toEqual({
+      status: 'PENDING', pinUsedAt: null, pinExpiresAt: { lte: now }, reservation: { status: 'CONFIRMED' },
+    });
+  });
+
+  function setup(sessionCount: number) {
+    const tx = {
+      session: { updateMany: vi.fn(async (_args: any) => ({ count: sessionCount })) },
+      reservation: { updateMany: vi.fn(async (_args: any) => ({ count: 1 })) },
+    };
+    const prisma = { $transaction: vi.fn(async (fn: (t: unknown) => unknown) => fn(tx)) };
+    return { tx, prisma, repo: new SessionsRepository(prisma as any) };
+  }
+
+  it('cancels the session (dropping its PIN) and marks the reservation NO_SHOW in one transaction', async () => {
+    const { tx, prisma, repo } = setup(1);
+    expect(await repo.expireAsNoShow('s1', 'r1')).toBe(true);
+    expect(prisma.$transaction).toHaveBeenCalledOnce();
+    expect(tx.session.updateMany).toHaveBeenCalledWith({
+      where: { id: 's1', status: 'PENDING', pinUsedAt: null, reservation: { status: 'CONFIRMED' } },
+      data: { status: 'CANCELLED', pinHash: null },
+    });
+    expect(tx.reservation.updateMany).toHaveBeenCalledWith({ where: { id: 'r1', status: 'CONFIRMED' }, data: { status: 'NO_SHOW' } });
+  });
+
+  it('touches nothing when a login spent the PIN first', async () => {
+    const { tx, repo } = setup(0);
+    expect(await repo.expireAsNoShow('s1', 'r1')).toBe(false);
+    expect(tx.reservation.updateMany).not.toHaveBeenCalled();
+  });
+});
