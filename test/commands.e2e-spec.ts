@@ -366,13 +366,134 @@ describe('station commands (e2e)', () => {
       });
       expect(dup.statusCode).toBe(409);
 
+      const unoffered = await createGame();
+      await assignToBranch(enabled.id);
+      await assignToBranch(disabled.id);
+
       await app.inject({ method: 'POST', url: '/users', payload: { username: usernames[2], password } });
       const login = await app.inject({ method: 'POST', url: '/auth/login', payload: { username: usernames[2], password } });
-      const gamerIds = (await app.inject({ method: 'GET', url: '/api/v1/games', headers: auth(login.json().accessToken) }))
-        .json()
-        .map((g: { id: string }) => g.id);
+      const forGamer = (await app.inject({ method: 'GET', url: '/api/v1/games', headers: auth(login.json().accessToken) })).json();
+      const gamerIds = forGamer.map((g: { id: string }) => g.id);
       expect(gamerIds).toContain(enabled.id);
       expect(gamerIds).not.toContain(disabled.id);
+      expect(gamerIds).not.toContain(unoffered.id); // offered nowhere
+      // Gamers never see launch details.
+      expect(forGamer.find((g: { id: string }) => g.id === enabled.id)).toEqual({
+        id: enabled.id,
+        gameId: enabled.gameId,
+        name: `Game ${enabled.gameId}`,
+        iconUrl: null,
+        sortOrder: 0,
+      });
+
+      // Staff see where each game is offered.
+      const forStaff = (await app.inject({ method: 'GET', url: '/api/v1/games', headers: auth() })).json();
+      expect(forStaff.find((g: { id: string }) => g.id === enabled.id).assignments).toEqual({
+        branchIds: [branchId],
+        stationIds: [],
+        excludedStationIds: [],
+      });
+    });
+
+    it('takes a branch-offered game off one station only, and back on', async () => {
+      const game = await createGame();
+      await assignToBranch(game.id);
+      const agent = await connectAgent();
+      const catalog = async () =>
+        ((await fetchCatalog({ authorization: `Bearer ${agent.stationToken}` })).json().games as { gameId: string }[]).map((g) => g.gameId);
+      expect(await catalog()).toContain(game.gameId);
+
+      const off = await app.inject({ method: 'DELETE', url: `/api/v1/games/${game.id}/stations/${agent.machine.id}`, headers: auth(managerToken) });
+      expect(off.json()).toMatchObject({ assigned: false });
+      expect(await catalog()).not.toContain(game.gameId);
+      const again = await app.inject({ method: 'DELETE', url: `/api/v1/games/${game.id}/stations/${agent.machine.id}`, headers: auth(managerToken) });
+      expect(again.json().code).toBe('ASSIGNMENT_NOT_FOUND');
+      const staffView = (await app.inject({ method: 'GET', url: '/api/v1/games', headers: auth() })).json();
+      expect(staffView.find((g: { id: string }) => g.id === game.id).assignments.excludedStationIds).toEqual([agent.machine.id]);
+
+      await app.inject({ method: 'PUT', url: `/api/v1/games/${game.id}/stations/${agent.machine.id}`, headers: auth(managerToken) });
+      expect(await catalog()).toContain(game.gameId);
+      agent.socket.close();
+    });
+
+    it('forgets a station install report once the launch spec changes, until the station reports again', async () => {
+      const { game, agent } = await readyToLaunch();
+      const edit = await app.inject({
+        method: 'PATCH',
+        url: `/api/v1/games/${game.id}`,
+        headers: auth(managerToken),
+        payload: { target: 'C:\\Games\\moved\\game.exe' },
+      });
+      expect(edit.statusCode).toBe(200);
+      expect((await stationGames(agent.machine.id)).find((g: { id: string }) => g.id === game.id)?.installed).toBeNull();
+      expect((await issue(agent.machine.id, { type: 'LAUNCH_GAME', gameId: game.gameId })).json().code).toBe('GAME_STATUS_UNKNOWN');
+
+      // A rename is not a launch change: the report stays.
+      agent.send('catalog_status', { games: [{ gameId: game.gameId, installed: true }] });
+      await vi.waitFor(async () =>
+        expect((await stationGames(agent.machine.id)).find((g: { id: string }) => g.id === game.id)?.installed).toBe(true),
+      );
+      await app.inject({ method: 'PATCH', url: `/api/v1/games/${game.id}`, headers: auth(managerToken), payload: { name: 'Renamed' } });
+      expect((await stationGames(agent.machine.id)).find((g: { id: string }) => g.id === game.id)?.installed).toBe(true);
+      agent.socket.close();
+    });
+
+    it('stores installed_games and lists them for "add to catalog", matched against the catalog', async () => {
+      const agent = await connectAgent();
+      const known = await createGame({ launchType: 'steam', target: '730' });
+      agent.send('installed_games', {
+        games: [
+          { launchType: 'steam', target: '730', name: 'Counter-Strike 2', processName: 'cs2.exe', inCatalog: true },
+          { launchType: 'epic', target: 'Fortnite', name: 'Fortnite', inCatalog: false },
+          { launchType: 'steam', target: 'not-an-app-id', name: 'Broken', inCatalog: false }, // skipped, not the list
+        ],
+      });
+      const installed = async () =>
+        (await app.inject({ method: 'GET', url: `/api/v1/games/installed?stationId=${agent.machine.id}`, headers: auth() })).json();
+      await vi.waitFor(async () => expect(await installed()).toHaveLength(2));
+      const list = await installed();
+      expect(list.find((g: { target: string }) => g.target === '730')).toMatchObject({
+        launchType: 'steam',
+        name: 'Counter-Strike 2',
+        processName: 'cs2.exe',
+        stations: [{ id: agent.machine.id }],
+        catalogGame: { id: known.id },
+      });
+      expect(list.find((g: { target: string }) => g.target === 'Fortnite')).toMatchObject({ launchType: 'epic', catalogGame: null });
+
+      // The next report replaces the list.
+      agent.send('installed_games', { games: [] });
+      await vi.waitFor(async () => expect(await installed()).toHaveLength(0));
+      agent.socket.close();
+    });
+
+    it('deletes a game from the catalog and every station, keeping past commands', async () => {
+      const game = await createGame();
+      await assignToBranch(game.id);
+      const agent = await connectAgent();
+      const res = await app.inject({ method: 'DELETE', url: `/api/v1/games/${game.id}`, headers: auth(managerToken) });
+      expect(res.json()).toEqual({ id: game.id, deleted: true });
+      await vi.waitFor(() => expect(agent.commands.some((c) => c.type === 'CATALOG_UPDATE')).toBe(true));
+      const games = (await fetchCatalog({ authorization: `Bearer ${agent.stationToken}` })).json().games as { gameId: string }[];
+      expect(games.some((g) => g.gameId === game.gameId)).toBe(false);
+      expect((await app.inject({ method: 'DELETE', url: `/api/v1/games/${game.id}`, headers: auth(managerToken) })).statusCode).toBe(404);
+      agent.socket.close();
+    });
+
+    it("keeps a branch manager from changing or deleting a game another branch offers", async () => {
+      const game = await createGame();
+      const otherBranch = await prisma.branch.create({ data: { name: `cmd-o-${randomUUID()}`, location: 'test' } });
+      await prisma.gameBranch.create({ data: { gameId: game.id, branchId: otherBranch.id } });
+
+      const edit = await app.inject({ method: 'PATCH', url: `/api/v1/games/${game.id}`, headers: auth(managerToken), payload: { enabled: false } });
+      expect(edit.statusCode).toBe(403);
+      expect(edit.json().code).toBe('GAME_SHARED_WITH_OTHER_BRANCHES');
+      expect((await app.inject({ method: 'DELETE', url: `/api/v1/games/${game.id}`, headers: auth(managerToken) })).statusCode).toBe(403);
+
+      // The manager doesn't even see where the other branch offers it.
+      const mine = (await app.inject({ method: 'GET', url: '/api/v1/games', headers: auth(managerToken) })).json();
+      expect(mine.find((g: { id: string }) => g.id === game.id).assignments.branchIds).toEqual([]);
+      await prisma.branch.delete({ where: { id: otherBranch.id } });
     });
 
     it('serves GET /stations/me/games to the agent by its bearer token, resolved for that machine', async () => {

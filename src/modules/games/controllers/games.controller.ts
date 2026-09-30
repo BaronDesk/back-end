@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, Put } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Put, Query } from '@nestjs/common';
 
 import { CurrentUser } from '../../../common/decorators/current-user.decorator.js';
 import { RequireScope } from '../../../common/decorators/require-scope.decorator.js';
@@ -7,10 +7,12 @@ import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
 import {
   assignStationSchema,
   createGameSchema,
+  installedGamesQuerySchema,
   updateGameSchema,
   uuidParamSchema,
   type AssignStationDto,
   type CreateGameDto,
+  type InstalledGamesQuery,
   type UpdateGameDto,
 } from '../schemas/games.schemas.js';
 import { GamesService } from '../services/games.service.js';
@@ -32,6 +34,7 @@ export class GamesController {
     return this.games.create(dto);
   }
 
+  /** HQ, or a manager whose branch alone offers the game (403 GAME_SHARED_WITH_OTHER_BRANCHES otherwise). */
   @RequireScope('admin')
   @Patch('games/:id')
   update(
@@ -40,6 +43,26 @@ export class GamesController {
     @Body(new ZodValidationPipe(updateGameSchema)) dto: UpdateGameDto,
   ) {
     return this.games.update(caller, id, dto);
+  }
+
+  /** Removes the game from the catalog and every station. HQ, or a manager whose branch alone offers it. */
+  @RequireScope('admin')
+  @Delete('games/:id')
+  remove(
+    @CurrentUser() caller: AccessTokenPayload,
+    @Param('id', new ZodValidationPipe(uuidParamSchema)) id: string,
+  ) {
+    return this.games.remove(caller, id);
+  }
+
+  /** Launcher games the stations found installed, each with the catalog entry it matches: the source for "add to catalog". */
+  @RequireScope('staff')
+  @Get('games/installed')
+  installed(
+    @CurrentUser() caller: AccessTokenPayload,
+    @Query(new ZodValidationPipe(installedGamesQuerySchema)) query: InstalledGamesQuery,
+  ) {
+    return this.games.installedGames(caller, query);
   }
 
   /** Offer the game at every station of a branch. */

@@ -126,3 +126,27 @@ export const catalogStatusPayloadSchema = z.object({
     .max(5000),
 });
 export type CatalogStatusPayload = z.infer<typeof catalogStatusPayloadSchema>;
+
+/**
+ * Inbound `installed_games`: launcher games the agent found installed, sent
+ * after every catalog sync. Entries are checked one by one (installedGameSchema)
+ * so one bad entry never drops the list.
+ */
+export const installedGamesPayloadSchema = z.object({ games: z.array(z.unknown()).max(5000) });
+
+/** One `installed_games` entry: a steam app id or epic AppName, as a catalog target would be. */
+export const installedGameSchema = z
+  .object({
+    launchType: z.string().transform((v) => v.toLowerCase()).pipe(z.enum(['steam', 'epic'])),
+    target: z.string().trim().min(1).max(128),
+    name: z.string().trim().min(1).max(MAX_NAME).regex(NO_CONTROL_CHARS),
+    processName: processNameSchema.nullish(),
+  })
+  .refine((g) => launchSpecError({ launchType: g.launchType, target: g.target }) === null, { message: 'invalid target' });
+
+/** GET /api/v1/games/installed: by branch (HQ may omit it) or by one station. */
+export const installedGamesQuerySchema = z.object({
+  branchId: z.string().uuid().optional(),
+  stationId: z.string().uuid().optional(),
+});
+export type InstalledGamesQuery = z.infer<typeof installedGamesQuerySchema>;

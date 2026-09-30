@@ -31,7 +31,7 @@ import {
 } from '../station/services/presence.service.js';
 import { StationAuthService } from '../station/services/station-auth.service.js';
 import { InvalidStationTokenError, type StationPrincipal } from '../station/services/station-token.service.js';
-import { catalogStatusPayloadSchema } from '../games/schemas/games.schemas.js';
+import { catalogStatusPayloadSchema, installedGamesPayloadSchema } from '../games/schemas/games.schemas.js';
 import { GamesService } from '../games/services/games.service.js';
 import { DashboardGateway } from './dashboard.gateway.js';
 import {
@@ -307,6 +307,9 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
         case AGENT_MESSAGE_TYPES.CATALOG_STATUS:
           await this.onCatalogStatus(conn.serialNumber, envelope);
           return;
+        case AGENT_MESSAGE_TYPES.INSTALLED_GAMES:
+          await this.onInstalledGames(conn.serialNumber, envelope);
+          return;
         default:
           this.logger.debug(`ignored unhandled frame type '${envelope.type}' from ${conn.serialNumber}`);
       }
@@ -524,6 +527,17 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     }
     const status = await this.games.recordStationStatus(station, parsed.data);
     this.dashboard.publishToBranch(station.branchId, DASHBOARD_EVENTS.CATALOG_STATUS, status);
+  }
+
+  /** installed_games: after every catalog sync, the launcher games this station has installed. */
+  private async onInstalledGames(serialNumber: string, envelope: Envelope): Promise<void> {
+    const parsed = installedGamesPayloadSchema.safeParse(envelope.payload);
+    const station = this.presence.resolve(serialNumber);
+    if (!parsed.success || !station) {
+      this.logger.warn(`malformed installed_games payload from ${serialNumber}`);
+      return;
+    }
+    await this.games.recordInstalledGames(station, parsed.data.games);
   }
 
   isConnected(serialNumber: string): boolean {

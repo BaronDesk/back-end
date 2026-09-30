@@ -19,6 +19,7 @@ export const AGENT_MESSAGE_TYPES = {
   COMMAND_NACK: 'command_nack',
   STATE_REPORT: 'state_report',
   CATALOG_STATUS: 'catalog_status',
+  INSTALLED_GAMES: 'installed_games',
   LOGIN_REQUEST: 'login_request',
 } as const;
 export const SERVER_MESSAGE_TYPES = {

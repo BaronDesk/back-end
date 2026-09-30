@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   InternalServerErrorException,
   Logger,
@@ -14,8 +15,9 @@ import { SCOPE_RANK } from '../../../common/utils/scope.js';
 import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
 import type { Game, MachineGame } from '../../../generated/prisma/index.js';
 import { PresenceService, type StationRef } from '../../station/services/presence.service.js';
-import { GamesRepository } from '../repository/games.repository.js';
+import { GamesRepository, type GameWithAssignments, type InstalledGameRow } from '../repository/games.repository.js';
 import {
+  installedGameSchema,
   launchSpecError,
   type AssignStationDto,
   type CatalogStatusPayload,
@@ -25,6 +27,9 @@ import {
 
 /** The agent refuses a catalog body over 1 MB (HttpGameCatalogClient.MaxResponseBytes). */
 const MAX_CATALOG_BYTES = 1024 * 1024;
+
+/** Fields that change how a station launches a game: editing one makes its install reports stale. */
+const LAUNCH_FIELDS = ['gameId', 'launchType', 'target', 'arguments', 'workingDirectory', 'processName'] as const;
 
 /**
  * Some stations' resolved catalog changed. Ops turns this into CATALOG_UPDATE
@@ -47,7 +52,7 @@ export interface CatalogGameEntry {
   processName: string | null;
 }
 
-/** API shape of a catalog entry. */
+/** API shape of a catalog entry (staff). */
 export function toGameDto(game: Game) {
   return {
     id: game.id,
@@ -63,6 +68,24 @@ export function toGameDto(game: Game) {
     sortOrder: game.sortOrder,
     createdAt: game.createdAt.toISOString(),
     updatedAt: game.updatedAt.toISOString(),
+  };
+}
+
+/** What a gamer may see of a game: no paths, arguments or other launch details. */
+function toPublicGameDto(game: Game) {
+  return { id: game.id, gameId: game.gameId, name: game.name, iconUrl: game.iconUrl, sortOrder: game.sortOrder };
+}
+
+/**
+ * Where a game is offered, as far as the caller may see: HQ sees every
+ * branch; branch staff see their own branch only.
+ */
+function toAssignments(game: GameWithAssignments, visibleBranch: string | null) {
+  const visible = (branchId: string) => visibleBranch === null || branchId === visibleBranch;
+  return {
+    branchIds: game.gameBranches.map((b) => b.branchId).filter(visible),
+    stationIds: game.machineGames.filter((m) => !m.excluded && visible(m.machine.branchId)).map((m) => m.machineId),
+    excludedStationIds: game.machineGames.filter((m) => m.excluded && visible(m.machine.branchId)).map((m) => m.machineId),
   };
 }
 
@@ -83,7 +106,9 @@ function toCatalogEntry(game: Game, override: MachineGame | undefined): CatalogG
 /**
  * The backend-side game catalog and its per-station view. A station pulls its
  * resolved catalog (GET /stations/me/games), and reports back what it can
- * actually launch (`catalog_status`), which is the only availability truth.
+ * actually launch (`catalog_status`), which is the only availability truth,
+ * and which launcher games it has installed (`installed_games`), which feeds
+ * "add to catalog".
  */
 @Injectable()
 export class GamesService implements OnModuleDestroy {
@@ -102,10 +127,19 @@ export class GamesService implements OnModuleDestroy {
 
   // --- catalog admin -------------------------------------------------------
 
-  /** Gamers see enabled games only; staff+ see the whole catalog. */
+  /**
+   * Gamers see the enabled games offered somewhere, without launch details.
+   * Staff see the whole catalog, each game with where it is offered.
+   */
   async list(caller: AccessTokenPayload) {
-    const enabledOnly = SCOPE_RANK[caller.scope] < SCOPE_RANK.staff;
-    return (await this.repo.list(enabledOnly)).map(toGameDto);
+    if (SCOPE_RANK[caller.scope] < SCOPE_RANK.staff) {
+      return (await this.repo.listOffered()).map(toPublicGameDto);
+    }
+    const visibleBranch = SCOPE_RANK[caller.scope] >= SCOPE_RANK.hq ? null : caller.branchId;
+    return (await this.repo.listWithAssignments()).map((game) => ({
+      ...toGameDto(game),
+      assignments: toAssignments(game, visibleBranch),
+    }));
   }
 
   async create(dto: CreateGameDto) {
@@ -116,16 +150,30 @@ export class GamesService implements OnModuleDestroy {
   }
 
   async update(caller: AccessTokenPayload, id: string, dto: UpdateGameDto) {
-    const existing = await this.getGame(id);
+    const existing = await this.getEditableGame(caller, id);
     const merged = { ...existing, ...dto };
     assertLaunchSpec(merged);
     if (dto.gameId && dto.gameId !== existing.gameId) await this.assertGameIdFree(dto.gameId);
 
     const updated = await this.repo.update(id, dto);
+    // A station's "installed" answer is about the old launch spec: forget it
+    // until the station re-reports after the sync announced below.
+    if (LAUNCH_FIELDS.some((field) => field in dto && dto[field] !== existing[field])) {
+      await this.repo.forgetStatuses([...new Set([existing.gameId, updated.gameId])]);
+    }
     // Existing per-machine overrides are not re-checked against a new launch
     // type: the agent rejects a bad one and reports it in catalog_status.
     this.announce(await this.repo.assignments(id), caller);
     return toGameDto(updated);
+  }
+
+  /** Removes the game from the catalog and from every station that offered it. */
+  async remove(caller: AccessTokenPayload, id: string) {
+    const game = await this.getEditableGame(caller, id);
+    const assignments = await this.repo.assignments(id);
+    await this.repo.delete(id, game.gameId);
+    this.announce(assignments, caller);
+    return { id, deleted: true };
   }
 
   async assignBranch(caller: AccessTokenPayload, id: string, branchId: string) {
@@ -157,13 +205,27 @@ export class GamesService implements OnModuleDestroy {
       workingDirectory: overrides.workingDirectory ?? game.workingDirectory,
     });
     const row = await this.repo.assignMachine(id, station.machineId, overrides);
+    // The overrides may change how this station launches it: its last report is stale.
+    await this.repo.forgetStatuses([game.gameId], station.machineId);
     this.announce({ branchIds: [], machineIds: [station.machineId] }, caller);
     return { gameId: id, stationId: station.machineId, assigned: true, ...overrides, updatedAt: row.updatedAt.toISOString() };
   }
 
+  /**
+   * Takes the game off one station. A game its branch offers is excluded for
+   * this station (the branch keeps offering it everywhere else); a game
+   * assigned to the station alone is simply unassigned.
+   */
   async unassignStation(caller: AccessTokenPayload, id: string, stationId: string) {
     const station = await this.getStation(caller, stationId);
-    if (!(await this.repo.unassignMachine(id, station.machineId))) throw assignmentNotFound();
+    await this.getGame(id);
+    const row = await this.repo.machineRow(id, station.machineId);
+    if (row?.excluded) throw assignmentNotFound();
+    if (await this.repo.isOfferedAtBranch(id, station.branchId)) {
+      await this.repo.excludeMachine(id, station.machineId);
+    } else if (!(await this.repo.deleteMachineRow(id, station.machineId))) {
+      throw assignmentNotFound();
+    }
     this.announce({ branchIds: [], machineIds: [station.machineId] }, caller);
     return { gameId: id, stationId: station.machineId, assigned: false };
   }
@@ -185,6 +247,55 @@ export class GamesService implements OnModuleDestroy {
         installed: status?.installed ?? null,
         reason: status?.reason ?? null,
         reportedAt: status?.reportedAt.toISOString() ?? null,
+      };
+    });
+  }
+
+  /**
+   * Launcher games the stations found installed, one row per game with the
+   * stations that have it, and the catalog entry it matches if any. Scoped
+   * to the caller's branch (HQ: `branchId`, or every branch); `stationId`
+   * narrows it to one station.
+   */
+  async installedGames(caller: AccessTokenPayload, query: { branchId?: string; stationId?: string }) {
+    let branchIds: string[] | null;
+    let machineId: string | undefined;
+    if (query.stationId) {
+      const station = await this.getStation(caller, query.stationId);
+      branchIds = [station.branchId];
+      machineId = station.machineId;
+    } else if (query.branchId) {
+      assertScope(caller, { branchId: query.branchId });
+      branchIds = [query.branchId];
+    } else {
+      branchIds = SCOPE_RANK[caller.scope] >= SCOPE_RANK.hq ? null : [caller.branchId!];
+    }
+
+    const rows = await this.repo.installedIn(branchIds, machineId);
+    const byGame = new Map<string, { launchType: string; target: string; name: string; processName: string | null; stations: { id: string; name: string | null; serialNumber: string }[]; reportedAt: Date }>();
+    for (const row of rows) {
+      const key = `${row.launchType}:${row.target}`;
+      const entry = byGame.get(key) ?? {
+        launchType: row.launchType,
+        target: row.target,
+        name: row.name,
+        processName: row.processName,
+        stations: [],
+        reportedAt: row.reportedAt,
+      };
+      entry.stations.push({ id: row.machine.id, name: row.machine.name, serialNumber: row.machine.serialNumber });
+      if (row.reportedAt > entry.reportedAt) entry.reportedAt = row.reportedAt;
+      byGame.set(key, entry);
+    }
+
+    const catalog = await this.repo.findByTargets(rows.map((r) => ({ launchType: r.launchType, target: r.target })));
+    const inCatalog = new Map(catalog.map((g) => [`${g.launchType}:${g.target}`, g]));
+    return [...byGame.entries()].map(([key, entry]) => {
+      const game = inCatalog.get(key);
+      return {
+        ...entry,
+        reportedAt: entry.reportedAt.toISOString(),
+        catalogGame: game ? { id: game.id, gameId: game.gameId, name: game.name } : null,
       };
     });
   }
@@ -219,6 +330,24 @@ export class GamesService implements OnModuleDestroy {
       reportedAt: reportedAt.toISOString(),
       games: rows,
     };
+  }
+
+  /**
+   * Inbound `installed_games`: replaces the launcher games this station has
+   * installed. Entries that don't validate are skipped, never the whole list.
+   */
+  async recordInstalledGames(station: StationRef, games: unknown[]): Promise<number> {
+    const rows: InstalledGameRow[] = [];
+    for (const raw of games) {
+      const parsed = installedGameSchema.safeParse(raw);
+      if (parsed.success) rows.push({ ...parsed.data, processName: parsed.data.processName ?? null });
+    }
+    if (rows.length < games.length) {
+      this.logger.warn(`installed_games from ${station.serialNumber}: skipped ${games.length - rows.length} invalid entr(y/ies)`);
+    }
+    await this.repo.replaceInstalled(station.machineId, rows, new Date());
+    this.logger.log(`installed_games from ${station.serialNumber}: ${rows.length} game(s)`);
+    return rows.length;
   }
 
   /**
@@ -263,6 +392,25 @@ export class GamesService implements OnModuleDestroy {
   private async getGame(id: string): Promise<Game> {
     const game = await this.repo.findById(id);
     if (!game) throw new NotFoundException({ code: 'GAME_NOT_FOUND', error: 'game not found' });
+    return game;
+  }
+
+  /**
+   * The catalog is shared by every branch. HQ may edit or delete any game; a
+   * branch manager only one that no other branch offers, so an edit at one
+   * branch can never change or remove another branch's games.
+   */
+  private async getEditableGame(caller: AccessTokenPayload, id: string): Promise<Game> {
+    const game = await this.repo.findWithAssignments(id);
+    if (!game) throw new NotFoundException({ code: 'GAME_NOT_FOUND', error: 'game not found' });
+    if (SCOPE_RANK[caller.scope] >= SCOPE_RANK.hq) return game;
+    const branches = new Set([...game.gameBranches.map((b) => b.branchId), ...game.machineGames.map((m) => m.machine.branchId)]);
+    if ([...branches].some((branchId) => branchId !== caller.branchId)) {
+      throw new ForbiddenException({
+        code: 'GAME_SHARED_WITH_OTHER_BRANCHES',
+        error: 'other branches offer this game: only HQ can change or delete it',
+      });
+    }
     return game;
   }
 

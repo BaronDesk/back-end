@@ -312,6 +312,7 @@ model Machine {
   branch          Branch           @relation(fields: [branchId], references: [id], onDelete: Cascade)
   machineGames    MachineGame[]
   gameStatuses    StationGameStatus[]
+  installedGames  StationInstalledGame[]
   nodeTelemetry   NodeTelemetry[]
   telemetryAlerts TelemetryAlert[]
   reservations    Reservation[]
@@ -400,6 +401,8 @@ model MachineGame {
   target           String?
   arguments        String?
   workingDirectory String?  @map("working_directory")
+  // true: NOT offered on this machine even though its branch offers the game.
+  excluded         Boolean  @default(false)
   createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz
   updatedAt        DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
 
@@ -427,6 +430,25 @@ model StationGameStatus {
 
   @@id([machineId, gameId])
   @@map("station_game_status")
+}
+
+// Launcher (steam / epic) games the agent found installed on a station
+// (`installed_games`, after every catalog sync): suggestions for the catalog.
+// Each report replaces the station's previous one.
+model StationInstalledGame {
+  machineId   String         @map("machine_id") @db.Uuid
+  launchType  GameLaunchType @map("launch_type")
+  // steam app id or epic AppName: what a catalog entry's target would be.
+  target      String
+  name        String
+  processName String?        @map("process_name")
+  reportedAt  DateTime       @map("reported_at") @db.Timestamptz
+
+  machine Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
+
+  @@id([machineId, launchType, target])
+  @@index([launchType, target])
+  @@map("station_installed_games")
 }
 
 // --- Telemetry ---
