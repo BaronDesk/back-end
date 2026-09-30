@@ -16,6 +16,8 @@ export interface CreateSessionInput {
   endTime: Date;
   rateCentsPerMinute: number;
   pinHash: string;
+  /** The PIN sealed by PinVault, so the gamer's app can show it again. */
+  pinCipher: string;
   pinExpiresAt: Date;
 }
 
@@ -156,18 +158,46 @@ export class SessionsRepository extends BaseRepository {
     return profile?.userId ?? null;
   }
 
-  create(data: CreateSessionInput) {
-    return this.prisma.session.create({ data: { ...data, status: 'PENDING' } });
+  create(data: CreateSessionInput, tx?: Prisma.TransactionClient) {
+    return (tx ?? this.prisma).session.create({ data: { ...data, status: 'PENDING' } });
+  }
+
+  /**
+   * Runs fn in one transaction holding the station's advisory lock — the same
+   * lock reservations take — so check-then-create on a station is serialized.
+   */
+  withMachineLock<T>(machineId: string, fn: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${machineId}))`;
+      return fn(tx);
+    });
+  }
+
+  /** The reservation's open session, read on the given transaction. */
+  findOpenForReservation(reservationId: string, tx: Prisma.TransactionClient) {
+    return tx.session.findFirst({ where: { reservationId, status: { in: OPEN_SESSION_STATUSES } } });
+  }
+
+  /** The gamer's unused PINs, sealed, by reservation: what the app shows on each booking. */
+  findUnusedPinsForGamer(gamerProfileId: string) {
+    return this.prisma.session.findMany({
+      where: { status: 'PENDING', pinUsedAt: null, pinCipher: { not: null }, reservation: { gamerProfileId, status: 'CONFIRMED' } },
+      select: { reservationId: true, pinCipher: true, pinExpiresAt: true, startTime: true },
+    });
   }
 
   update(id: string, data: Prisma.SessionUpdateInput) {
     return this.prisma.session.update({ where: { id }, data });
   }
 
-  /** The PENDING session a login on this station is for: its reservation is CONFIRMED and its window not over. */
+  /**
+   * The PENDING session a login on this station is for: its booking has
+   * started (a PIN never works early), is CONFIRMED and its window not over.
+   */
   findLoginCandidate(machineId: string, now: Date) {
     return this.prisma.session.findFirst({
-      where: { status: 'PENDING', endTime: { gt: now }, reservation: { machineId, status: 'CONFIRMED' } },
+      where: { status: 'PENDING', startTime: { lte: now }, endTime: { gt: now }, reservation: { machineId, status: 'CONFIRMED' } },
+      include: { reservation: { select: { gamerProfileId: true } } },
       orderBy: { startTime: 'asc' },
     });
   }
@@ -185,16 +215,21 @@ export class SessionsRepository extends BaseRepository {
   async spendPin(id: string, at: Date): Promise<boolean> {
     const { count } = await this.prisma.session.updateMany({
       where: { id, status: 'PENDING', pinUsedAt: null },
-      data: { pinUsedAt: at, pinHash: null },
+      data: { pinUsedAt: at, pinHash: null, pinCipher: null },
     });
     return count === 1;
   }
 
-  /** Closes a PENDING session nobody logged into, expiring its PIN. */
-  cancelPending(id: string) {
-    return this.prisma.session.updateMany({
+  /**
+   * Cancels a PENDING session nobody logged into, expiring its PIN. Leaves the
+   * reservation CONFIRMED: only for replacing a PIN, which creates the new
+   * session in the same transaction. To close a session for good, use
+   * closeAsNoShow() or complete().
+   */
+  cancelPending(id: string, tx?: Prisma.TransactionClient) {
+    return (tx ?? this.prisma).session.updateMany({
       where: { id, status: 'PENDING', pinUsedAt: null },
-      data: { status: 'CANCELLED', pinHash: null },
+      data: { status: 'CANCELLED', pinHash: null, pinCipher: null },
     });
   }
 
@@ -206,15 +241,69 @@ export class SessionsRepository extends BaseRepository {
     ]);
   }
 
-  /** Session settles; its reservation -> COMPLETED. */
-  async complete(id: string, reservationId: string, data: Prisma.SessionUpdateInput) {
-    await this.prisma.$transaction([
-      this.prisma.session.update({ where: { id }, data }),
-      this.prisma.reservation.updateMany({
+  /**
+   * Session settles; its reservation -> COMPLETED. Only an open session is
+   * closed: false if another path (presence, force-close, sweep) closed it first.
+   */
+  complete(id: string, reservationId: string, data: Prisma.SessionUpdateManyMutationInput): Promise<boolean> {
+    return this.prisma.$transaction(async (tx) => {
+      const { count } = await tx.session.updateMany({ where: { id, status: { in: OPEN_SESSION_STATUSES } }, data });
+      if (count === 0) return false;
+      await tx.reservation.updateMany({
         where: { id: reservationId, status: { in: ['CONFIRMED', 'ACTIVE'] } },
         data: { status: 'COMPLETED' },
-      }),
-    ]);
+      });
+      return true;
+    });
+  }
+
+  /**
+   * A PENDING session that never played closes as CANCELLED (PIN dropped)
+   * and its reservation -> NO_SHOW, in one transaction. unusedPinOnly skips a
+   * session whose PIN was spent meanwhile. False if the session was no longer
+   * PENDING: nothing changes.
+   */
+  closeAsNoShow(id: string, reservationId: string, { unusedPinOnly = false } = {}): Promise<boolean> {
+    return this.prisma.$transaction(async (tx) => {
+      const { count } = await tx.session.updateMany({
+        where: { id, status: 'PENDING', ...(unusedPinOnly ? { pinUsedAt: null } : {}) },
+        data: { status: 'CANCELLED', pinHash: null, pinCipher: null },
+      });
+      if (count === 0) return false;
+      await tx.reservation.updateMany({
+        where: { id: reservationId, status: { in: ['CONFIRMED', 'ACTIVE'] } },
+        data: { status: 'NO_SHOW' },
+      });
+      return true;
+    });
+  }
+
+  /**
+   * Bookings the gamer never logged into: the PIN's no-show deadline passed
+   * unused while the reservation is still CONFIRMED.
+   */
+  findExpiredUnusedPins(now: Date) {
+    return this.prisma.session.findMany({
+      where: { status: 'PENDING', pinUsedAt: null, pinExpiresAt: { lte: now }, reservation: { status: 'CONFIRMED' } },
+      select: { id: true, reservationId: true },
+    });
+  }
+
+  /**
+   * No-show, in one transaction: the unused-PIN session -> CANCELLED (PIN
+   * dropped) and its CONFIRMED reservation -> NO_SHOW, freeing the station.
+   * False if a login spent the PIN or the reservation moved on meanwhile.
+   */
+  expireAsNoShow(id: string, reservationId: string): Promise<boolean> {
+    return this.prisma.$transaction(async (tx) => {
+      const { count } = await tx.session.updateMany({
+        where: { id, status: 'PENDING', pinUsedAt: null, reservation: { status: 'CONFIRMED' } },
+        data: { status: 'CANCELLED', pinHash: null, pinCipher: null },
+      });
+      if (count === 0) return false;
+      await tx.reservation.updateMany({ where: { id: reservationId, status: 'CONFIRMED' }, data: { status: 'NO_SHOW' } });
+      return true;
+    });
   }
 
   /** Open sessions whose reservation window is over. */
@@ -257,7 +346,7 @@ export class SessionsRepository extends BaseRepository {
       const ids = late.map((r) => r.id);
       await tx.session.updateMany({
         where: { reservationId: { in: ids }, status: 'PENDING', pinUsedAt: null },
-        data: { status: 'CANCELLED', pinHash: null },
+        data: { status: 'CANCELLED', pinHash: null, pinCipher: null },
       });
       const { count } = await tx.reservation.updateMany({ where: { id: { in: ids }, status: 'CONFIRMED' }, data: { status: 'NO_SHOW' } });
       return count;
@@ -321,7 +410,7 @@ export class SessionsRepository extends BaseRepository {
       const ids = ahead.map((r) => r.id);
       await tx.session.updateMany({
         where: { reservationId: { in: ids }, status: 'PENDING', pinUsedAt: null },
-        data: { status: 'CANCELLED', pinHash: null },
+        data: { status: 'CANCELLED', pinHash: null, pinCipher: null },
       });
       const { count } = await tx.reservation.updateMany({ where: { id: { in: ids } }, data: { status: 'CANCELLED' } });
       return count;

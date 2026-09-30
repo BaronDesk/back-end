@@ -587,6 +587,8 @@ model Session {
   settledAt           DateTime?     @map("settled_at") @db.Timestamptz
   // --- station login PIN: only the hash is stored; single-use, short-lived ---
   pinHash             String?       @map("pin_hash")
+  // The same PIN, encrypted (AES-GCM), so the gamer's app can show it again until it is used.
+  pinCipher           String?       @map("pin_cipher")
   pinExpiresAt        DateTime?     @map("pin_expires_at") @db.Timestamptz
   pinUsedAt           DateTime?     @map("pin_used_at") @db.Timestamptz
   pinAttempts         Int           @default(0) @map("pin_attempts")

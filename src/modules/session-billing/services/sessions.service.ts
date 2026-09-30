@@ -28,16 +28,13 @@ import {
 import { WalletService } from '../../wallet/services/wallet.service.js';
 import { OPEN_SESSION_STATUSES, SessionsRepository } from '../repository/sessions.repository.js';
 import { costAt, exactCostAt, foldDueRateSwitch, msUntilSpent, rateAt, secondsBetween, type Meter } from '../util/metering.js';
-import { generatePin, hashPin, verifyPin } from '../util/pin.js';
+import { generatePin, hashPin, PinVault, verifyPin } from '../util/pin.js';
 import { toSessionDto, type SessionRecord } from '../util/public-session.js';
 
 import { RunoutTimerService } from './runout-timer.service.js';
 
 /** The only login method the backend accepts from the lock screen. */
 const PIN_METHOD = 'pin';
-
-/** A PIN is issued from 15 minutes before the booked time. */
-const CHECK_IN_EARLY_MS = 15 * 60_000;
 
 /** Session.lockReason: the backend locked the station because the gamer's funds ran out. */
 const RUNOUT_LOCK = 'runout';
@@ -87,8 +84,8 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
   private readonly subs: Subscription[] = [];
   private sweepTimer?: NodeJS.Timeout;
 
-  private readonly pinTtlMs: number;
   private readonly pinMaxAttempts: number;
+  private readonly vault: PinVault;
   private readonly leaseCapSeconds: number;
   private readonly sweepIntervalMs: number;
   private readonly minPlayMinutes: number;
@@ -110,13 +107,13 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
     private readonly dashboard: DashboardGateway,
     config: ConfigService,
   ) {
-    this.pinTtlMs = Number(config.get('SESSION_PIN_TTL_S') ?? 900) * 1000;
+    this.vault = new PinVault(config.get<string>('PIN_ENCRYPTION_KEY') ?? config.getOrThrow<string>('JWT_ACCESS_SECRET'));
     this.pinMaxAttempts = Number(config.get('SESSION_PIN_MAX_ATTEMPTS') ?? 5);
     this.leaseCapSeconds = Number(config.get('SESSION_LEASE_CAP_S') ?? 180);
     this.sweepIntervalMs = Number(config.get('SESSION_SWEEP_INTERVAL_MS') ?? 60_000);
     this.minPlayMinutes = Number(config.get('SESSION_MIN_PLAY_MINUTES') ?? 5);
     this.runoutMarginS = Number(config.get('SESSION_RUNOUT_MARGIN_S') ?? 30);
-    this.noShowGraceMs = Number(config.get('NO_SHOW_GRACE_MINUTES') ?? 15) * 60_000;
+    this.noShowGraceMs = Number(config.get('NO_SHOW_GRACE_MINUTES') ?? 30) * 60_000;
     this.endingNoticeMs = Number(config.get('SESSION_ENDING_NOTICE_MINUTES') ?? 10) * 60_000;
   }
 
@@ -141,8 +138,8 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
   // --- PINs ----------------------------------------------------------------
 
   /**
-   * Staff start: creates the PENDING session with a fresh PIN for the desk to
-   * hand the gamer. Gamers normally get their PIN themselves (checkIn).
+   * Staff start: a fresh PIN for the booking, for the desk to hand the gamer
+   * (e.g. one with no phone). Gamers get theirs with the booking.
    */
   async start(caller: AccessTokenPayload, reservationId: string) {
     const reservation = await this.repo.findReservationForStart(reservationId);
@@ -153,10 +150,9 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
   }
 
   /**
-   * The gamer's own check-in: the same PENDING session and PIN as start(),
-   * handed straight to the gamer. Opens CHECK_IN_EARLY_MS before the booking.
-   * Asking again replaces a PIN nobody has typed yet, so a lost PIN is never
-   * a dead end. The caller has already resolved the gamer's profile.
+   * The gamer's PIN for their own booking: issued when the booking is made,
+   * and on demand again (a new PIN replaces one nobody has typed yet, e.g.
+   * after too many wrong tries). The caller has already resolved the profile.
    */
   async checkIn(gamerProfileId: string, reservationId: string) {
     const reservation = await this.repo.findReservationForStart(reservationId);
@@ -168,52 +164,69 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
   }
 
   /**
-   * Creates the PENDING session with a fresh PIN. Only the PIN's hash is
-   * stored; the plaintext is returned here, once. Nothing is sent to the
-   * station: it unlocks only after an accepted login. A PIN is issued from
-   * CHECK_IN_EARLY_MS before the booking, and only with enough balance for
-   * the minimum play time. `replaceUnusedPin` lets a PIN nobody typed yet be
-   * replaced even while it is still valid.
+   * Creates the booking's PENDING session with a fresh PIN: its hash for the
+   * login check, and a sealed copy so the gamer's app can show it again. The
+   * PIN works on this PC only, from the booking's start until the no-show
+   * deadline (NO_SHOW_GRACE_MINUTES later); nothing is sent to the station,
+   * which unlocks only after an accepted login. Serialized per station.
+   * `replaceUnusedPin` lets a PIN nobody typed yet be replaced even while
+   * it is still valid.
    */
   private async issuePin(reservation: StartableReservation, now: Date, replaceUnusedPin: boolean) {
     const reservationId = reservation.id;
     if (reservation.status !== 'CONFIRMED') {
       throw new ConflictException({ code: 'RESERVATION_NOT_CONFIRMED', error: 'reservation is not confirmed' });
     }
-    if (reservation.endTime <= now) {
-      throw new ConflictException({ code: 'RESERVATION_EXPIRED', error: 'reservation window is over' });
-    }
-    if (reservation.startTime.getTime() - CHECK_IN_EARLY_MS > now.getTime()) {
-      throw new ConflictException({ code: 'RESERVATION_NOT_STARTED', error: 'check-in opens 15 minutes before the booking' });
-    }
-    if (!this.presence.isOnline(reservation.machine.serialNumber)) {
-      throw new ConflictException({ code: 'STATION_OFFLINE', error: 'station is not online' });
-    }
-    const open = await this.repo.findActiveForReservation(reservationId);
-    // A PIN that expired or was burned unused can be replaced; anything else is a live session.
-    if (open && !(replaceUnusedPin ? open.status === 'PENDING' && !open.pinUsedAt : this.isDeadPin(open, now))) {
-      throw new ConflictException({ code: 'SESSION_ALREADY_STARTED', error: 'reservation already has an open session' });
+    const deadline = this.noShowDeadline(reservation);
+    if (deadline <= now) {
+      throw new ConflictException({ code: 'RESERVATION_EXPIRED', error: 'the booking is over, or passed its no-show deadline' });
     }
 
     const playStarts = new Date(Math.max(now.getTime(), reservation.startTime.getTime()));
     const rate = await this.computeRate(reservation.machine.branchId, reservation.gamerProfileId, reservation.isWalkIn, playStarts);
-    if (!(await this.coversMinimumPlay(reservation.gamerProfileId, rate.centsPerMinute))) {
-      throw insufficientFunds(`balance must cover at least ${this.minPlayMinutes} minutes of play`);
-    }
-    if (open) await this.repo.cancelPending(open.id);
-
     const pin = generatePin();
-    const session = await this.repo.create({
-      reservationId,
-      appliedMembershipId: rate.membershipId,
-      startTime: reservation.startTime,
-      endTime: reservation.endTime,
-      rateCentsPerMinute: rate.centsPerMinute,
-      pinHash: await hashPin(pin),
-      pinExpiresAt: new Date(Math.min(playStarts.getTime() + this.pinTtlMs, reservation.endTime.getTime())),
+    const pinHash = await hashPin(pin);
+
+    const session = await this.repo.withMachineLock(reservation.machineId, async (tx) => {
+      const open = await this.repo.findOpenForReservation(reservationId, tx);
+      if (open) {
+        // A PIN that expired or was burned unused can be replaced; anything else is a live session.
+        if (!(replaceUnusedPin ? open.status === 'PENDING' && !open.pinUsedAt : this.isDeadPin(open, now))) {
+          throw new ConflictException({ code: 'SESSION_ALREADY_STARTED', error: 'reservation already has an open session' });
+        }
+        await this.repo.cancelPending(open.id, tx);
+      }
+      return this.repo.create(
+        {
+          reservationId,
+          appliedMembershipId: rate.membershipId,
+          startTime: reservation.startTime,
+          endTime: reservation.endTime,
+          rateCentsPerMinute: rate.centsPerMinute,
+          pinHash,
+          pinCipher: this.vault.seal(pin),
+          pinExpiresAt: deadline,
+        },
+        tx,
+      );
     });
 
     return { session, pin };
+  }
+
+  /** The gamer's unused PINs by reservation, for the app to show on each booking. */
+  async pinsForGamer(gamerProfileId: string): Promise<Map<string, { pin: string; validFrom: string; validUntil: string | null }>> {
+    const pins = new Map<string, { pin: string; validFrom: string; validUntil: string | null }>();
+    for (const row of await this.repo.findUnusedPinsForGamer(gamerProfileId)) {
+      const pin = this.vault.open(row.pinCipher);
+      if (pin) pins.set(row.reservationId, { pin, validFrom: row.startTime.toISOString(), validUntil: row.pinExpiresAt?.toISOString() ?? null });
+    }
+    return pins;
+  }
+
+  /** A booking nobody logged into by then is a NO_SHOW (never past its own end). */
+  private noShowDeadline(reservation: { startTime: Date; endTime: Date }): Date {
+    return new Date(Math.min(reservation.startTime.getTime() + this.noShowGraceMs, reservation.endTime.getTime()));
   }
 
   // --- money ---------------------------------------------------------------
@@ -433,6 +446,43 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
     return this.commands.issue(caller, session.reservation.machineId, { type: 'END_SESSION', reason });
   }
 
+  /**
+   * Staff close-out that does not wait for the station. Asks the station to
+   * end the session (skipped if offline or it runs another one), then closes
+   * at once from server state:
+   * - ACTIVE/PAUSED (it played): settled, metered up to now -> COMPLETED.
+   * - PENDING (never played): no metering, no debit -> CANCELLED / NO_SHOW.
+   * A later presence sessionEnded finds the session closed and does nothing;
+   * the debit key is shared, so it never bills twice.
+   */
+  async forceClose(caller: AccessTokenPayload, id: string, reason?: string) {
+    const session = await this.repo.findByIdWithReservation(id);
+    if (!session) throw notFound('SESSION_NOT_FOUND', 'session not found');
+    assertScope(caller, { branchId: session.reservation.machine.branchId });
+    if (!OPEN_SESSION_STATUSES.includes(session.status)) {
+      throw new ConflictException({ code: 'SESSION_NOT_OPEN', error: 'session is already closed' });
+    }
+    try {
+      await this.commands.issueSystemEndSession(session.reservation.machineId, reason ?? 'force_close', id);
+    } catch (err) {
+      // The station may be gone for good; settlement must not depend on it.
+      this.logger.warn(`force-close END_SESSION for session ${id} failed: ${(err as Error).message}`);
+    }
+    // One retry covers a PENDING session that a login activated between the read and the close.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const current = await this.repo.findForSettlement(id);
+      if (!current || !OPEN_SESSION_STATUSES.includes(current.status)) break;
+      const closed =
+        current.status === 'PENDING' && !current.pinUsedAt
+          ? await this.repo.closeAsNoShow(current.id, current.reservationId, { unusedPinOnly: true })
+          : await this.settle(current, new Date(), reason ?? 'force_close');
+      if (closed) break;
+    }
+    await this.runoutTimer.cancel(id);
+    const closed = await this.repo.findByIdWithReservation(id);
+    return toSessionDto((closed ?? session) as SessionRecord);
+  }
+
   /** A staff UNLOCK resumes the station's own open session; there is no unlocking without one. */
   async unlockFor(station: StationRef) {
     const now = new Date();
@@ -535,10 +585,12 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
 
   /**
    * login_request from the station's lock screen. Checks the PIN of the
-   * station's open PENDING session: not expired, not spent, within the
-   * attempt limit. Accepting spends the PIN, and closes any other session
-   * still open on this PC (it can't resume there any more). The gateway sends
-   * login_result and then the UNLOCK; nothing is sent from here.
+   * station's PENDING session whose booking has started: not expired, not
+   * spent, within the attempt limit, and the wallet still covering the
+   * minimum play time. Accepting spends the PIN, and closes any other session
+   * still open on this PC (the previous booking has ended, so it can't resume
+   * there any more). The gateway sends login_result and then the UNLOCK;
+   * nothing is sent from here.
    */
   async login(station: StationRef, method: string, credential: string): Promise<LoginDecision> {
     if (method !== PIN_METHOD) return rejected('unsupported_method');
@@ -552,6 +604,10 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
       return rejected(session.pinAttempts >= this.pinMaxAttempts ? 'too_many_attempts' : 'pin_used');
     }
     if (!(await verifyPin(session.pinHash, credential.trim()))) return rejected('invalid_pin');
+    // Money may have been spent since the booking: play starts only with enough for the minimum play time.
+    if (!(await this.coversMinimumPlay(session.reservation.gamerProfileId, session.rateCentsPerMinute ?? 0))) {
+      return rejected('insufficient_funds');
+    }
     if (!(await this.repo.spendPin(session.id, now))) return rejected('pin_used');
 
     for (const other of await this.repo.findGrantedOnMachine(station.machineId)) {
@@ -733,14 +789,22 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
       for (const session of await this.repo.findDueRateSwitches(now)) {
         await this.foldRateSwitch(session, now);
       }
+      // No-shows: the PIN's deadline (NO_SHOW_GRACE_MINUTES after the start) passed unused: the station is free again.
+      for (const expired of await this.repo.findExpiredUnusedPins(now)) {
+        if (await this.repo.expireAsNoShow(expired.id, expired.reservationId)) {
+          this.logger.log(`reservation ${expired.reservationId} NO_SHOW: PIN of session ${expired.id} unused by its deadline; station freed`);
+        }
+      }
       for (const session of await this.repo.findOverdueOpen(now)) {
         if (session.status === 'PENDING' && !session.pinUsedAt) {
-          await this.repo.cancelPending(session.id);
-          this.logger.log(`session ${session.id} cancelled: reservation window passed without a login`);
+          if (await this.repo.closeAsNoShow(session.id, session.reservationId, { unusedPinOnly: true })) {
+            this.logger.log(`session ${session.id} cancelled, reservation NO_SHOW: window passed without a login`);
+          }
         } else {
           await this.closeOverdue(session);
         }
       }
+      // Bookings that never got a PIN (none is issued for them any more, but older rows exist).
       const noShows = await this.repo.markNoShows(now, this.noShowGraceMs);
       if (noShows) this.logger.log(`${noShows} reservation(s) marked NO_SHOW`);
 
@@ -794,7 +858,8 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
    * the booking checks keep the bill within the wallet; the capped debit is
    * only a safety net, and a shortfall is logged as an error.
    */
-  private async settle(found: SettlementSession, endedAt: Date, reason = 'normal'): Promise<void> {
+  /** False if another path closed the session first; the shared debit key keeps a repeat from billing twice. */
+  private async settle(found: SettlementSession, endedAt: Date, reason = 'normal'): Promise<boolean> {
     const session = await this.foldRateSwitch(found, endedAt);
     // No lease reaches past the reservation window, so neither does metering.
     const meteredUntil = new Date(Math.min(endedAt.getTime(), session.endTime.getTime()));
@@ -833,7 +898,7 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
       }
     }
 
-    await this.repo.complete(session.id, session.reservationId, {
+    const closed = await this.repo.complete(session.id, session.reservationId, {
       status: 'COMPLETED',
       meteringStartedAt: null,
       meteredSeconds,
@@ -842,6 +907,7 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
       billingBreakdown: breakdown as unknown as Prisma.InputJsonValue,
     });
     await this.runoutTimer.cancel(session.id);
+    return closed;
   }
 
   /**

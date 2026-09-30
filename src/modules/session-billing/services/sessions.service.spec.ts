@@ -65,6 +65,12 @@ describe('SessionsService', () => {
     repo = {
       findReservationForStart: vi.fn(async () => reservation()),
       findActiveForReservation: vi.fn(async () => null),
+      findOpenForReservation: vi.fn(async () => null),
+      withMachineLock: vi.fn(async (_machineId: string, fn: (tx: unknown) => unknown) => fn({})),
+      findUnusedPinsForGamer: vi.fn(async () => []),
+      closeAsNoShow: vi.fn(async () => true),
+      findExpiredUnusedPins: vi.fn(async () => []),
+      expireAsNoShow: vi.fn(async () => true),
       create: vi.fn(async (data) => sessionRow(data)),
       cancelPending: vi.fn(async () => ({ count: 1 })),
       findById: vi.fn(async () => sessionRow({ status: 'PENDING', pinUsedAt: new Date() })),
@@ -77,7 +83,7 @@ describe('SessionsService', () => {
       findPausedByGamer: vi.fn(async () => null),
       findActiveByGamer: vi.fn(async () => null),
       activate: vi.fn(async () => undefined),
-      complete: vi.fn(async () => undefined),
+      complete: vi.fn(async () => true),
       findOverdueOpen: vi.fn(async () => []),
       markNoShows: vi.fn(async () => 0),
       findGrantedByGamer: vi.fn(async () => []),
@@ -122,6 +128,7 @@ describe('SessionsService', () => {
     };
     port = new StationSessionPort();
     const config = {
+      getOrThrow: () => 'test-jwt-secret',
       get: (key: string) =>
         ({ SESSION_LEASE_CAP_S: LEASE_CAP_S, SESSION_PIN_MAX_ATTEMPTS: MAX_ATTEMPTS, SESSION_PIN_TTL_S: 900 })[key],
     };
@@ -148,11 +155,12 @@ describe('SessionsService', () => {
       for (const fn of Object.values(commands)) expect(fn).not.toHaveBeenCalled();
     });
 
-    it('expires the PIN after the TTL, never past the reservation window', async () => {
+    it('makes the PIN work until the no-show deadline (30 min after the start), never past the booking end', async () => {
       await service.start(caller(), 'res-1');
-      const ttlBound = repo.create.mock.calls[0][0].pinExpiresAt.getTime();
-      expect(ttlBound).toBeGreaterThan(Date.now() + 14 * 60_000);
-      expect(ttlBound).toBeLessThanOrEqual(Date.now() + 15 * 60_000);
+      // The default window started 10 minutes ago: the deadline is 20 minutes away.
+      const deadline = repo.create.mock.calls[0][0].pinExpiresAt.getTime();
+      expect(deadline).toBeGreaterThan(Date.now() + 19 * 60_000);
+      expect(deadline).toBeLessThanOrEqual(Date.now() + 20 * 60_000);
 
       const endTime = new Date(Date.now() + 5 * 60_000);
       repo.findReservationForStart.mockResolvedValueOnce(reservation({ endTime }));
@@ -164,7 +172,7 @@ describe('SessionsService', () => {
       membership.getActiveDiscountForGamer.mockResolvedValueOnce({ membershipId: 'ms1', discountPercent: 10 });
       await service.start(caller(), 'res-1');
       // 6000c/hr * 0.9 = 5400c/hr = 90c/min
-      expect(repo.create).toHaveBeenCalledWith(expect.objectContaining({ rateCentsPerMinute: 90, appliedMembershipId: 'ms1' }));
+      expect(repo.create.mock.calls[0][0]).toMatchObject({ rateCentsPerMinute: 90, appliedMembershipId: 'ms1' });
     });
 
     it('404s for a missing reservation, and rejects a cross-branch caller', async () => {
@@ -173,16 +181,25 @@ describe('SessionsService', () => {
       await expect(service.start(caller({ branchId: 'other' }), 'res-1')).rejects.toThrow();
     });
 
-    it('409s a reservation that is not CONFIRMED, already over, or whose station is offline', async () => {
+    it('409s a reservation that is not CONFIRMED, already over, or past its no-show deadline', async () => {
       repo.findReservationForStart.mockResolvedValueOnce(reservation({ status: 'PENDING' }));
       await expect(service.start(caller(), 'res-1')).rejects.toMatchObject({ response: { code: 'RESERVATION_NOT_CONFIRMED' } });
 
       repo.findReservationForStart.mockResolvedValueOnce(reservation({ endTime: new Date(Date.now() - 1000) }));
       await expect(service.start(caller(), 'res-1')).rejects.toMatchObject({ response: { code: 'RESERVATION_EXPIRED' } });
 
-      presence.isOnline.mockReturnValueOnce(false);
-      await expect(service.start(caller(), 'res-1')).rejects.toMatchObject({ response: { code: 'STATION_OFFLINE' } });
+      const now = Date.now();
+      repo.findReservationForStart.mockResolvedValueOnce(reservation({ startTime: new Date(now - 31 * 60_000), endTime: new Date(now + HOUR) }));
+      await expect(service.start(caller(), 'res-1')).rejects.toMatchObject({ response: { code: 'RESERVATION_EXPIRED' } });
       expect(repo.create).not.toHaveBeenCalled();
+    });
+
+    it('issues the PIN for a booking later on, even while its station is switched off, under the station lock', async () => {
+      presence.isOnline.mockReturnValue(false);
+      const now = Date.now();
+      repo.findReservationForStart.mockResolvedValueOnce(reservation({ startTime: new Date(now + 2 * 24 * HOUR), endTime: new Date(now + 2 * 24 * HOUR + HOUR) }));
+      await expect(service.start(caller(), 'res-1')).resolves.toMatchObject({ pin: expect.stringMatching(/^\d{6}$/) });
+      expect(repo.withMachineLock).toHaveBeenCalledWith('m1', expect.any(Function));
     });
 
     it('starts from a CONFIRMED walk-in (window starting now) just like a booking', async () => {
@@ -201,16 +218,16 @@ describe('SessionsService', () => {
     });
 
     it('rejects a reservation with a live open session', async () => {
-      repo.findActiveForReservation.mockResolvedValueOnce(sessionRow({ pinExpiresAt: new Date(Date.now() + 60_000) }));
+      repo.findOpenForReservation.mockResolvedValueOnce(sessionRow({ pinExpiresAt: new Date(Date.now() + 60_000) }));
       await expect(service.start(caller(), 'res-1')).rejects.toBeInstanceOf(ConflictException);
-      repo.findActiveForReservation.mockResolvedValueOnce(sessionRow({ status: 'ACTIVE' }));
+      repo.findOpenForReservation.mockResolvedValueOnce(sessionRow({ status: 'ACTIVE' }));
       await expect(service.start(caller(), 'res-1')).rejects.toBeInstanceOf(ConflictException);
     });
 
     it('replaces a PENDING session whose PIN expired unused', async () => {
-      repo.findActiveForReservation.mockResolvedValueOnce(sessionRow({ id: 'old', pinExpiresAt: new Date(Date.now() - 1000) }));
+      repo.findOpenForReservation.mockResolvedValueOnce(sessionRow({ id: 'old', pinExpiresAt: new Date(Date.now() - 1000) }));
       await service.start(caller(), 'res-1');
-      expect(repo.cancelPending).toHaveBeenCalledWith('old');
+      expect(repo.cancelPending).toHaveBeenCalledWith('old', {});
       expect(repo.create).toHaveBeenCalled();
     });
   });
@@ -229,21 +246,21 @@ describe('SessionsService', () => {
       expect(repo.create).not.toHaveBeenCalled();
     });
 
-    it('opens 15 minutes before the booking', async () => {
-      const now = Date.now();
-      repo.findReservationForStart.mockResolvedValueOnce(reservation({ startTime: new Date(now + 20 * 60_000), endTime: new Date(now + HOUR) }));
-      await expect(service.checkIn('g1', 'res-1')).rejects.toMatchObject({ response: { code: 'RESERVATION_NOT_STARTED' } });
-
-      repo.findReservationForStart.mockResolvedValueOnce(reservation({ startTime: new Date(now + 10 * 60_000), endTime: new Date(now + HOUR) }));
-      await expect(service.checkIn('g1', 'res-1')).resolves.toMatchObject({ pin: expect.any(String) });
+    it('keeps the PIN recoverable for the app: the sealed copy opens to the same PIN, never stored in clear', async () => {
+      const { pin } = await service.checkIn('g1', 'res-1');
+      const { pinCipher, pinExpiresAt } = repo.create.mock.calls[0][0];
+      expect(pinCipher).not.toContain(pin);
+      repo.findUnusedPinsForGamer.mockResolvedValueOnce([{ reservationId: 'res-1', pinCipher, pinExpiresAt, startTime: new Date() }]);
+      const pins = await service.pinsForGamer('g1');
+      expect(pins.get('res-1')).toMatchObject({ pin, validUntil: pinExpiresAt.toISOString() });
     });
 
     it('replaces a still-valid PIN nobody typed, but not a session already logged into', async () => {
-      repo.findActiveForReservation.mockResolvedValueOnce(sessionRow({ id: 'old', pinExpiresAt: new Date(Date.now() + 60_000) }));
+      repo.findOpenForReservation.mockResolvedValueOnce(sessionRow({ id: 'old', pinExpiresAt: new Date(Date.now() + 60_000) }));
       await service.checkIn('g1', 'res-1');
-      expect(repo.cancelPending).toHaveBeenCalledWith('old');
+      expect(repo.cancelPending).toHaveBeenCalledWith('old', {});
 
-      repo.findActiveForReservation.mockResolvedValueOnce(sessionRow({ pinUsedAt: new Date() }));
+      repo.findOpenForReservation.mockResolvedValueOnce(sessionRow({ pinUsedAt: new Date() }));
       await expect(service.checkIn('g1', 'res-1')).rejects.toMatchObject({ response: { code: 'SESSION_ALREADY_STARTED' } });
     });
   });
@@ -441,13 +458,18 @@ describe('SessionsService', () => {
       expect(wallet.debitUpTo).not.toHaveBeenCalled();
     });
 
-    it('sweep: cancels a never-logged-in session past its window and marks no-shows', async () => {
+    it('sweep: a booking nobody logged into by its no-show deadline becomes NO_SHOW and frees the PC', async () => {
+      repo.findExpiredUnusedPins.mockResolvedValueOnce([{ id: 'e1', reservationId: 'r-late' }]);
+      await service.sweep();
+      expect(repo.expireAsNoShow).toHaveBeenCalledWith('e1', 'r-late');
+      expect(repo.markNoShows).toHaveBeenCalledWith(expect.any(Date), 30 * 60_000);
+    });
+
+    it('sweep: closes a never-logged-in session past its window as a no-show', async () => {
       const past = { startTime: new Date(Date.now() - 2 * HOUR), endTime: new Date(Date.now() - HOUR) };
       repo.findOverdueOpen.mockResolvedValueOnce([sessionRow({ id: 'p1', status: 'PENDING', pinUsedAt: null, ...past })]);
-      repo.markNoShows.mockResolvedValueOnce(1);
       await service.sweep();
-      expect(repo.cancelPending).toHaveBeenCalledWith('p1');
-      expect(repo.markNoShows).toHaveBeenCalledWith(expect.any(Date), 15 * 60_000);
+      expect(repo.closeAsNoShow).toHaveBeenCalledWith('p1', 'res-1', { unusedPinOnly: true });
       expect(wallet.debitUpTo).not.toHaveBeenCalled();
       expect(commands.issueSystemEndSession).not.toHaveBeenCalled();
     });
@@ -484,17 +506,17 @@ describe('SessionsService', () => {
       expect(repo.create.mock.calls[0][0]).toMatchObject({ rateCentsPerMinute: 0, appliedMembershipId: null });
 
       subscriptions.getWindowDiscountForGamer.mockResolvedValueOnce({ subscriptionId: 'sub1', discountPercent: 5 });
-      repo.findActiveForReservation.mockResolvedValueOnce(sessionRow({ id: 'old', pinExpiresAt: new Date(Date.now() - 1000) }));
+      repo.findOpenForReservation.mockResolvedValueOnce(sessionRow({ id: 'old', pinExpiresAt: new Date(Date.now() - 1000) }));
       await service.start(caller(), 'res-1');
       expect(repo.create.mock.calls[1][0]).toMatchObject({ rateCentsPerMinute: 90, appliedMembershipId: 'ms1' });
     });
 
-    it('refuses a PIN without the balance for the minimum play time, keeping any PIN already issued', async () => {
+    it('refuses the login, keeping the PIN, when the wallet no longer covers the minimum play time', async () => {
       wallet.getWalletForGamer.mockResolvedValue({ balance: 499 }); // 5 min at 100/min = 500
-      repo.findActiveForReservation.mockResolvedValueOnce(sessionRow({ id: 'old', pinExpiresAt: new Date(Date.now() + 60_000) }));
-      await expect(service.checkIn('g1', 'res-1')).rejects.toMatchObject({ response: { code: 'INSUFFICIENT_FUNDS' } });
-      expect(repo.cancelPending).not.toHaveBeenCalled();
-      expect(repo.create).not.toHaveBeenCalled();
+      const pinHash = await hashPin('123456');
+      repo.findLoginCandidate.mockResolvedValueOnce(sessionRow({ pinHash, pinExpiresAt: new Date(Date.now() + 60_000) }));
+      await expect(service.login(STATION, 'pin', '123456')).resolves.toEqual({ accepted: false, reason: 'insufficient_funds' });
+      expect(repo.spendPin).not.toHaveBeenCalled();
     });
 
     it('lets free play start with an empty wallet', async () => {
@@ -503,10 +525,28 @@ describe('SessionsService', () => {
       await expect(service.checkIn('g1', 'res-1')).resolves.toMatchObject({ pin: expect.any(String) });
     });
 
-    it('never issues a PIN earlier than 15 minutes before the booking, from the desk either', async () => {
-      const now = Date.now();
-      repo.findReservationForStart.mockResolvedValueOnce(reservation({ startTime: new Date(now + 2 * HOUR), endTime: new Date(now + 3 * HOUR) }));
-      await expect(service.start(caller(), 'res-1')).rejects.toMatchObject({ response: { code: 'RESERVATION_NOT_STARTED' } });
+    it('force-closes: settles a session that played, closes one that never did as a no-show, and ends it on its station', async () => {
+      repo.findByIdWithReservation.mockResolvedValue(sessionRow({ status: 'ACTIVE', pinUsedAt: new Date() }));
+      repo.findForSettlement.mockResolvedValueOnce(sessionRow({ status: 'ACTIVE', pinUsedAt: new Date(), meteringStartedAt: new Date(Date.now() - 60_000) }));
+      await service.forceClose(caller(), 's1', 'desk');
+      expect(commands.issueSystemEndSession).toHaveBeenCalledWith('m1', 'desk', 's1');
+      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED' }));
+
+      repo.findByIdWithReservation.mockResolvedValue(sessionRow({ status: 'PENDING' }));
+      repo.findForSettlement.mockResolvedValueOnce(sessionRow({ status: 'PENDING' }));
+      await service.forceClose(caller(), 's1');
+      expect(repo.closeAsNoShow).toHaveBeenCalledWith('s1', 'res-1', { unusedPinOnly: true });
+
+      repo.findByIdWithReservation.mockResolvedValue(sessionRow({ status: 'COMPLETED' }));
+      await expect(service.forceClose(caller(), 's1')).rejects.toMatchObject({ response: { code: 'SESSION_NOT_OPEN' } });
+    });
+
+    it('force-close still settles when the END_SESSION cannot be sent', async () => {
+      commands.issueSystemEndSession.mockRejectedValueOnce(new Error('queue down'));
+      repo.findByIdWithReservation.mockResolvedValue(sessionRow({ status: 'PAUSED', pinUsedAt: new Date(), meteredSeconds: 60 }));
+      repo.findForSettlement.mockResolvedValueOnce(sessionRow({ status: 'PAUSED', pinUsedAt: new Date(), meteredSeconds: 60 }));
+      await service.forceClose(caller(), 's1');
+      expect(repo.complete).toHaveBeenCalled();
     });
 
     it('charges what the wallet holds when the bill is bigger, and records the shortfall', async () => {

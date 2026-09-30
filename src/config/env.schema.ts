@@ -32,9 +32,15 @@ export const envSchema = z.object({
   // A session only starts with enough balance for this many minutes of play
   // (else the runout timer would lock the station at once).
   SESSION_MIN_PLAY_MINUTES: z.coerce.number().int().min(0).default(5),
-  // Station login. The PIN the gamer gets in the app is single-use, expires after
-  // SESSION_PIN_TTL_S (never past the reservation window) and is burned after
-  // SESSION_PIN_MAX_ATTEMPTS wrong entries.
+  // Station login. The PIN is issued with the booking and shown in the app; it
+  // works on that PC from the booking's start until the no-show deadline
+  // (NO_SHOW_GRACE_MINUTES later), is single-use, and is burned after
+  // SESSION_PIN_MAX_ATTEMPTS wrong entries. SESSION_PIN_TTL_S is no longer used.
+  // PIN_ENCRYPTION_KEY keeps the PIN recoverable for the app (default: derived
+  // from JWT_ACCESS_SECRET).
+  PIN_ENCRYPTION_KEY: z.string().min(16).optional(),
+  // A booking nobody logged into this long after its start is a NO_SHOW: the PC is free again.
+  NO_SHOW_GRACE_MINUTES: z.coerce.number().int().min(1).default(30),
   SESSION_PIN_TTL_S: z.coerce.number().int().positive().default(900),
   SESSION_PIN_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(20).default(5),
   // Upper bound on any station lease, re-granted on every heartbeat_ack. The

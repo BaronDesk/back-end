@@ -3,7 +3,17 @@ import { Injectable } from '@nestjs/common';
 import { BaseRepository } from '../../common/repository/base.repository.js';
 import type { Prisma, ReservationStatus } from '../../generated/prisma/index.js';
 import { PrismaService } from '../../infra/prisma/prisma.service.js';
+import { OPEN_SESSION_STATUSES } from '../session-billing/repository/sessions.repository.js';
 import type { CreateReservationDto } from './reservations.schemas.js';
+
+export const CANCELLABLE_STATUSES: ReservationStatus[] = ['PENDING', 'CONFIRMED'];
+
+/** Thrown inside the cancel transaction to roll it back with a reason. */
+class CancelAborted extends Error {
+  constructor(readonly kind: 'session_in_progress' | 'not_cancellable') {
+    super(kind);
+  }
+}
 
 @Injectable()
 export class ReservationsRepository extends BaseRepository {
@@ -42,6 +52,21 @@ export class ReservationsRepository extends BaseRepository {
 
       if (walkIn && input.startTime.getTime() > Date.now() + 60_000) {
         return { kind: 'invalid_walk_in' as const };
+      }
+
+      // A walk-in starts now: fail fast if someone is still playing on the
+      // station (logged in, even if their window no longer overlaps). An
+      // unused PIN of a later booking does not count.
+      if (walkIn) {
+        const busy = await tx.session.findFirst({
+          where: {
+            status: { in: OPEN_SESSION_STATUSES },
+            OR: [{ status: { not: 'PENDING' } }, { pinUsedAt: { not: null } }],
+            reservation: { machineId: input.machineId },
+          },
+          select: { id: true },
+        });
+        if (busy) return { kind: 'slot_taken' as const };
       }
 
       // ACTIVE = a session is running on this reservation (set by session-billing).
@@ -112,15 +137,40 @@ export class ReservationsRepository extends BaseRepository {
     return this.prisma.reservation.findFirst({ where: { id, gamerProfileId } });
   }
 
-  /** Cancels the booking and any PIN already issued for it (a gamer can check in 15 minutes early). */
-  async cancel(id: string) {
-    const [reservation] = await this.prisma.$transaction([
-      this.prisma.reservation.update({ where: { id }, data: { status: 'CANCELLED' } }),
-      this.prisma.session.updateMany({
-        where: { reservationId: id, status: 'PENDING', pinUsedAt: null },
-        data: { status: 'CANCELLED', pinHash: null },
-      }),
-    ]);
-    return reservation;
+  /** The reservation's PENDING/ACTIVE/PAUSED sessions. */
+  findOpenSessions(reservationId: string, tx?: Prisma.TransactionClient) {
+    return (tx ?? this.prisma).session.findMany({
+      where: { reservationId, status: { in: OPEN_SESSION_STATUSES } },
+      select: { id: true, status: true, pinUsedAt: true },
+    });
+  }
+
+  /**
+   * Cancels the reservation and burns any unused PIN, in one transaction;
+   * rolls back if a session is in play (ACTIVE, PAUSED, or PENDING with its
+   * PIN already spent) or the reservation left PENDING/CONFIRMED meanwhile.
+   */
+  async cancelUnlessInProgress(id: string) {
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        // Burn first: the row lock makes a racing login's spendPin miss, and a
+        // login that won already set pinUsedAt, so its session stays open below.
+        await tx.session.updateMany({
+          where: { reservationId: id, status: 'PENDING', pinUsedAt: null },
+          data: { status: 'CANCELLED', pinHash: null, pinCipher: null },
+        });
+        if ((await this.findOpenSessions(id, tx)).length > 0) throw new CancelAborted('session_in_progress');
+
+        const { count } = await tx.reservation.updateMany({
+          where: { id, status: { in: CANCELLABLE_STATUSES } },
+          data: { status: 'CANCELLED' },
+        });
+        if (count === 0) throw new CancelAborted('not_cancellable');
+        return { kind: 'cancelled' as const, reservation: await tx.reservation.findUniqueOrThrow({ where: { id } }) };
+      });
+    } catch (err) {
+      if (err instanceof CancelAborted) return { kind: err.kind };
+      throw err;
+    }
   }
 }

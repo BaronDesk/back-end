@@ -10,12 +10,17 @@ import type { AccessTokenPayload } from '../../common/types/jwt-payload.js';
 import { assertScope } from '../../common/utils/assert-scope.js';
 import { MembershipService } from '../membership/services/membership.service.js';
 import { SessionsService } from '../session-billing/services/sessions.service.js';
-import { ReservationsRepository } from './reservations.repository.js';
+import { CANCELLABLE_STATUSES, ReservationsRepository } from './reservations.repository.js';
 import type { CreateReservationDto, StaffListQuery, WalkInDto } from './reservations.schemas.js';
 
 const DAY_MS = 24 * 60 * 60_000;
 
 const minutesBetween = (from: Date, to: Date) => Math.ceil((to.getTime() - from.getTime()) / 60_000);
+
+const notCancellable = () =>
+  new ConflictException({ code: 'RESERVATION_NOT_CANCELLABLE', error: 'reservation cannot be cancelled' });
+
+const sessionInProgress = () => new ConflictException({ code: 'SESSION_IN_PROGRESS', error: 'end the session instead' });
 
 @Injectable()
 export class ReservationsService {
@@ -27,9 +32,11 @@ export class ReservationsService {
     private readonly membership: MembershipService,
   ) {}
 
+  /** The gamer's bookings, each with its PIN while unused (it works on that PC from the start until the no-show deadline). */
   async list(caller: AccessTokenPayload) {
     const gamer = await this.getGamer(caller.sub);
-    return this.reservations.listForGamer(gamer.id);
+    const [bookings, pins] = await Promise.all([this.reservations.listForGamer(gamer.id), this.sessions.pinsForGamer(gamer.id)]);
+    return bookings.map((b) => ({ ...b, pin: pins.get(b.id) ?? null }));
   }
 
   async create(caller: AccessTokenPayload, input: CreateReservationDto) {
@@ -54,7 +61,8 @@ export class ReservationsService {
       start: input.startTime,
       minutes: minutesBetween(input.startTime, input.endTime),
     });
-    return this.unwrap(await this.reservations.createIfAvailable(gamer.id, input));
+    const reservation = this.unwrap(await this.reservations.createIfAvailable(gamer.id, input));
+    return { ...reservation, checkIn: await this.issuePin(gamer.id, reservation.id) };
   }
 
   async walkIn(caller: AccessTokenPayload, input: WalkInDto) {
@@ -73,15 +81,20 @@ export class ReservationsService {
       endTime: new Date(startTime.getTime() + input.durationMinutes * 60_000),
     }, true);
     const reservation = this.unwrap(result);
-    // The gamer plays now, so they get their PIN now. The booking stands even
-    // if that fails: the gamer can ask again with check-in.
-    let checkIn: Awaited<ReturnType<SessionsService['checkIn']>> | null = null;
+    return { ...reservation, checkIn: await this.issuePin(gamer.id, reservation.id) };
+  }
+
+  /**
+   * Every booking gets its PIN when it is made. The booking stands even if
+   * that fails: the gamer can ask for one again (check-in).
+   */
+  private async issuePin(gamerProfileId: string, reservationId: string) {
     try {
-      checkIn = await this.sessions.checkIn(gamer.id, reservation.id);
+      return await this.sessions.checkIn(gamerProfileId, reservationId);
     } catch (err) {
-      this.logger.warn(`walk-in ${reservation.id}: no PIN issued: ${(err as Error).message}`);
+      this.logger.warn(`booking ${reservationId}: no PIN issued: ${(err as Error).message}`);
+      return null;
     }
-    return { ...reservation, checkIn };
   }
 
   /** What extra time the gamer can add to their running booking now, and its cost. */
@@ -116,13 +129,8 @@ export class ReservationsService {
     const reservation = await this.reservations.findForStaff(id);
     if (!reservation) throw new NotFoundException({ code: 'RESERVATION_NOT_FOUND', error: 'reservation not found' });
     assertScope(caller, { branchId: reservation.machine.branchId });
-    if (reservation.status !== 'CONFIRMED' && reservation.status !== 'PENDING') {
-      throw new ConflictException({ code: 'RESERVATION_NOT_CANCELLABLE', error: 'reservation cannot be cancelled' });
-    }
-    if (reservation.sessions.length > 0) {
-      throw new ConflictException({ code: 'SESSION_RUNNING', error: 'the gamer is playing on it: end the session instead' });
-    }
-    return this.reservations.cancel(id);
+    if (!CANCELLABLE_STATUSES.includes(reservation.status)) throw notCancellable();
+    return this.cancelUnlessInProgress(id);
   }
 
   /** The gamer gets the PIN to type on the station for their own booking. */
@@ -135,13 +143,16 @@ export class ReservationsService {
     const gamer = await this.getGamer(caller.sub);
     const reservation = await this.reservations.findOwned(id, gamer.id);
     if (!reservation) throw new NotFoundException({ code: 'RESERVATION_NOT_FOUND', error: 'reservation not found' });
-    if (reservation.status !== 'CONFIRMED' && reservation.status !== 'PENDING') {
-      throw new ConflictException({ code: 'RESERVATION_NOT_CANCELLABLE', error: 'reservation cannot be cancelled' });
-    }
-    if (reservation.startTime <= new Date()) {
-      throw new ConflictException({ code: 'RESERVATION_ALREADY_STARTED', error: 'reservation has already started' });
-    }
-    return this.reservations.cancel(id);
+    if (!CANCELLABLE_STATUSES.includes(reservation.status)) throw notCancellable();
+    return this.cancelUnlessInProgress(id);
+  }
+
+  /** Keyed off actual play, not the clock: an opened window nobody logged into can still be cancelled. */
+  private async cancelUnlessInProgress(id: string) {
+    const result = await this.reservations.cancelUnlessInProgress(id);
+    if (result.kind === 'cancelled') return result.reservation;
+    if (result.kind === 'session_in_progress') throw sessionInProgress();
+    throw notCancellable();
   }
 
   /** The branch of the PC being booked (its prices); an unknown PC can't be booked. */
