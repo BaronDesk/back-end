@@ -15,5 +15,6 @@ export interface ScheduleRunoutInput extends RunoutJobData {
   rateCentsPerMinute: number | null;
 }
 
-export const warnJobId = (sessionId: string): string => `warn:${sessionId}`;
-export const lockJobId = (sessionId: string): string => `lock:${sessionId}`;
+// BullMQ rejects custom job ids containing ':' ("Custom Id cannot contain :").
+export const warnJobId = (sessionId: string): string => `warn-${sessionId}`;
+export const lockJobId = (sessionId: string): string => `lock-${sessionId}`;
