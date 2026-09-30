@@ -64,28 +64,114 @@ describe('ReservationsRepository.createIfAvailable', () => {
   });
 });
 
-describe('ReservationsService.cancel', () => {
-  let repo: Record<string, ReturnType<typeof vi.fn>>;
-  let service: ReservationsService;
-  const future = () => new Date(Date.now() + 60 * 60_000);
+/** Equality, `{ in: [...] }` and null filters: enough for the cancel queries. */
+function matches(row: Record<string, unknown>, where: Record<string, any>): boolean {
+  return Object.entries(where).every(([key, cond]) =>
+    cond !== null && typeof cond === 'object' && 'in' in cond ? cond.in.includes(row[key]) : row[key] === cond,
+  );
+}
 
-  beforeEach(() => {
-    repo = {
-      findGamerProfileId: vi.fn(async () => ({ id: 'g1' })),
-      findOwned: vi.fn(),
-      cancel: vi.fn(async (id) => ({ id, status: 'CANCELLED' })),
-    };
-    service = new ReservationsService(repo as any);
+/** In-memory reservation + session tables; a transaction that throws rolls both back. */
+function fakeDb(reservations: Record<string, any>[], sessions: Record<string, any>[]) {
+  const db = { reservations, sessions };
+  const table = (rows: () => Record<string, any>[]) => ({
+    findFirst: vi.fn(async ({ where }) => rows().find((r) => matches(r, where)) ?? null),
+    findMany: vi.fn(async ({ where }) => rows().filter((r) => matches(r, where))),
+    findUniqueOrThrow: vi.fn(async ({ where }) => {
+      const row = rows().find((r) => matches(r, where));
+      if (!row) throw new Error('not found');
+      return { ...row };
+    }),
+    updateMany: vi.fn(async ({ where, data }) => {
+      const hit = rows().filter((r) => matches(r, where));
+      for (const r of hit) Object.assign(r, data);
+      return { count: hit.length };
+    }),
   });
+  const client: Record<string, any> = {
+    gamerProfile: { findUnique: vi.fn(async () => ({ id: 'g1' })) },
+    reservation: table(() => db.reservations),
+    session: table(() => db.sessions),
+  };
+  client.$transaction = vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => {
+    const snapshot = structuredClone({ reservations: db.reservations, sessions: db.sessions });
+    try {
+      return await fn(client);
+    } catch (err) {
+      db.reservations.splice(0, Infinity, ...snapshot.reservations);
+      db.sessions.splice(0, Infinity, ...snapshot.sessions);
+      throw err;
+    }
+  });
+  return client;
+}
+
+describe('ReservationsService.cancel', () => {
+  const future = () => new Date(Date.now() + 60 * 60_000);
+  const opened = () => ({ startTime: new Date(Date.now() - 10 * 60_000), endTime: new Date(Date.now() + 50 * 60_000) });
+
+  let reservations: Record<string, any>[];
+  let sessions: Record<string, any>[];
+  let service: ReservationsService;
+
+  function setup(reservation: Record<string, unknown>, sessionRows: Record<string, unknown>[] = []) {
+    reservations = [{ id: 'r1', gamerProfileId: 'g1', machineId: MACHINE_ID, status: 'CONFIRMED', startTime: future(), ...reservation }];
+    sessions = sessionRows.map((s, i) => ({ id: `s${i + 1}`, reservationId: 'r1', pinUsedAt: null, ...s }));
+    service = new ReservationsService(new ReservationsRepository(fakeDb(reservations, sessions) as any));
+  }
 
   it.each(['PENDING', 'CONFIRMED'])('cancels a %s reservation that has not started', async (status) => {
-    repo.findOwned.mockResolvedValueOnce({ id: 'r1', status, startTime: future() });
+    setup({ status });
+    await expect(service.cancel(GAMER, 'r1')).resolves.toMatchObject({ id: 'r1', status: 'CANCELLED' });
+    expect(reservations[0].status).toBe('CANCELLED');
+  });
+
+  it('cancels an opened reservation whose only session is an unused PIN, and burns the PIN', async () => {
+    setup({ ...opened() }, [{ status: 'PENDING', pinHash: '$argon2id$hash', pinExpiresAt: new Date(Date.now() + 5 * 60_000) }]);
+
     await expect(service.cancel(GAMER, 'r1')).resolves.toMatchObject({ status: 'CANCELLED' });
+
+    expect(reservations[0].status).toBe('CANCELLED');
+    // No hash and no longer PENDING: session-billing's login (PENDING + CONFIRMED reservation + pinHash) cannot redeem it.
+    expect(sessions[0]).toMatchObject({ status: 'CANCELLED', pinHash: null });
+  });
+
+  it.each([
+    ['ACTIVE', { status: 'ACTIVE' }],
+    ['PAUSED', { status: 'PAUSED' }],
+    ['PENDING with its PIN already spent', { status: 'PENDING', pinUsedAt: new Date(), pinHash: null }],
+  ])('409s SESSION_IN_PROGRESS for a %s session and changes nothing', async (_label, session) => {
+    setup({ ...opened() }, [session, { status: 'PENDING', pinHash: '$argon2id$other' }]);
+
+    await expect(service.cancel(GAMER, 'r1')).rejects.toMatchObject({
+      response: { code: 'SESSION_IN_PROGRESS', error: 'end the session instead' },
+    });
+
+    expect(reservations[0].status).toBe('CONFIRMED');
+    // The PIN burn rolled back with the rest of the transaction.
+    expect(sessions[1]).toMatchObject({ status: 'PENDING', pinHash: '$argon2id$other' });
   });
 
   it.each(['ACTIVE', 'COMPLETED', 'CANCELLED', 'NO_SHOW'])('refuses to cancel a %s reservation', async (status) => {
-    repo.findOwned.mockResolvedValueOnce({ id: 'r1', status, startTime: future() });
-    await expect(service.cancel(GAMER, 'r1')).rejects.toBeInstanceOf(ConflictException);
-    expect(repo.cancel).not.toHaveBeenCalled();
+    setup({ status });
+    await expect(service.cancel(GAMER, 'r1')).rejects.toMatchObject({ response: { code: 'RESERVATION_NOT_CANCELLABLE' } });
+    expect(reservations[0].status).toBe(status);
+  });
+
+  it('refuses when the reservation left CONFIRMED between the read and the cancel', async () => {
+    setup({ ...opened() });
+    const repo = (service as any).reservations as ReservationsRepository;
+    const findOwned = repo.findOwned.bind(repo);
+    vi.spyOn(repo, 'findOwned').mockImplementationOnce(async (...args) => {
+      const row = await findOwned(...args);
+      reservations[0].status = 'ACTIVE'; // session activated meanwhile
+      return row;
+    });
+    await expect(service.cancel(GAMER, 'r1')).rejects.toMatchObject({ response: { code: 'RESERVATION_NOT_CANCELLABLE' } });
+  });
+
+  it('404s a reservation the caller does not own', async () => {
+    setup({ gamerProfileId: 'someone-else' });
+    await expect(service.cancel(GAMER, 'r1')).rejects.toMatchObject({ response: { code: 'RESERVATION_NOT_FOUND' } });
   });
 });

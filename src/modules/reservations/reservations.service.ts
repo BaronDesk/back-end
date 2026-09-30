@@ -6,8 +6,11 @@ import {
 } from '@nestjs/common';
 
 import type { AccessTokenPayload } from '../../common/types/jwt-payload.js';
-import { ReservationsRepository } from './reservations.repository.js';
+import { CANCELLABLE_STATUSES, ReservationsRepository } from './reservations.repository.js';
 import type { CreateReservationDto, WalkInDto } from './reservations.schemas.js';
+
+const notCancellable = () =>
+  new ConflictException({ code: 'RESERVATION_NOT_CANCELLABLE', error: 'reservation cannot be cancelled' });
 
 @Injectable()
 export class ReservationsService {
@@ -41,13 +44,14 @@ export class ReservationsService {
     const gamer = await this.getGamer(caller.sub);
     const reservation = await this.reservations.findOwned(id, gamer.id);
     if (!reservation) throw new NotFoundException({ code: 'RESERVATION_NOT_FOUND', error: 'reservation not found' });
-    if (reservation.status !== 'CONFIRMED' && reservation.status !== 'PENDING') {
-      throw new ConflictException({ code: 'RESERVATION_NOT_CANCELLABLE', error: 'reservation cannot be cancelled' });
+    if (!CANCELLABLE_STATUSES.includes(reservation.status)) throw notCancellable();
+    // Keyed off actual play, not the clock: an opened window nobody logged into can still be cancelled.
+    const result = await this.reservations.cancelUnlessInProgress(id);
+    if (result.kind === 'cancelled') return result.reservation;
+    if (result.kind === 'session_in_progress') {
+      throw new ConflictException({ code: 'SESSION_IN_PROGRESS', error: 'end the session instead' });
     }
-    if (reservation.startTime <= new Date()) {
-      throw new ConflictException({ code: 'RESERVATION_ALREADY_STARTED', error: 'reservation has already started' });
-    }
-    return this.reservations.cancel(id);
+    throw notCancellable();
   }
 
   private async getGamer(userId: string) {
