@@ -1,4 +1,4 @@
-import { Body, Controller, HttpCode, Param, Post } from '@nestjs/common';
+import { Body, Controller, HttpCode, Logger, Param, Post } from '@nestjs/common';
 
 import { CurrentUser } from '../../../common/decorators/current-user.decorator.js';
 import { Public } from '../../../common/decorators/public.decorator.js';
@@ -15,6 +15,8 @@ import { EnrollmentService, type EnrollmentResult } from '../services/enrollment
 
 @Controller()
 export class EnrollmentController {
+  private readonly logger = new Logger(EnrollmentController.name);
+
   constructor(private readonly enrollment: EnrollmentService) {}
 
 
@@ -41,7 +43,16 @@ export class EnrollmentController {
   @Post('enrollment/request')
   async redeem(@Body() body: unknown): Promise<EnrollmentResult> {
     const parsed = redeemEnrollmentTokenSchema.safeParse(body);
-    if (!parsed.success) return { status: 'REJECTED', reason: 'INVALID_REQUEST' };
-    return this.enrollment.redeem(parsed.data);
+    if (!parsed.success) {
+      this.logger.warn(`enrollment request rejected: INVALID_REQUEST ${JSON.stringify(parsed.error.issues)}`);
+      return { status: 'REJECTED', reason: 'INVALID_REQUEST' };
+    }
+    const result = await this.enrollment.redeem(parsed.data);
+    if (result.status === 'REJECTED') {
+      this.logger.warn(`enrollment request rejected: ${result.reason} (serial ${parsed.data.serialNumber})`);
+    } else {
+      this.logger.log(`enrollment request: ${result.status} machine ${result.machineId} (serial ${parsed.data.serialNumber})`);
+    }
+    return result;
   }
 }
