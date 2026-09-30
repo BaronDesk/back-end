@@ -48,6 +48,14 @@ export class SessionsRepository extends BaseRepository {
     return this.prisma.session.findFirst({ where: { reservationId, status: { in: OPEN_SESSION_STATUSES } } });
   }
 
+  /** The ACTIVE session for a gamer, if any — reschedules on a wallet top-up. */
+  findActiveByGamer(gamerProfileId: string) {
+    return this.prisma.session.findFirst({
+      where: { status: 'ACTIVE', reservation: { gamerProfileId } },
+      include: { reservation: { include: { machine: true } } },
+    });
+  }
+
   create(data: CreateSessionInput) {
     return this.prisma.session.create({ data: { ...data, status: 'PENDING' } });
   }

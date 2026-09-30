@@ -38,5 +38,6 @@ export const DASHBOARD_EVENTS = {
   COMMAND_RESULT: 'command_result',
   COMMAND_UPDATE: 'command_update',
   CATALOG_STATUS: 'catalog_status',
+  SESSION_RUNOUT_WARNING: 'session_runout_warning',
 } as const;
 export type DashboardEvent = (typeof DASHBOARD_EVENTS)[keyof typeof DASHBOARD_EVENTS];

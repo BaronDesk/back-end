@@ -38,6 +38,8 @@ export const envSchema = z.object({
   SESSION_LEASE_CAP_S: z.coerce.number().int().positive().default(180),
   // How often reservations past their window are closed out (NO_SHOW / END_SESSION).
   SESSION_SWEEP_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
+  // Runout timer: how long before the calculated lock time the WARN job fires.
+  SESSION_RUNOUT_WARNING_LEAD_S: z.coerce.number().int().nonnegative().default(300),
 });
 
 export type EnvConfig = z.infer<typeof envSchema>;

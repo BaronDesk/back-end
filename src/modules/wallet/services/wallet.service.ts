@@ -1,4 +1,5 @@
 import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { Subject } from 'rxjs';
 
 import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
 import { Prisma } from '../../../generated/prisma/index.js';
@@ -8,6 +9,8 @@ import { toPublicEntry, toPublicWallet } from '../util/public-wallet.js';
 
 @Injectable()
 export class WalletService {
+  readonly credited = new Subject<{ gamerProfileId: string; amount: number; balanceAfter: number }>();
+
   constructor(private readonly wallets: WalletRepository) {}
 
   async getOrCreateWallet(gamerProfileId: string) {
@@ -54,6 +57,7 @@ export class WalletService {
       idempotencyKey: dto.idempotencyKey,
     });
     if (!entry) throw new ConflictException({ code: 'WALLET_POST_FAILED', error: 'could not post entry' });
+    this.credited.next({ gamerProfileId, amount: dto.amount, balanceAfter: entry.balanceAfter });
     return toPublicEntry(entry);
   }
 

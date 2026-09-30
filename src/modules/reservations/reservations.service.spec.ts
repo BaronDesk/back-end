@@ -19,7 +19,7 @@ describe('ReservationsRepository.createIfAvailable', () => {
 
   beforeEach(() => {
     tx = {
-      $queryRaw: vi.fn(async () => []),
+      $executeRaw: vi.fn(async () => undefined),
       machine: { findUnique: vi.fn(async () => ({ id: MACHINE_ID, enrollmentStatus: 'ENROLLED', status: 'ONLINE' })) },
       reservation: {
         findFirst: vi.fn(async () => null),

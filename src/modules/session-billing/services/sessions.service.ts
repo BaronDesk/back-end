@@ -26,6 +26,8 @@ import { OPEN_SESSION_STATUSES, SessionsRepository } from '../repository/session
 import { generatePin, hashPin, verifyPin } from '../util/pin.js';
 import { toSessionDto, type SessionRecord } from '../util/public-session.js';
 
+import { RunoutTimerService } from './runout-timer.service.js';
+
 /** The only login method the backend accepts from the lock screen. */
 const PIN_METHOD = 'pin';
 
@@ -69,6 +71,8 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
   private readonly leaseCapSeconds: number;
   private readonly sweepIntervalMs: number;
 
+  private creditSub?: Subscription;
+
   constructor(
     private readonly repo: SessionsRepository,
     private readonly presence: PresenceService,
@@ -76,6 +80,7 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
     private readonly membership: MembershipService,
     private readonly wallet: WalletService,
     private readonly commands: CommandsService,
+    private readonly runoutTimer: RunoutTimerService,
     private readonly port: StationSessionPort,
     config: ConfigService,
   ) {
@@ -91,11 +96,13 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
     this.port.register(this);
     this.sweepTimer = setInterval(() => void this.sweep(), this.sweepIntervalMs);
     this.sweepTimer.unref();
+    this.creditSub = this.wallet.credited.subscribe((e) => void this.onWalletCredited(e));
   }
 
   onModuleDestroy(): void {
     this.statusSub?.unsubscribe();
     this.endedSub?.unsubscribe();
+    this.creditSub?.unsubscribe();
     clearInterval(this.sweepTimer);
   }
 
@@ -236,19 +243,26 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
 
   private async onStationStatus(event: StationStatusEvent): Promise<void> {
     if (!event.sessionId) return;
-    const session = await this.repo.findById(event.sessionId);
+    const session = await this.repo.findForSettlement(event.sessionId)
     if (!session || !OPEN_SESSION_STATUSES.includes(session.status)) return;
 
     if (event.locked === false && session.status !== 'ACTIVE') {
       // The agent binds a session only from an UNLOCK, which only follows an accepted login.
       if (session.status === 'PENDING' && !session.pinUsedAt) return;
       await this.repo.activate(session.id, session.reservationId, { status: 'ACTIVE', meteringStartedAt: new Date(), lockedAt: null });
-      // TODO(runout-timer): runoutTimer.scheduleOrReschedule({ sessionId: session.id, gamerProfileId, machineId, branchId, serialNumber, rateCentsPerMinute: session.rateCentsPerMinute })
+      await this.runoutTimer.scheduleOrReschedule({
+        sessionId: session.id,
+        gamerProfileId: session.reservation.gamerProfileId,
+        machineId: session.reservation.machineId,
+        branchId: event.branchId,
+        serialNumber: event.serialNumber,
+        rateCentsPerMinute: session.rateCentsPerMinute,
+      });
     } else if (event.locked === true && session.status === 'ACTIVE') {
       const now = new Date();
       const meteredSeconds = session.meteredSeconds + secondsBetween(session.meteringStartedAt ?? now, now);
       await this.repo.update(session.id, { status: 'PAUSED', meteringStartedAt: null, meteredSeconds, lockedAt: now });
-      // TODO(runout-timer): runoutTimer.cancel(session.id)
+      await this.runoutTimer.cancel(session.id);
     }
   }
 
@@ -256,7 +270,20 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
     const session = await this.repo.findForSettlement(event.sessionId);
     if (!session || !OPEN_SESSION_STATUSES.includes(session.status)) return;
     await this.settle(session, new Date(event.endedAt));
-    // TODO(runout-timer): runoutTimer.cancel(session.id)
+    await this.runoutTimer.cancel(session.id)
+  }
+
+  private async onWalletCredited(event: { gamerProfileId: string }): Promise<void> {
+    const session = await this.repo.findActiveByGamer(event.gamerProfileId);
+    if (!session) return;
+    await this.runoutTimer.scheduleOrReschedule({
+      sessionId: session.id,
+      gamerProfileId: event.gamerProfileId,
+      machineId: session.reservation.machineId,
+      branchId: session.reservation.machine.branchId,
+      serialNumber: session.reservation.machine.serialNumber,
+      rateCentsPerMinute: session.rateCentsPerMinute,
+    });
   }
 
   /**

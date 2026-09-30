@@ -53,6 +53,7 @@ describe('SessionsService', () => {
   let membership: { getActiveDiscountForGamer: ReturnType<typeof vi.fn> };
   let wallet: { debit: ReturnType<typeof vi.fn> };
   let commands: Record<string, ReturnType<typeof vi.fn>>;
+  let runoutTimer: Record<string, ReturnType<typeof vi.fn>>;
   let port: StationSessionPort;
   let service: SessionsService;
 
@@ -77,20 +78,21 @@ describe('SessionsService', () => {
     presence = { statusChanges: new Subject(), sessionEnded: new Subject(), isOnline: vi.fn(() => true) };
     pricing = { getRatesForBranch: vi.fn(async () => ({ paygRate: 6000, bookingRate: 9000 })) }; // 6000c/hr = 100c/min
     membership = { getActiveDiscountForGamer: vi.fn(async () => null) };
-    wallet = { debit: vi.fn(async () => ({ id: 'e1' })) };
+    wallet = { debit: vi.fn(async () => ({ id: 'e1' })), credited: new Subject() };
     commands = {
       issue: vi.fn(async () => ({})),
       issueSystemLock: vi.fn(async () => undefined),
       issueSessionUnlock: vi.fn(async () => true),
       issueSystemEndSession: vi.fn(async () => true),
     };
+    runoutTimer = { scheduleOrReschedule: vi.fn(async () => undefined), cancel: vi.fn(async () => undefined) };
     port = new StationSessionPort();
     const config = {
       get: (key: string) =>
         ({ SESSION_LEASE_CAP_S: LEASE_CAP_S, SESSION_PIN_MAX_ATTEMPTS: MAX_ATTEMPTS, SESSION_PIN_TTL_S: 900 })[key],
     };
     service = new SessionsService(
-      repo as any, presence as any, pricing as any, membership as any, wallet as any, commands as any, port, config as any,
+      repo as any, presence as any, pricing as any, membership as any, wallet as any, commands as any, runoutTimer as any, port, config as any,
     );
     service.onModuleInit();
   });
@@ -313,6 +315,7 @@ describe('SessionsService', () => {
 
   describe('metering and reservation lifecycle', () => {
     it('goes ACTIVE, and moves the reservation CONFIRMED -> ACTIVE, once presence reports the station unlocked', async () => {
+      repo.findForSettlement = vi.fn(async () => sessionRow({ status: 'PENDING', pinUsedAt: new Date() }));
       presence.statusChanges.next({ sessionId: 's1', locked: false, branchId: 'b1' });
       await flush();
       expect(repo.activate).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'ACTIVE', lockedAt: null }));
