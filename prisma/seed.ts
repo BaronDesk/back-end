@@ -152,20 +152,22 @@ async function main() {
       name: 'The Night Owl',
       price: 25,
       durationDays: 30,
-      benefits: { type: 'unlimited_free_play', window: { start: '00:00', end: '06:00' } },
+      // free play every night, 00:00-06:00 local time
+      benefits: { windows: [{ daysOfWeek: [0, 1, 2, 3, 4, 5, 6], startTime: '00:00', endTime: '06:00', discountPercent: 100 }] },
     },
     {
       name: 'The Weekend Warrior',
       price: 40,
       durationDays: 30,
-      benefits: { type: 'free_hours', hours: 15, scope: 'weekend' },
+      // half price all day Saturday and Sunday (the API's benefits are time windows, no hour quotas)
+      benefits: { windows: [{ daysOfWeek: [0, 6], startTime: '00:00', endTime: '00:00', discountPercent: 50 }] },
     },
   ];
   const subscriptionPlans: Record<string, Awaited<ReturnType<typeof prisma.subscriptionPlan.upsert>>> = {};
   for (const seed of subscriptionPlanSeeds) {
     subscriptionPlans[seed.name] = await prisma.subscriptionPlan.upsert({
       where: { name: seed.name },
-      update: {},
+      update: { benefits: seed.benefits },
       create: seed,
     });
   }
@@ -575,9 +577,8 @@ async function main() {
   }
 
   // 7) Night Owl overrun: gamer.gold's session (05:30-06:30) crosses the free
-  // window's 06:00 cutoff. Subscription benefits aren't applied by computeRate
-  // yet, so this is fixture data: billingBreakdown manually splits free vs paid
-  // minutes for whoever wires that logic in.
+  // window's 06:00 cutoff. Fixture data: the backend prices a session once, at
+  // check-in, so this billingBreakdown's free/paid split is illustrative.
   {
     const start = addDays(now, -2);
     start.setHours(5, 30, 0, 0);

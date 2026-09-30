@@ -66,6 +66,21 @@ export class SubscriptionsRepository extends BaseRepository {
     });
   }
 
+  /** ACTIVE passes whose end date is today or later (end dates are whole days). */
+  findActiveForGamer(gamerProfileId: string, today: Date) {
+    return this.prisma.subscription.findMany({
+      where: { gamerProfileId, status: 'ACTIVE', startDate: { lte: today }, endDate: { gte: today } },
+    });
+  }
+
+  // flips ACTIVE passes whose end date has passed, so they neither apply nor block a new purchase
+  expireLapsed(gamerProfileId: string, today: Date) {
+    return this.prisma.subscription.updateMany({
+      where: { gamerProfileId, status: 'ACTIVE', endDate: { lt: today } },
+      data: { status: 'EXPIRED' },
+    });
+  }
+
   create(data: CreateSubscriptionInput) {
     return this.prisma.subscription.create({
       data,

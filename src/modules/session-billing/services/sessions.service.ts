@@ -14,6 +14,7 @@ import {
   type StationSessionHandler,
 } from '../../ops/services/station-session.port.js';
 import { PricingService } from '../../pricing/services/pricing.service.js';
+import { SubscriptionsService } from '../../subscriptions/services/subscriptions.service.js';
 import type { StateReportPayload } from '../../station/schemas/presence.schemas.js';
 import {
   PresenceService,
@@ -31,8 +32,11 @@ import { RunoutTimerService } from './runout-timer.service.js';
 /** The only login method the backend accepts from the lock screen. */
 const PIN_METHOD = 'pin';
 
-/** A gamer can get their PIN from 15 minutes before the booked time. */
+/** A PIN is issued from 15 minutes before the booked time. */
 const CHECK_IN_EARLY_MS = 15 * 60_000;
+
+/** Session.lockReason of a station locked because the gamer's funds ran out. */
+const RUNOUT_LOCK = 'runout';
 
 const rejected = (reason: string): LoginDecision => ({ accepted: false, reason });
 
@@ -60,8 +64,8 @@ type StartableReservation = NonNullable<Awaited<ReturnType<SessionsRepository['f
  *
  * Metering state (ACTIVE/PAUSED) and close-out (COMPLETED) are driven by
  * PresenceService's agent-reported events — the same path whether a station
- * got locked by staff, by a lapsed lease, or (once feat/runout-timer wires
- * in) by running out of funds. Never by a command ack.
+ * got locked by staff, by a lapsed lease, or by running out of funds. Never
+ * by a command ack.
  */
 @Injectable()
 export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSessionHandler {
@@ -74,6 +78,7 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
   private readonly pinMaxAttempts: number;
   private readonly leaseCapSeconds: number;
   private readonly sweepIntervalMs: number;
+  private readonly minPlayMinutes: number;
 
   private creditSub?: Subscription;
 
@@ -82,6 +87,7 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
     private readonly presence: PresenceService,
     private readonly pricing: PricingService,
     private readonly membership: MembershipService,
+    private readonly subscriptions: SubscriptionsService,
     private readonly wallet: WalletService,
     private readonly commands: CommandsService,
     private readonly runoutTimer: RunoutTimerService,
@@ -92,6 +98,7 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
     this.pinMaxAttempts = Number(config.get('SESSION_PIN_MAX_ATTEMPTS') ?? 5);
     this.leaseCapSeconds = Number(config.get('SESSION_LEASE_CAP_S') ?? 180);
     this.sweepIntervalMs = Number(config.get('SESSION_SWEEP_INTERVAL_MS') ?? 60_000);
+    this.minPlayMinutes = Number(config.get('SESSION_MIN_PLAY_MINUTES') ?? 5);
   }
 
   onModuleInit(): void {
@@ -133,19 +140,17 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
     if (!reservation || reservation.gamerProfileId !== gamerProfileId) {
       throw notFound('RESERVATION_NOT_FOUND', 'reservation not found');
     }
-    const now = new Date();
-    if (reservation.startTime.getTime() - CHECK_IN_EARLY_MS > now.getTime()) {
-      throw new ConflictException({ code: 'RESERVATION_NOT_STARTED', error: 'check-in opens 15 minutes before the booking' });
-    }
-    const { session, pin } = await this.issuePin(reservation, now, true);
+    const { session, pin } = await this.issuePin(reservation, new Date(), true);
     return { sessionId: session.id, reservationId, pin, pinExpiresAt: session.pinExpiresAt };
   }
 
   /**
    * Creates the PENDING session with a fresh PIN. Only the PIN's hash is
    * stored; the plaintext is returned here, once. Nothing is sent to the
-   * station: it unlocks only after an accepted login. `replaceUnusedPin`
-   * lets a PIN nobody typed yet be replaced even while it is still valid.
+   * station: it unlocks only after an accepted login. A PIN is issued from
+   * CHECK_IN_EARLY_MS before the booking, and only with enough balance for
+   * the minimum play time. `replaceUnusedPin` lets a PIN nobody typed yet be
+   * replaced even while it is still valid.
    */
   private async issuePin(reservation: StartableReservation, now: Date, replaceUnusedPin: boolean) {
     const reservationId = reservation.id;
@@ -155,20 +160,27 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
     if (reservation.endTime <= now) {
       throw new ConflictException({ code: 'RESERVATION_EXPIRED', error: 'reservation window is over' });
     }
+    if (reservation.startTime.getTime() - CHECK_IN_EARLY_MS > now.getTime()) {
+      throw new ConflictException({ code: 'RESERVATION_NOT_STARTED', error: 'check-in opens 15 minutes before the booking' });
+    }
     if (!this.presence.isOnline(reservation.machine.serialNumber)) {
       throw new ConflictException({ code: 'STATION_OFFLINE', error: 'station is not online' });
     }
     const open = await this.repo.findActiveForReservation(reservationId);
-    if (open) {
-      // A PIN that expired or was burned unused can be replaced; anything else is a live session.
-      const replaceable = replaceUnusedPin ? open.status === 'PENDING' && !open.pinUsedAt : this.isDeadPin(open, now);
-      if (!replaceable) {
-        throw new ConflictException({ code: 'SESSION_ALREADY_STARTED', error: 'reservation already has an open session' });
-      }
-      await this.repo.cancelPending(open.id);
+    // A PIN that expired or was burned unused can be replaced; anything else is a live session.
+    if (open && !(replaceUnusedPin ? open.status === 'PENDING' && !open.pinUsedAt : this.isDeadPin(open, now))) {
+      throw new ConflictException({ code: 'SESSION_ALREADY_STARTED', error: 'reservation already has an open session' });
     }
 
-    const rate = await this.computeRate(reservation.machine.branchId, reservation.gamerProfileId);
+    const rate = await this.computeRate(reservation, now);
+    if (!(await this.coversMinimumPlay(reservation.gamerProfileId, rate.centsPerMinute))) {
+      throw new ConflictException({
+        code: 'INSUFFICIENT_FUNDS',
+        error: `balance must cover at least ${this.minPlayMinutes} minutes of play`,
+      });
+    }
+    if (open) await this.repo.cancelPending(open.id);
+
     const pin = generatePin();
     const pinWindowStart = Math.max(now.getTime(), reservation.startTime.getTime());
     const session = await this.repo.create({
@@ -203,15 +215,16 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
   }
 
   /**
-   * RUNOUT_LOCK_HANDLER seam for feat/runout-timer. Just requests the lock —
-   * the PAUSED transition and metering close-out happen through
-   * onStationStatus once presence reports the station actually locked, same
-   * as a staff-issued LOCK.
+   * RUNOUT_LOCK_HANDLER seam for feat/runout-timer. Marks the session as
+   * locked for funds (so a top-up can resume it) and requests the lock — the
+   * PAUSED transition and metering close-out happen through onStationStatus
+   * once presence reports the station actually locked, same as a staff LOCK.
    */
   async lockForRunout(sessionId: string): Promise<void> {
     const session = await this.repo.findByIdWithReservation(sessionId);
     if (!session || !OPEN_SESSION_STATUSES.includes(session.status)) return;
-    await this.commands.issueSystemLock(session.reservation.machineId, 'runout');
+    await this.repo.update(session.id, { lockReason: RUNOUT_LOCK });
+    await this.commands.issueSystemLock(session.reservation.machineId, RUNOUT_LOCK);
   }
 
   /**
@@ -283,7 +296,12 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
     if (event.locked === false && session.status !== 'ACTIVE') {
       // The agent binds a session only from an UNLOCK, which only follows an accepted login.
       if (session.status === 'PENDING' && !session.pinUsedAt) return;
-      await this.repo.activate(session.id, session.reservationId, { status: 'ACTIVE', meteringStartedAt: new Date(), lockedAt: null });
+      await this.repo.activate(session.id, session.reservationId, {
+        status: 'ACTIVE',
+        meteringStartedAt: new Date(),
+        lockedAt: null,
+        lockReason: null,
+      });
       await this.runoutTimer.scheduleOrReschedule({
         sessionId: session.id,
         gamerProfileId: session.reservation.gamerProfileId,
@@ -307,17 +325,36 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
     await this.runoutTimer.cancel(session.id)
   }
 
+  /**
+   * A top-up moves the run-out time of a running session. A session the
+   * runout timer locked is resumed once the balance covers the minimum play
+   * time again: UNLOCK, and metering restarts when the station reports it.
+   */
   private async onWalletCredited(event: { gamerProfileId: string }): Promise<void> {
     const session = await this.repo.findActiveByGamer(event.gamerProfileId);
-    if (!session) return;
-    await this.runoutTimer.scheduleOrReschedule({
-      sessionId: session.id,
-      gamerProfileId: event.gamerProfileId,
-      machineId: session.reservation.machineId,
-      branchId: session.reservation.machine.branchId,
-      serialNumber: session.reservation.machine.serialNumber,
-      rateCentsPerMinute: session.rateCentsPerMinute,
-    });
+    if (session) {
+      await this.runoutTimer.scheduleOrReschedule({
+        sessionId: session.id,
+        gamerProfileId: event.gamerProfileId,
+        machineId: session.reservation.machineId,
+        branchId: session.reservation.machine.branchId,
+        serialNumber: session.reservation.machine.serialNumber,
+        rateCentsPerMinute: session.rateCentsPerMinute,
+      });
+      return;
+    }
+
+    const now = new Date();
+    const paused = await this.repo.findPausedByGamer(event.gamerProfileId, RUNOUT_LOCK, now);
+    if (!paused || !(await this.coversMinimumPlay(event.gamerProfileId, paused.rateCentsPerMinute ?? 0))) return;
+    await this.commands.issueSessionUnlock(paused.reservation.machineId, { sessionId: paused.id, ...this.leaseFor(paused, now) }, 'topup');
+  }
+
+  /** Free play always does; paid play needs the balance for the minimum play time (at least a minute). */
+  private async coversMinimumPlay(gamerProfileId: string, centsPerMinute: number): Promise<boolean> {
+    if (centsPerMinute <= 0) return true;
+    const { balance } = await this.wallet.getWalletForGamer(gamerProfileId);
+    return balance >= centsPerMinute * Math.max(this.minPlayMinutes, 1);
   }
 
   /**
@@ -393,12 +430,19 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
 
     if (totalCents > 0) {
       try {
-        await this.wallet.debit(session.reservation.gamerProfileId, {
+        // The play already happened: take what the wallet holds rather than
+        // nothing, and leave the rest on the bill for the desk.
+        const charged = await this.wallet.debitUpTo(session.reservation.gamerProfileId, {
           amount: totalCents,
           type: 'PAYMENT',
           sessionId: session.id,
           idempotencyKey: `session-settlement:${session.id}`,
         });
+        breakdown.chargedCents = charged;
+        if (charged < totalCents) {
+          breakdown.shortfallCents = totalCents - charged;
+          this.logger.warn(`session ${session.id} settled ${totalCents - charged} short: the wallet held ${charged}`);
+        }
       } catch (err) {
         this.logger.error(`settlement debit failed for session ${session.id}: ${(err as Error).message}`);
         breakdown.debitFailed = true; // session still closes; staff reconciles from the flagged breakdown
@@ -415,12 +459,26 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
     });
   }
 
-  /** paygRate is cents/hour (Pricing convention); membership discount applies before converting to cents/minute. */
-  private async computeRate(branchId: string, gamerProfileId: string): Promise<{ centsPerMinute: number; membershipId: string | null }> {
-    const { paygRate } = await this.pricing.getRatesForBranch(branchId);
-    const discount = await this.membership.getActiveDiscountForGamer(gamerProfileId);
-    const discountPercent = discount ? Number(discount.discountPercent) : 0;
-    const centsPerHour = Math.round(paygRate * (1 - discountPercent / 100));
-    return { centsPerMinute: Math.max(Math.round(centsPerHour / 60), 0), membershipId: discount?.membershipId ?? null };
+  /**
+   * Rates are per hour (Pricing convention): paygRate for Play now, bookingRate
+   * for a booking made ahead. The better of the membership discount and a
+   * pass window discount (at the time play starts) applies — they don't stack —
+   * before converting to per minute. The rate is fixed for the session.
+   */
+  private async computeRate(reservation: StartableReservation, now: Date): Promise<{ centsPerMinute: number; membershipId: string | null }> {
+    const { paygRate, bookingRate } = await this.pricing.getRatesForBranch(reservation.machine.branchId);
+    const playStarts = new Date(Math.max(now.getTime(), reservation.startTime.getTime()));
+    const [membership, pass] = await Promise.all([
+      this.membership.getActiveDiscountForGamer(reservation.gamerProfileId),
+      this.subscriptions.getWindowDiscountForGamer(reservation.gamerProfileId, playStarts),
+    ]);
+    const membershipPercent = membership ? Number(membership.discountPercent) : 0;
+    const passPercent = pass?.discountPercent ?? 0;
+    const discountPercent = Math.max(membershipPercent, passPercent);
+    const centsPerHour = Math.round((reservation.isWalkIn ? paygRate : bookingRate) * (1 - discountPercent / 100));
+    return {
+      centsPerMinute: Math.max(Math.round(centsPerHour / 60), 0),
+      membershipId: membership && membershipPercent >= passPercent ? membership.membershipId : null,
+    };
   }
 }

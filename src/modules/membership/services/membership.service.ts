@@ -9,6 +9,7 @@ import {
 import { Prisma } from '../../../generated/prisma/index.js';
 
 import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
+import { dinarsToMillimes } from '../../../common/utils/money.js';
 import { WalletService } from '../../wallet/services/wallet.service.js';
 import { MembershipRepository } from '../repository/membership.repository.js';
 import type {
@@ -77,6 +78,7 @@ export class MembershipService {
 
   async listMine(caller: AccessTokenPayload) {
     const gamerProfileId = await this.resolveGamerProfileId(caller);
+    await this.memberships.expireLapsed(gamerProfileId, startOfUtcDay(new Date()));
     return this.memberships.listForGamer(gamerProfileId);
   }
 
@@ -115,7 +117,7 @@ export class MembershipService {
       throw alreadyActive();
     }
 
-    const price = Math.round(Number(plan.price) * 100);
+    const price = dinarsToMillimes(plan.price);
     const ledgerKey = `membership:${key ?? randomUUID()}`;
     if (price > 0) {
       await this.wallet.debit(gamerProfileId, {
@@ -152,10 +154,25 @@ export class MembershipService {
     }
   }
 
-  /** Internal accessor: the gamer's active membership discount, if any. */
+  /** Internal accessor: the gamer's active membership discount, if any. A lapsed membership gives none. */
   async getActiveDiscountForGamer(gamerProfileId: string): Promise<{ membershipId: string; discountPercent: Prisma.Decimal } | null> {
-    const membership = await this.memberships.findActiveForGamer(gamerProfileId);
+    const membership = await this.findCurrent(gamerProfileId);
     return membership ? { membershipId: membership.id, discountPercent: membership.discountPercentSnapshot } : null;
+  }
+
+  /**
+   * Internal accessor: how many days ahead the gamer may book, from their
+   * membership plan. No membership books like the free tier.
+   */
+  async getBookingAdvanceDays(gamerProfileId: string): Promise<number> {
+    const membership = await this.findCurrent(gamerProfileId);
+    return membership?.membershipPlan.bookingAdvanceDays ?? 0;
+  }
+
+  /** The ACTIVE membership, once any whose end date passed has been expired. */
+  private async findCurrent(gamerProfileId: string) {
+    await this.memberships.expireLapsed(gamerProfileId, startOfUtcDay(new Date()));
+    return this.memberships.findActiveForGamer(gamerProfileId);
   }
 
 

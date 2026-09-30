@@ -69,6 +69,7 @@ export class MembershipRepository extends BaseRepository {
   findActiveForGamer(gamerProfileId: string) {
     return this.prisma.membership.findFirst({
       where: { gamerProfileId, status: 'ACTIVE' },
+      include: { membershipPlan: { select: { bookingAdvanceDays: true } } },
     });
   }
 

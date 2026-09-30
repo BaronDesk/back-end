@@ -33,12 +33,14 @@ describe('session billing (e2e)', () => {
 
   const as = (token: string) => ({ authorization: `Bearer ${token}` });
 
-  async function createGamer(): Promise<{ username: string; profileId: string; token: string }> {
+  /** A gamer with `balance` in the wallet: by default enough for the minimum play time a session needs. */
+  async function createGamer(balance = 10_000): Promise<{ username: string; profileId: string; token: string }> {
     const username = `sb-gamer-${randomUUID()}`;
     usernames.push(username);
     await app.inject({ method: 'POST', url: '/users', payload: { username, password } });
     const login = await app.inject({ method: 'POST', url: '/auth/login', payload: { username, password } });
     const user = await prisma.user.findUniqueOrThrow({ where: { username }, include: { gamerProfile: true } });
+    if (balance > 0) await creditWallet(user.gamerProfile!.id, balance);
     return { username, profileId: user.gamerProfile!.id, token: login.json().accessToken };
   }
 
@@ -48,11 +50,12 @@ describe('session billing (e2e)', () => {
     });
   }
 
+  /** A Play now booking starting now (walk-in rate), unless overridden. */
   async function createConfirmedReservation(gamerProfileId: string, machineId: string, overrides: Record<string, unknown> = {}) {
     const startTime = new Date();
     const endTime = new Date(startTime.getTime() + 60 * 60_000);
     return prisma.reservation.create({
-      data: { gamerProfileId, machineId, startTime, endTime, status: 'CONFIRMED', ...overrides },
+      data: { gamerProfileId, machineId, startTime, endTime, status: 'CONFIRMED', isWalkIn: true, ...overrides },
     });
   }
 
@@ -340,13 +343,28 @@ describe('session billing (e2e)', () => {
     agent.socket.close();
   });
 
-  it('still completes the session, flagged, when settlement cannot cover the metered amount', async () => {
-    const gamer = await createGamer(); // zero balance
+  it('refuses a PIN when the balance does not cover the minimum play time', async () => {
+    const gamer = await createGamer(0);
+    const machine = await createMachine();
+    const reservation = await createConfirmedReservation(gamer.profileId, machine.id);
+    const agent = await connectAgent(machine);
+
+    const res = await start(reservation.id);
+    expect(res.statusCode).toBe(409);
+    expect(res.json().code).toBe('INSUFFICIENT_FUNDS');
+    agent.socket.close();
+  });
+
+  it('charges what the wallet holds when the bill is bigger, and records the shortfall', async () => {
+    const gamer = await createGamer();
     const machine = await createMachine();
     const reservation = await createConfirmedReservation(gamer.profileId, machine.id);
     const agent = await connectAgent(machine);
 
     const sessionId = await startAndLogIn(agent, reservation.id);
+    // The wallet empties while the gamer plays (e.g. a refund reversed at the desk).
+    const all = await walletBalance(gamer.profileId);
+    await app.inject({ method: 'POST', url: `/wallets/${gamer.profileId}/debit`, headers: as(adminToken), payload: { amount: all - 1 } });
     await new Promise((r) => setTimeout(r, 1100));
 
     await end(sessionId);
@@ -354,7 +372,9 @@ describe('session billing (e2e)', () => {
     agent.send('heartbeat', { locked: true, sessionId: null });
 
     await vi.waitFor(async () => expect((await get(sessionId)).json().status).toBe('COMPLETED'));
-    expect((await get(sessionId)).json().billingBreakdown).toMatchObject({ debitFailed: true });
+    const breakdown = (await get(sessionId)).json().billingBreakdown;
+    expect(breakdown.totalCents).toBeGreaterThan(1);
+    expect(breakdown).toMatchObject({ chargedCents: 1, shortfallCents: breakdown.totalCents - 1 });
     expect(await walletBalance(gamer.profileId)).toBe(0);
 
     agent.socket.close();

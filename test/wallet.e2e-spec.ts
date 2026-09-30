@@ -13,10 +13,13 @@ describe('wallet ledger (e2e)', () => {
   let gamerProfileId: string;
   let gamerToken: string;
   let adminToken: string;
+  let employeeToken: string;
+  let branchId: string;
 
   const password = 'super-secret-1';
   const gamerUsername = `gamer-${randomUUID()}`;
   const adminUsername = `admin-${randomUUID()}`;
+  const employeeUsername = `employee-${randomUUID()}`;
 
   beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -31,6 +34,11 @@ describe('wallet ledger (e2e)', () => {
 
     const passwordHash = await hash(password);
     await prisma.user.create({ data: { username: adminUsername, passwordHash, role: 'ADMIN' } });
+    branchId = (await prisma.branch.create({ data: { name: `wallet-${randomUUID()}`, location: 'test' } })).id;
+    await prisma.user.create({
+      data: { username: employeeUsername, passwordHash, role: 'EMPLOYEE', employeeProfile: { create: { managedBranchId: branchId, hireDate: new Date() } } },
+    });
+    employeeToken = (await app.inject({ method: 'POST', url: '/auth/login', payload: { username: employeeUsername, password } })).json().accessToken;
 
     await app.inject({ method: 'POST', url: '/users', payload: { username: gamerUsername, password } });
 
@@ -56,7 +64,8 @@ describe('wallet ledger (e2e)', () => {
   }, 30_000);
 
   afterAll(async () => {
-    await prisma.user.deleteMany({ where: { username: { in: [gamerUsername, adminUsername] } } });
+    await prisma.user.deleteMany({ where: { username: { in: [gamerUsername, adminUsername, employeeUsername] } } });
+    await prisma.branch.deleteMany({ where: { id: branchId } });
     await app.close();
   });
 
@@ -197,6 +206,25 @@ describe('wallet ledger (e2e)', () => {
       headers: { authorization: `Bearer ${adminToken}` },
     });
     expect(after.json().balance).toBe(balance - amount);
+  });
+
+  it('lets any staff top up, but keeps refunds, adjustments and debits to managers and up', async () => {
+    const post = (path: string, payload: object) =>
+      app.inject({ method: 'POST', url: `/wallets/${gamerProfileId}/${path}`, headers: { authorization: `Bearer ${employeeToken}` }, payload });
+    expect((await post('credit', { amount: 100 })).statusCode).toBe(201);
+    expect((await post('credit', { amount: 100, type: 'REFUND' })).statusCode).toBe(403);
+    expect((await post('credit', { amount: 100, type: 'ADJUSTMENT' })).statusCode).toBe(403);
+    expect((await post('debit', { amount: 100 })).statusCode).toBe(403);
+  });
+
+  it('refuses an entry type that runs the wrong way', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: `/wallets/${gamerProfileId}/credit`,
+      headers: { authorization: `Bearer ${adminToken}` },
+      payload: { amount: 100, type: 'PAYMENT' },
+    });
+    expect(res.statusCode).toBe(400);
   });
 
   it('lists posted entries newest-first', async () => {

@@ -53,7 +53,7 @@ describe('MembershipService.purchase', () => {
     });
 
     expect(wallet.debit).toHaveBeenCalledWith('gamer-1', {
-      amount: 1250,
+      amount: 12500,
       type: 'PAYMENT',
       idempotencyKey: 'membership:purchase-123',
     });
@@ -118,7 +118,7 @@ describe('MembershipService.purchase', () => {
       service.purchase(caller, 'plan-1', { idempotencyKey: 'k1' }),
     ).rejects.toBe(boom);
     expect(wallet.credit).toHaveBeenCalledWith('gamer-1', {
-      amount: 1250,
+      amount: 12500,
       type: 'REFUND',
       idempotencyKey: 'membership:k1:refund',
     });
@@ -157,12 +157,12 @@ describe('MembershipService.purchase', () => {
   });
 });
 
-describe('MembershipService.getActiveDiscountForGamer', () => {
-  let repository: { findActiveForGamer: ReturnType<typeof vi.fn> };
+describe('MembershipService.getActiveDiscountForGamer / getBookingAdvanceDays', () => {
+  let repository: { findActiveForGamer: ReturnType<typeof vi.fn>; expireLapsed: ReturnType<typeof vi.fn> };
   let service: MembershipService;
 
   beforeEach(() => {
-    repository = { findActiveForGamer: vi.fn() };
+    repository = { findActiveForGamer: vi.fn(), expireLapsed: vi.fn().mockResolvedValue({ count: 0 }) };
     service = new MembershipService(repository as any, {} as any);
   });
 
@@ -170,6 +170,22 @@ describe('MembershipService.getActiveDiscountForGamer', () => {
     repository.findActiveForGamer.mockResolvedValue(null);
     await expect(service.getActiveDiscountForGamer('gamer-1')).resolves.toBeNull();
     expect(repository.findActiveForGamer).toHaveBeenCalledWith('gamer-1');
+  });
+
+  it('expires lapsed memberships (end date before today) before looking one up, so they give no discount', async () => {
+    repository.findActiveForGamer.mockResolvedValue(null);
+    await service.getActiveDiscountForGamer('gamer-1');
+    const [gamer, today] = repository.expireLapsed.mock.calls[0];
+    expect(gamer).toBe('gamer-1');
+    expect(today.toISOString()).toMatch(/T00:00:00\.000Z$/);
+    expect(repository.expireLapsed.mock.invocationCallOrder[0]).toBeLessThan(repository.findActiveForGamer.mock.invocationCallOrder[0]);
+  });
+
+  it("books as far ahead as the plan allows, 0 days without a membership", async () => {
+    repository.findActiveForGamer.mockResolvedValueOnce({ id: 'm', membershipPlan: { bookingAdvanceDays: 7 } });
+    await expect(service.getBookingAdvanceDays('gamer-1')).resolves.toBe(7);
+    repository.findActiveForGamer.mockResolvedValueOnce(null);
+    await expect(service.getBookingAdvanceDays('gamer-1')).resolves.toBe(0);
   });
 
   it('returns the membership id and its snapshotted discount when one is active', async () => {

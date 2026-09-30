@@ -7,15 +7,17 @@ const benefitWindowSchema = z.object({
   endTime: timeSchema,
   discountPercent: z.number().min(0).max(100),
 });
+export type BenefitWindow = z.infer<typeof benefitWindowSchema>;
+
+/** A pass's benefits, as plans store them and purchases snapshot them. */
+export const benefitsSchema = z.object({ windows: z.array(benefitWindowSchema).max(50) });
 
 export const idParamSchema = z.string().uuid();
 export const createSubscriptionPlanSchema = z.object({
   name: z.string().trim().min(1).max(100),
   price: z.number().finite().min(0).max(99_999_999.99),
   durationDays: z.number().int().positive().max(3650),
-  benefits: z
-    .object({ windows: z.array(benefitWindowSchema).max(50) })
-    .strict(),
+  benefits: benefitsSchema.strict(),
 });
 export type CreateSubscriptionPlanDto = z.infer<
   typeof createSubscriptionPlanSchema

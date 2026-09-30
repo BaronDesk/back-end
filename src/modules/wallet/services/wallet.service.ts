@@ -76,6 +76,24 @@ export class WalletService {
     return toPublicEntry(entry);
   }
 
+  /**
+   * Takes up to dto.amount: all of it when the balance covers it, else what
+   * the wallet holds. Resolves to the amount actually taken (0 on an empty
+   * wallet). For bills already incurred, like a finished session.
+   */
+  async debitUpTo(gamerProfileId: string, dto: DebitDto): Promise<number> {
+    const wallet = await this.getOrCreateWallet(gamerProfileId);
+    const entry = await this.wallets.postCappedDebit({
+      walletId: wallet.id,
+      maxAmount: dto.amount,
+      amount: -dto.amount,
+      type: dto.type ?? 'DEBIT',
+      sessionId: dto.sessionId,
+      idempotencyKey: dto.idempotencyKey,
+    });
+    return entry ? -entry.amount : 0;
+  }
+
   private async resolveOwnGamerProfileId(caller: AccessTokenPayload): Promise<string> {
     const gamerProfileId = await this.wallets.findGamerProfileIdByUserId(caller.sub);
     if (!gamerProfileId) {

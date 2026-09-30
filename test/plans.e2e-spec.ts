@@ -15,6 +15,7 @@ describe('membership + subscription purchase (e2e)', () => {
   let adminToken: string;
   let membershipPlanId: string;
   let subscriptionPlanId: string;
+  let otherSubscriptionPlanId: string;
 
   const password = 'super-secret-1';
   const gamerUsername = `gamer-${randomUUID()}`;
@@ -76,7 +77,7 @@ describe('membership + subscription purchase (e2e)', () => {
       method: 'POST',
       url: `/wallets/${gamerProfileId}/credit`,
       headers: as(adminToken),
-      payload: { amount: 5000 },
+      payload: { amount: 50_000 }, // 50 DT
     });
   }, 30_000);
 
@@ -84,7 +85,7 @@ describe('membership + subscription purchase (e2e)', () => {
     await prisma.membership.deleteMany({ where: { gamerProfileId } });
     await prisma.subscription.deleteMany({ where: { gamerProfileId } });
     await prisma.membershipPlan.deleteMany({ where: { id: membershipPlanId } });
-    await prisma.subscriptionPlan.deleteMany({ where: { id: subscriptionPlanId } });
+    await prisma.subscriptionPlan.deleteMany({ where: { id: { in: [subscriptionPlanId, otherSubscriptionPlanId].filter(Boolean) } } });
     await prisma.user.deleteMany({ where: { username: { in: [gamerUsername, adminUsername] } } });
     await app.close();
   });
@@ -100,12 +101,12 @@ describe('membership + subscription purchase (e2e)', () => {
 
     const first = await purchase();
     expect(first.statusCode).toBe(201);
-    expect(await balance()).toBe(4000);
+    expect(await balance()).toBe(40_000); // a 10 DT plan costs 10 000 millimes
 
     const replay = await purchase();
     expect(replay.statusCode).toBe(201);
     expect(replay.json().id).toBe(first.json().id);
-    expect(await balance()).toBe(4000);
+    expect(await balance()).toBe(40_000);
   });
 
   it('rejects a second active membership with MEMBERSHIP_ALREADY_ACTIVE and no charge', async () => {
@@ -117,7 +118,7 @@ describe('membership + subscription purchase (e2e)', () => {
     });
     expect(res.statusCode).toBe(409);
     expect(res.json()).toMatchObject({ code: 'MEMBERSHIP_ALREADY_ACTIVE' });
-    expect(await balance()).toBe(4000);
+    expect(await balance()).toBe(40_000);
   });
 
   it('enforces one ACTIVE membership per gamer at the database level', async () => {
@@ -135,17 +136,21 @@ describe('membership + subscription purchase (e2e)', () => {
     ).rejects.toMatchObject({ code: 'P2002' });
   });
 
-  it('allows several subscriptions for the same gamer', async () => {
-    for (const key of ['s-1', 's-2']) {
-      const res = await app.inject({
+  it('sells a pass once: the same pass again is refused while it is active, with no charge', async () => {
+    const buy = (key: string) =>
+      app.inject({
         method: 'POST',
         url: `/subscription-plans/${subscriptionPlanId}/purchase`,
         headers: as(gamerToken),
         payload: { idempotencyKey: key },
       });
-      expect(res.statusCode).toBe(201);
-    }
-    expect(await balance()).toBe(3000);
+    expect((await buy('s-1')).statusCode).toBe(201);
+    expect(await balance()).toBe(35_000);
+
+    const again = await buy('s-2');
+    expect(again.statusCode).toBe(409);
+    expect(again.json()).toMatchObject({ code: 'SUBSCRIPTION_ALREADY_ACTIVE' });
+    expect(await balance()).toBe(35_000);
   });
 
   it('returns INSUFFICIENT_FUNDS and creates nothing when the wallet cannot cover the price', async () => {
@@ -153,17 +158,24 @@ describe('membership + subscription purchase (e2e)', () => {
       method: 'POST',
       url: `/wallets/${gamerProfileId}/debit`,
       headers: as(adminToken),
-      payload: { amount: 3000 },
+      payload: { amount: 35_000 },
     });
+    const other = await app.inject({
+      method: 'POST',
+      url: '/subscription-plans',
+      headers: as(adminToken),
+      payload: { name: `weekends-${suffix}`, price: 5, durationDays: 7, benefits: { windows: [] } },
+    });
+    otherSubscriptionPlanId = other.json().id;
 
     const res = await app.inject({
       method: 'POST',
-      url: `/subscription-plans/${subscriptionPlanId}/purchase`,
+      url: `/subscription-plans/${otherSubscriptionPlanId}/purchase`,
       headers: as(gamerToken),
       payload: { idempotencyKey: 's-3' },
     });
     expect(res.statusCode).toBe(409);
     expect(res.json()).toMatchObject({ code: 'INSUFFICIENT_FUNDS' });
-    expect(await prisma.subscription.count({ where: { gamerProfileId } })).toBe(2);
+    expect(await prisma.subscription.count({ where: { gamerProfileId } })).toBe(1);
   });
 });

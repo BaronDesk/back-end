@@ -56,6 +56,14 @@ export class SessionsRepository extends BaseRepository {
     });
   }
 
+  /** The gamer's PAUSED session the backend locked for `lockReason`, still inside its window. */
+  findPausedByGamer(gamerProfileId: string, lockReason: string, now: Date) {
+    return this.prisma.session.findFirst({
+      where: { status: 'PAUSED', lockReason, endTime: { gt: now }, reservation: { gamerProfileId } },
+      include: { reservation: { select: { machineId: true } } },
+    });
+  }
+
   create(data: CreateSessionInput) {
     return this.prisma.session.create({ data: { ...data, status: 'PENDING' } });
   }

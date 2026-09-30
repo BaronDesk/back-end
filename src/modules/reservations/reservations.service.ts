@@ -7,9 +7,12 @@ import {
 } from '@nestjs/common';
 
 import type { AccessTokenPayload } from '../../common/types/jwt-payload.js';
+import { MembershipService } from '../membership/services/membership.service.js';
 import { SessionsService } from '../session-billing/services/sessions.service.js';
 import { ReservationsRepository } from './reservations.repository.js';
 import type { CreateReservationDto, WalkInDto } from './reservations.schemas.js';
+
+const DAY_MS = 24 * 60 * 60_000;
 
 @Injectable()
 export class ReservationsService {
@@ -18,6 +21,7 @@ export class ReservationsService {
   constructor(
     private readonly reservations: ReservationsRepository,
     private readonly sessions: SessionsService,
+    private readonly membership: MembershipService,
   ) {}
 
   async list(caller: AccessTokenPayload) {
@@ -27,8 +31,17 @@ export class ReservationsService {
 
   async create(caller: AccessTokenPayload, input: CreateReservationDto) {
     const gamer = await this.getGamer(caller.sub);
-    if (input.startTime <= new Date()) {
+    const now = Date.now();
+    if (input.startTime.getTime() <= now) {
       throw new BadRequestException({ code: 'INVALID_RESERVATION_TIME', error: 'reservation must start in the future' });
+    }
+    // The membership plan sets how far ahead a gamer may book; everyone may book the next 24 hours.
+    const advanceDays = Math.max(await this.membership.getBookingAdvanceDays(gamer.id), 1);
+    if (input.startTime.getTime() > now + advanceDays * DAY_MS) {
+      throw new BadRequestException({
+        code: 'BOOKING_TOO_FAR_AHEAD',
+        error: `your plan lets you book up to ${advanceDays} day(s) ahead`,
+      });
     }
     return this.unwrap(await this.reservations.createIfAvailable(gamer.id, input));
   }
@@ -87,6 +100,9 @@ export class ReservationsService {
     }
     if (result.kind === 'slot_taken') {
       throw new ConflictException({ code: 'RESERVATION_SLOT_TAKEN', error: 'machine is already reserved for this time' });
+    }
+    if (result.kind === 'gamer_busy') {
+      throw new ConflictException({ code: 'GAMER_ALREADY_BOOKED', error: 'you already have a booking at this time' });
     }
     return result.reservation;
   }

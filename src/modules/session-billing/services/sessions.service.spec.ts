@@ -24,7 +24,7 @@ function window() {
 
 function reservation(overrides: Record<string, unknown> = {}) {
   return {
-    id: 'res-1', gamerProfileId: 'g1', machineId: 'm1', status: 'CONFIRMED', ...window(),
+    id: 'res-1', gamerProfileId: 'g1', machineId: 'm1', status: 'CONFIRMED', isWalkIn: true, ...window(),
     machine: { id: 'm1', branchId: 'b1', serialNumber: 'SN-1' },
     ...overrides,
   };
@@ -51,7 +51,8 @@ describe('SessionsService', () => {
   let presence: { statusChanges: Subject<any>; sessionEnded: Subject<any>; isOnline: ReturnType<typeof vi.fn> };
   let pricing: { getRatesForBranch: ReturnType<typeof vi.fn> };
   let membership: { getActiveDiscountForGamer: ReturnType<typeof vi.fn> };
-  let wallet: { debit: ReturnType<typeof vi.fn> };
+  let subscriptions: { getWindowDiscountForGamer: ReturnType<typeof vi.fn> };
+  let wallet: { debitUpTo: ReturnType<typeof vi.fn>; getWalletForGamer: ReturnType<typeof vi.fn>; credited: Subject<any> };
   let commands: Record<string, ReturnType<typeof vi.fn>>;
   let runoutTimer: Record<string, ReturnType<typeof vi.fn>>;
   let port: StationSessionPort;
@@ -70,6 +71,8 @@ describe('SessionsService', () => {
       claimPinAttempt: vi.fn(async () => true),
       spendPin: vi.fn(async () => true),
       update: vi.fn(async (id, data) => sessionRow({ id, ...data })),
+      findPausedByGamer: vi.fn(async () => null),
+      findActiveByGamer: vi.fn(async () => null),
       activate: vi.fn(async () => undefined),
       complete: vi.fn(async () => undefined),
       findOverdueOpen: vi.fn(async () => []),
@@ -78,7 +81,12 @@ describe('SessionsService', () => {
     presence = { statusChanges: new Subject(), sessionEnded: new Subject(), isOnline: vi.fn(() => true) };
     pricing = { getRatesForBranch: vi.fn(async () => ({ paygRate: 6000, bookingRate: 9000 })) }; // 6000c/hr = 100c/min
     membership = { getActiveDiscountForGamer: vi.fn(async () => null) };
-    wallet = { debit: vi.fn(async () => ({ id: 'e1' })), credited: new Subject() };
+    subscriptions = { getWindowDiscountForGamer: vi.fn(async () => null) };
+    wallet = {
+      debitUpTo: vi.fn(async (_gamer: string, dto: { amount: number }) => dto.amount),
+      getWalletForGamer: vi.fn(async () => ({ balance: 100_000 })),
+      credited: new Subject(),
+    };
     commands = {
       issue: vi.fn(async () => ({})),
       issueSystemLock: vi.fn(async () => undefined),
@@ -92,7 +100,7 @@ describe('SessionsService', () => {
         ({ SESSION_LEASE_CAP_S: LEASE_CAP_S, SESSION_PIN_MAX_ATTEMPTS: MAX_ATTEMPTS, SESSION_PIN_TTL_S: 900 })[key],
     };
     service = new SessionsService(
-      repo as any, presence as any, pricing as any, membership as any, wallet as any, commands as any, runoutTimer as any, port, config as any,
+      repo as any, presence as any, pricing as any, membership as any, subscriptions as any, wallet as any, commands as any, runoutTimer as any, port, config as any,
     );
     service.onModuleInit();
   });
@@ -326,7 +334,7 @@ describe('SessionsService', () => {
         sessionRow({ status: 'ACTIVE', meteringStartedAt: new Date(endTime.getTime() - 10 * 60_000), endTime }),
       );
       await service.reconcile(STATION, { locked: false, sessionId: 's1' });
-      expect(wallet.debit).toHaveBeenCalledWith('g1', expect.objectContaining({ amount: 1000, sessionId: 's1' }));
+      expect(wallet.debitUpTo).toHaveBeenCalledWith('g1', expect.objectContaining({ amount: 1000, sessionId: 's1' }));
       expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED', meteredSeconds: 600 }));
       expect(commands.issueSystemEndSession).toHaveBeenCalledWith('m1', 'reservation_ended');
       expect(commands.issueSessionUnlock).not.toHaveBeenCalled();
@@ -336,7 +344,7 @@ describe('SessionsService', () => {
       repo.findForSettlement.mockResolvedValueOnce(sessionRow({ status: 'COMPLETED' }));
       await service.reconcile(STATION, { locked: false, sessionId: 's1' });
       expect(commands.issueSystemEndSession).toHaveBeenCalledWith('m1', 'session_closed');
-      expect(wallet.debit).not.toHaveBeenCalled();
+      expect(wallet.debitUpTo).not.toHaveBeenCalled();
       expect(commands.issueSessionUnlock).not.toHaveBeenCalled();
     });
 
@@ -384,12 +392,12 @@ describe('SessionsService', () => {
       presence.sessionEnded.next({ sessionId: 's1', endedAt: new Date().toISOString() });
       await flush();
       // 5 minutes active at 100c/min = 500c
-      expect(wallet.debit).toHaveBeenCalledWith('g1', expect.objectContaining({ amount: 500, sessionId: 's1' }));
+      expect(wallet.debitUpTo).toHaveBeenCalledWith('g1', expect.objectContaining({ amount: 500, sessionId: 's1' }));
       expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED', meteredSeconds: 300 }));
     });
 
     it('still completes the session, flagged, when the settlement debit fails', async () => {
-      wallet.debit.mockRejectedValueOnce(new ConflictException());
+      wallet.debitUpTo.mockRejectedValueOnce(new ConflictException());
       presence.sessionEnded.next({ sessionId: 's1', endedAt: new Date().toISOString() });
       await flush();
       expect(repo.complete).toHaveBeenCalledWith(
@@ -403,7 +411,7 @@ describe('SessionsService', () => {
       repo.findForSettlement.mockResolvedValueOnce(sessionRow({ status: 'COMPLETED' }));
       presence.sessionEnded.next({ sessionId: 's1', endedAt: new Date().toISOString() });
       await flush();
-      expect(wallet.debit).not.toHaveBeenCalled();
+      expect(wallet.debitUpTo).not.toHaveBeenCalled();
     });
 
     it('sweep: cancels a never-logged-in session past its window and marks no-shows', async () => {
@@ -413,7 +421,7 @@ describe('SessionsService', () => {
       await service.sweep();
       expect(repo.cancelPending).toHaveBeenCalledWith('p1');
       expect(repo.markNoShows).toHaveBeenCalledWith(expect.any(Date));
-      expect(wallet.debit).not.toHaveBeenCalled();
+      expect(wallet.debitUpTo).not.toHaveBeenCalled();
       expect(commands.issueSystemEndSession).not.toHaveBeenCalled();
     });
 
@@ -429,9 +437,81 @@ describe('SessionsService', () => {
     });
   });
 
-  it("lockForRunout issues a system LOCK for the session's station", async () => {
+  it("lockForRunout marks the session locked for funds and issues a system LOCK for its station", async () => {
     await service.lockForRunout('s1');
+    expect(repo.update).toHaveBeenCalledWith('s1', { lockReason: 'runout' });
     expect(commands.issueSystemLock).toHaveBeenCalledWith('m1', 'runout');
+  });
+
+  describe('pricing, funds and run-out', () => {
+    it('bills a booking made ahead at the booking rate, Play now at the walk-in rate', async () => {
+      repo.findReservationForStart.mockResolvedValueOnce(reservation({ isWalkIn: false }));
+      await service.start(caller(), 'res-1');
+      expect(repo.create.mock.calls[0][0].rateCentsPerMinute).toBe(150); // 9000/hr booking rate
+    });
+
+    it('applies the better of the membership and pass discounts, without stacking them', async () => {
+      membership.getActiveDiscountForGamer.mockResolvedValue({ membershipId: 'ms1', discountPercent: 10 });
+      subscriptions.getWindowDiscountForGamer.mockResolvedValueOnce({ subscriptionId: 'sub1', discountPercent: 100 });
+      await service.start(caller(), 'res-1');
+      expect(repo.create.mock.calls[0][0]).toMatchObject({ rateCentsPerMinute: 0, appliedMembershipId: null });
+
+      subscriptions.getWindowDiscountForGamer.mockResolvedValueOnce({ subscriptionId: 'sub1', discountPercent: 5 });
+      repo.findActiveForReservation.mockResolvedValueOnce(sessionRow({ id: 'old', pinExpiresAt: new Date(Date.now() - 1000) }));
+      await service.start(caller(), 'res-1');
+      expect(repo.create.mock.calls[1][0]).toMatchObject({ rateCentsPerMinute: 90, appliedMembershipId: 'ms1' });
+    });
+
+    it('refuses a PIN without the balance for the minimum play time, keeping any PIN already issued', async () => {
+      wallet.getWalletForGamer.mockResolvedValue({ balance: 499 }); // 5 min at 100/min = 500
+      repo.findActiveForReservation.mockResolvedValueOnce(sessionRow({ id: 'old', pinExpiresAt: new Date(Date.now() + 60_000) }));
+      await expect(service.checkIn('g1', 'res-1')).rejects.toMatchObject({ response: { code: 'INSUFFICIENT_FUNDS' } });
+      expect(repo.cancelPending).not.toHaveBeenCalled();
+      expect(repo.create).not.toHaveBeenCalled();
+    });
+
+    it('lets free play start with an empty wallet', async () => {
+      wallet.getWalletForGamer.mockResolvedValue({ balance: 0 });
+      subscriptions.getWindowDiscountForGamer.mockResolvedValueOnce({ subscriptionId: 'sub1', discountPercent: 100 });
+      await expect(service.checkIn('g1', 'res-1')).resolves.toMatchObject({ pin: expect.any(String) });
+    });
+
+    it('never issues a PIN earlier than 15 minutes before the booking, from the desk either', async () => {
+      const now = Date.now();
+      repo.findReservationForStart.mockResolvedValueOnce(reservation({ startTime: new Date(now + 2 * HOUR), endTime: new Date(now + 3 * HOUR) }));
+      await expect(service.start(caller(), 'res-1')).rejects.toMatchObject({ response: { code: 'RESERVATION_NOT_STARTED' } });
+    });
+
+    it('charges what the wallet holds when the bill is bigger, and records the shortfall', async () => {
+      wallet.debitUpTo.mockResolvedValueOnce(320);
+      presence.sessionEnded.next({ sessionId: 's1', endedAt: new Date().toISOString() });
+      await vi.waitFor(() => expect(repo.complete).toHaveBeenCalled());
+      expect(repo.complete.mock.calls[0][2].billingBreakdown).toMatchObject({ totalCents: 500, chargedCents: 320, shortfallCents: 180 });
+    });
+
+    it('resumes a session locked for funds once a top-up covers the minimum play time', async () => {
+      repo.findPausedByGamer.mockResolvedValue(sessionRow({ status: 'PAUSED', lockReason: 'runout', pinUsedAt: new Date() }));
+      wallet.credited.next({ gamerProfileId: 'g1' });
+      await vi.waitFor(() => expect(commands.issueSessionUnlock).toHaveBeenCalled());
+      expect(repo.findPausedByGamer).toHaveBeenCalledWith('g1', 'runout', expect.any(Date));
+      expect(commands.issueSessionUnlock).toHaveBeenCalledWith('m1', expect.objectContaining({ sessionId: 's1' }), 'topup');
+    });
+
+    it('keeps a session locked for funds locked when the top-up is still too small', async () => {
+      wallet.getWalletForGamer.mockResolvedValue({ balance: 100 });
+      repo.findPausedByGamer.mockResolvedValue(sessionRow({ status: 'PAUSED', lockReason: 'runout' }));
+      wallet.credited.next({ gamerProfileId: 'g1' });
+      await vi.waitFor(() => expect(wallet.getWalletForGamer).toHaveBeenCalled());
+      await flush();
+      expect(commands.issueSessionUnlock).not.toHaveBeenCalled();
+    });
+
+    it('clears the lock reason when the session runs again', async () => {
+      repo.findForSettlement.mockResolvedValueOnce(sessionRow({ status: 'PAUSED', lockReason: 'runout', pinUsedAt: new Date() }));
+      presence.statusChanges.next({ sessionId: 's1', locked: false, branchId: 'b1' });
+      await vi.waitFor(() => expect(repo.activate).toHaveBeenCalled());
+      expect(repo.activate.mock.calls[0][2]).toMatchObject({ status: 'ACTIVE', lockReason: null });
+    });
   });
 
   it('lockForRunout is a no-op for a session that is already closed', async () => {

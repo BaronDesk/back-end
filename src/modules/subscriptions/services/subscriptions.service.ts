@@ -6,25 +6,36 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { Prisma } from '../../../generated/prisma/index.js';
 
 import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
+import { dinarsToMillimes } from '../../../common/utils/money.js';
 import { WalletService } from '../../wallet/services/wallet.service.js';
 import { SubscriptionsRepository } from '../repository/subscriptions.repository.js';
-import type {
-  CreateSubscriptionPlanDto,
-  PurchaseSubscriptionDto,
-  UpdateSubscriptionPlanDto,
+import {
+  benefitsSchema,
+  type CreateSubscriptionPlanDto,
+  type PurchaseSubscriptionDto,
+  type UpdateSubscriptionPlanDto,
 } from '../schemas/subscription.schemas.js';
+import { inWindow, localClock } from '../util/benefit-window.js';
+
+const startOfUtcDay = (date: Date) =>
+  new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
 
 @Injectable()
 export class SubscriptionsService {
   private readonly logger = new Logger(SubscriptionsService.name);
+  private readonly timeZone: string;
 
   constructor(
     private readonly subscriptions: SubscriptionsRepository,
     private readonly wallet: WalletService,
-  ) {}
+    config: ConfigService,
+  ) {
+    this.timeZone = config.get<string>('BUSINESS_TIMEZONE') ?? 'Africa/Tunis';
+  }
 
   listPlans() {
     return this.subscriptions.listPlans();
@@ -55,9 +66,31 @@ export class SubscriptionsService {
   }
 
   async listMine(caller: AccessTokenPayload) {
-    return this.subscriptions.listForGamer(
-      await this.resolveGamerProfileId(caller),
-    );
+    const gamerProfileId = await this.resolveGamerProfileId(caller);
+    await this.subscriptions.expireLapsed(gamerProfileId, startOfUtcDay(new Date()));
+    return this.subscriptions.listForGamer(gamerProfileId);
+  }
+
+  /**
+   * Internal accessor: the best discount the gamer's active passes give at
+   * `at` (local business time), or null outside every window. Benefits not in
+   * the `windows` shape grant nothing.
+   */
+  async getWindowDiscountForGamer(gamerProfileId: string, at = new Date()): Promise<{ subscriptionId: string; discountPercent: number } | null> {
+    const today = startOfUtcDay(at);
+    await this.subscriptions.expireLapsed(gamerProfileId, today);
+    const clock = localClock(at, this.timeZone);
+    let best: { subscriptionId: string; discountPercent: number } | null = null;
+    for (const sub of await this.subscriptions.findActiveForGamer(gamerProfileId, today)) {
+      const benefits = benefitsSchema.safeParse(sub.benefitsSnapshot);
+      if (!benefits.success) continue;
+      for (const window of benefits.data.windows) {
+        if (inWindow(window, clock) && window.discountPercent > (best?.discountPercent ?? 0)) {
+          best = { subscriptionId: sub.id, discountPercent: window.discountPercent };
+        }
+      }
+    }
+    return best;
   }
 
   async purchase(
@@ -84,7 +117,14 @@ export class SubscriptionsService {
       });
     }
 
-    const price = Math.round(Number(plan.price) * 100);
+    const today = startOfUtcDay(new Date());
+    await this.subscriptions.expireLapsed(gamerProfileId, today);
+    const active = await this.subscriptions.findActiveForGamer(gamerProfileId, today);
+    if (active.some((s) => s.subscriptionPlanId === plan.id)) {
+      throw new ConflictException({ code: 'SUBSCRIPTION_ALREADY_ACTIVE', error: 'gamer already has this pass' });
+    }
+
+    const price = dinarsToMillimes(plan.price);
     const ledgerKey = `subscription:${key ?? randomUUID()}`;
     if (price > 0) {
       await this.wallet.debit(gamerProfileId, {

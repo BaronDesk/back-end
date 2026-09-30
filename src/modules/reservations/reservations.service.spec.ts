@@ -44,6 +44,24 @@ describe('ReservationsRepository.createIfAvailable', () => {
     expect(tx.reservation.findFirst.mock.calls[0][0].where.status).toEqual({ in: ['PENDING', 'CONFIRMED', 'ACTIVE'] });
     expect(tx.reservation.create).not.toHaveBeenCalled();
   });
+
+  it('needs the PC online for Play now only: a booking for later just needs it enrolled', async () => {
+    tx.machine.findUnique.mockResolvedValue({ id: MACHINE_ID, enrollmentStatus: 'ENROLLED', status: 'OFFLINE' });
+    expect(await repo.createIfAvailable('g1', slot(), true)).toEqual({ kind: 'machine_unavailable' });
+    const later = { ...slot(), startTime: new Date(Date.now() + 60 * 60_000), endTime: new Date(Date.now() + 2 * 60 * 60_000) };
+    expect(await repo.createIfAvailable('g1', later)).toMatchObject({ kind: 'created', reservation: { isWalkIn: false } });
+  });
+
+  it('marks Play now bookings as walk-ins', async () => {
+    expect(await repo.createIfAvailable('g1', slot(), true)).toMatchObject({ kind: 'created', reservation: { isWalkIn: true } });
+  });
+
+  it('refuses a booking that overlaps another one of the same gamer, on any PC', async () => {
+    tx.reservation.findFirst.mockResolvedValueOnce(null).mockResolvedValueOnce({ id: 'mine-elsewhere' });
+    expect(await repo.createIfAvailable('g1', slot(), true)).toEqual({ kind: 'gamer_busy' });
+    expect(tx.reservation.findFirst.mock.calls[1][0].where).toMatchObject({ gamerProfileId: 'g1' });
+    expect(tx.reservation.create).not.toHaveBeenCalled();
+  });
 });
 
 describe('ReservationsService.cancel', () => {
@@ -57,7 +75,7 @@ describe('ReservationsService.cancel', () => {
       findOwned: vi.fn(),
       cancel: vi.fn(async (id) => ({ id, status: 'CANCELLED' })),
     };
-    service = new ReservationsService(repo as any, {} as any);
+    service = new ReservationsService(repo as any, {} as any, {} as any);
   });
 
   it.each(['PENDING', 'CONFIRMED'])('cancels a %s reservation that has not started', async (status) => {
@@ -75,6 +93,7 @@ describe('ReservationsService.cancel', () => {
 describe('ReservationsService walk-in and check-in', () => {
   let repo: Record<string, ReturnType<typeof vi.fn>>;
   let sessions: { checkIn: ReturnType<typeof vi.fn> };
+  let membership: { getBookingAdvanceDays: ReturnType<typeof vi.fn> };
   let service: ReservationsService;
   const pin = { sessionId: 's1', reservationId: 'r1', pin: '123456', pinExpiresAt: new Date() };
 
@@ -84,7 +103,25 @@ describe('ReservationsService walk-in and check-in', () => {
       createIfAvailable: vi.fn(async () => ({ kind: 'created', reservation: { id: 'r1', status: 'CONFIRMED' } })),
     };
     sessions = { checkIn: vi.fn(async () => pin) };
-    service = new ReservationsService(repo as any, sessions as any);
+    membership = { getBookingAdvanceDays: vi.fn(async () => 0) };
+    service = new ReservationsService(repo as any, sessions as any, membership as any);
+  });
+
+  const inHours = (h: number) => new Date(Date.now() + h * 60 * 60_000);
+  const booking = (startHours: number) => ({ machineId: MACHINE_ID, startTime: inHours(startHours), endTime: inHours(startHours + 1) });
+
+  it('lets anyone book the next 24 hours, and further only as far as their plan allows', async () => {
+    await expect(service.create(GAMER, booking(20))).resolves.toMatchObject({ id: 'r1' });
+    await expect(service.create(GAMER, booking(30))).rejects.toMatchObject({ response: { code: 'BOOKING_TOO_FAR_AHEAD' } });
+
+    membership.getBookingAdvanceDays.mockResolvedValue(7);
+    await expect(service.create(GAMER, booking(6 * 24))).resolves.toMatchObject({ id: 'r1' });
+    await expect(service.create(GAMER, booking(8 * 24))).rejects.toMatchObject({ response: { code: 'BOOKING_TOO_FAR_AHEAD' } });
+  });
+
+  it('refuses a second booking overlapping one the gamer already holds', async () => {
+    repo.createIfAvailable.mockResolvedValueOnce({ kind: 'gamer_busy' });
+    await expect(service.create(GAMER, booking(2))).rejects.toMatchObject({ response: { code: 'GAMER_ALREADY_BOOKED' } });
   });
 
   it('gives the walk-in gamer their PIN in the same answer', async () => {

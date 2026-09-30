@@ -5,6 +5,7 @@ import { MembershipModule } from '../membership/membership.module.js';
 import { OpsModule } from '../ops/ops.module.js';
 import { PricingModule } from '../pricing/pricing.module.js';
 import { StationModule } from '../station/station.module.js';
+import { SubscriptionsModule } from '../subscriptions/subscriptions.module.js';
 import { WalletModule } from '../wallet/wallet.module.js';
 import { SessionsController } from './controllers/sessions.controller.js';
 import { SessionsRepository } from './repository/sessions.repository.js';
@@ -14,7 +15,7 @@ import { RunoutTimerProcessor } from './services/runout-timer.processor.js';
 import { RunoutTimerService } from './services/runout-timer.service.js';
 
 @Module({
-  imports: [StationModule, PricingModule, MembershipModule, WalletModule, OpsModule, BullModule.registerQueue({ name: RUNOUT_QUEUE })],
+  imports: [StationModule, PricingModule, MembershipModule, SubscriptionsModule, WalletModule, OpsModule, BullModule.registerQueue({ name: RUNOUT_QUEUE })],
   controllers: [SessionsController],
   providers: [SessionsRepository, SessionsService, RunoutTimerService, RunoutTimerProcessor],
   exports: [SessionsService],

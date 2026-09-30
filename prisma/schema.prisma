@@ -513,6 +513,8 @@ model Reservation {
   startTime      DateTime         @map("start_time") @db.Timestamptz
   endTime        DateTime         @map("end_time") @db.Timestamptz
   status         ReservationStatus @default(PENDING)
+  // Play now (starts at once, walk-in rate) vs booked ahead (booking rate).
+  isWalkIn       Boolean          @default(false) @map("is_walk_in")
   createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz
   updatedAt      DateTime         @updatedAt @map("updated_at") @db.Timestamptz
 
@@ -537,6 +539,8 @@ model Session {
   status              SessionStatus @default(PENDING)
   // --- billing (feat/session-billing) ---
   lockedAt            DateTime?     @map("locked_at") @db.Timestamptz
+  // Why the backend locked it ("runout" = out of funds: a top-up resumes it). Null otherwise.
+  lockReason          String?       @map("lock_reason")
   meteringStartedAt   DateTime?     @map("metering_started_at") @db.Timestamptz
   meteredSeconds      Int           @default(0) @map("metered_seconds")
   rateCentsPerMinute  Int?          @map("rate_cents_per_minute")

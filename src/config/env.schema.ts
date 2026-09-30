@@ -27,7 +27,12 @@ export const envSchema = z.object({
   // Final status of a command whose station has no live socket at send time.
   COMMAND_OFFLINE_STATUS: z.enum(['TIMEOUT', 'FAILED']).default('FAILED'),
   BULLMQ_PREFIX: z.string().min(1).default('bull'),
-  // Station login. The PIN staff hand the gamer is single-use, expires after
+  // Local time of the gaming centres: pass time windows ("00:00–06:00") are read in it.
+  BUSINESS_TIMEZONE: z.string().min(1).default('Africa/Tunis'),
+  // A session only starts with enough balance for this many minutes of play
+  // (else the runout timer would lock the station at once).
+  SESSION_MIN_PLAY_MINUTES: z.coerce.number().int().min(0).default(5),
+  // Station login. The PIN the gamer gets in the app is single-use, expires after
   // SESSION_PIN_TTL_S (never past the reservation window) and is burned after
   // SESSION_PIN_MAX_ATTEMPTS wrong entries.
   SESSION_PIN_TTL_S: z.coerce.number().int().positive().default(900),
