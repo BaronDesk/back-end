@@ -1,92 +1,94 @@
 # Station agent: physical test plan
 
 A manual test of the whole backend against a real BaronDesk desktop agent. You
-act as the server operator: you send commands and run the gamer flow with the
-station console, then check the effect on the gaming PC and in the backend.
+drive the backend with the **station console**, a command palette: log in as any
+profile, run any command it is allowed to run, in any order, and check the effect
+on the gaming PC and in the backend.
 
 | Part | Covers |
 |---|---|
-| §1 to §7 | The station itself: admission, presence, commands, catalog, fault injection, telemetry, dashboard feed |
-| §8 to §12 | The business flow: users and roles, pricing, wallet, membership and subscription plans, reservation, session with PIN, metering, end and billing settlement |
-| §13 | The full walkthrough in one run (start here for a quick smoke test) |
+| §0 | Setup, prerequisites, the console |
+| §1 | The palette: commands per profile, identity switching, observer |
+| §2 | Enrollment (real flow), admission cases |
+| §3 to §7 | The station: presence, commands, catalog, fault injection, telemetry and alerts |
+| §8 to §13 | Scoping and the business flow: users, pricing, wallet, plans, reservation, session with PIN, run-out, billing |
+| §14 | Full walkthrough in one run (start here for a quick smoke test) |
 
 Reference for the protocol and the error codes: [STATION_AGENT.md](STATION_AGENT.md).
+Enrollment design: [ENROLLMENT_HANDOFF.md](ENROLLMENT_HANDOFF.md).
 
 ---
 
 ## 0. Setup
 
-### 0.1 Backend
+### 0.1 Prerequisites
 
-```powershell
-npm run docker:dev          # stack up (backend, postgres, redis, caddy)
-npm run docker:logs         # keep this open in a second terminal
-```
+- Stack up, seeded: `npm run docker:dev`, then keep `npm run docker:logs` open in a second terminal.
+- Seed data the console relies on: the HQ admin (`hq-admin` / `change-me-immediately`, or
+  `SEED_ADMIN_USERNAME` / `SEED_ADMIN_PASSWORD`), the branches, their pricing, and the
+  seed staff and gamers (`manager.manar`, `employee.manar1`, `gamer.wood`, ... password
+  `password123`). Machines and tokens are **not** taken from the seed: they are created
+  through the enrollment API (§2).
+- **The desktop agent must run elevated (Run as administrator) or as the SYSTEM service.**
+  It stores its station credential with DPAPI in machine scope and cannot read it
+  otherwise: a non-elevated agent fails to load its credential and tries to enroll again.
+- Node 18+ on the machine that runs the console (it uses the built-in `fetch`).
+- The negative admission cases (§2.4) need Docker and the repo root as the working
+  directory: they run `psql` in the postgres container and read `JWT_ACCESS_SECRET`
+  from the backend container.
 
-The HQ admin comes from the seed (`hq-admin` / `change-me-immediately`, or
-`SEED_ADMIN_USERNAME` / `SEED_ADMIN_PASSWORD`).
-
-### 0.2 Station
-
-The real enrollment flow (`POST /enrollment/request`, admin approval) is not on
-this branch. The console stands in for it, like the old `scripts/node-monitor.ts`
-(`station-enroll`, `station-token`, `station-auth`): it writes the ENROLLED
-MACHINE row and mints the station JWT exactly as enrollment must
-([ENROLLMENT_HANDOFF.md §3](ENROLLMENT_HANDOFF.md#3-what-enrollment-must-produce)).
-
-1. Start the console (§0.3). With no station yet, it offers the enrollment menu.
-   Otherwise type `e`.
-2. `1` enroll a station: serial `STATION-DEV-01`, status `ENROLLED`, pick the branch
-   (it creates `Dev branch` if there is none). Answer `y` to mint the token.
-3. The console prints the token and the PowerShell lines to paste on the gaming PC
-   (`Agent__ServerUrl`, `Agent__SerialNumber`, `Agent__StationToken`, `dotnet run`).
-   Details: [STATION_AGENT.md §11](STATION_AGENT.md#11-connecting-a-real-agent-dev).
-4. Backend log must show `agent connected: STATION-DEV-01 ...` and
-   `served catalog to STATION-DEV-01`.
-
-The console needs Docker for this (it runs `psql` and reads `JWT_ACCESS_SECRET`
-from the backend container), so start it from the repo root.
-
-### 0.3 Station console
+### 0.2 Start the console
 
 ```powershell
 node scripts/station-console.mjs
 # optional
 $env:BASE_URL = "http://localhost:3000"
 $env:CONSOLE_USER = "hq-admin"; $env:CONSOLE_PASS = "change-me-immediately"
-$env:STATION_SERIAL = "STATION-DEV-01"
+$env:CONSOLE_USER = ""          # start logged out
 ```
 
-The menus follow the logged-in profile. Each item is shown only if the backend
-allows that role (`@RequireScope` on the route):
+The console logs in as `CONSOLE_USER`, then shows the palette. Type a number to run
+a command. Each command asks for its inputs (defaults in brackets, Enter keeps them),
+makes one call, and prints the request and the full response:
 
-| Profile (scope) | Sees |
+```text
+-> POST /sessions {"reservationId":"6c1f..."}  (hq-admin)
+<- 201
+{ "id": "...", "status": "PENDING", "rateCentsPerMinute": 100, "pin": "482193", ... }
+```
+
+The console holds no business logic. It never decides whether a call should work:
+the backend answers, and the console prints the answer.
+
+### 0.3 Top-level keys
+
+| Key | Action |
 |---|---|
-| GAMER (self) | Own profile, own wallet and ledger, plans (browse, buy, own membership / subscriptions), games (browse), raw request. No station, no feed |
-| EMPLOYEE (staff) | + station commands except SHUTDOWN, telemetry, alerts, live feed, register a gamer, wallets by id (credit, debit), pricing (read), reservations, sessions |
-| MANAGER (admin) | + SHUTDOWN, enrollment, game catalog management, plan management, pricing change, create EMPLOYEE and change roles to GAMER / EMPLOYEE in its own branch |
-| ADMIN (hq) | Everything, every branch, and can create MANAGER / grant ADMIN |
+| number | Run that command |
+| `h` or Enter | Show the palette |
+| `/text` | Palette filtered by text (for example `/wallet`) |
+| `l` | Login as: pick a saved identity, or log in as a new one |
+| `s` | Swap to the previous identity (one key) |
+| `o` | Observer on / off (`/dashboard-io`, §1.3) |
+| `t` | Show / hide `telemetry_update` frames in the observer |
+| `v` | Show / hide the commands above your scope (greyed, with "requires ...") |
+| `c` | Remembered ids (the prompt defaults) |
+| `r` | Raw request: any method, path, body, with the active token, no token, or a stand-in station token |
+| `q` | Quit |
 
-To check that the server itself refuses a hidden action (403), send it with
-raw request (`r`).
-
-For staff and above, the console logs in, connects to `/dashboard-io`, and prints live events for the
-selected station: `[station_status]`, `[command_update]`, `[catalog_status]`,
-`[alert]`, `[alert_resolved]` (`[telemetry_update]` is off by default, turn it on
-with `f`). After each command it waits for the final status and prints
-`=> <TYPE>: ACKED | NACKED | FAILED | TIMEOUT`.
-
-`ACKED` only means the agent accepted the command. Check the real effect on the
-PC and in the next `[station_status]` (lock, session and running game come from
-heartbeats and state reports).
+Ids from the last responses (station, branch, reservation, session, command, plan,
+gamerProfileId, enrollment token) become the defaults of the next prompts, so a
+flow runs with Enter most of the time. `c` lists them.
 
 ### 0.4 Useful SQL (`npm run db:psql`)
 
 ```sql
-SELECT id, serial_number, branch_id, enrollment_status, status, last_seen, ip_address FROM machines;
-SELECT type, status, attempts, nack_code, nack_reason, failure_reason, issued_at
-  FROM commands ORDER BY issued_at DESC LIMIT 10;
+SELECT id, serial_number, branch_id, enrollment_status, status, last_seen FROM machines ORDER BY created_at DESC;
+SELECT id, branch_id, machine_id, consumed_at, expires_at FROM enrollment_tokens ORDER BY created_at DESC LIMIT 5;
+SELECT type, status, attempts, nack_code, nack_reason, failure_reason, issued_at FROM commands ORDER BY issued_at DESC LIMIT 10;
 ```
+
+`enrollment_tokens` stores `token_hash` (sha256 hex of the token), never the token.
 
 ### 0.5 Result sheet
 
@@ -94,355 +96,458 @@ Mark each case **P** (pass) or **F** (fail) and note what you saw.
 
 ---
 
-## 1. Enrollment, connection and admission
+## 1. The palette
 
-### 1.a Automated admission cases (console `e`, `4`)
+### 1.1 Commands per profile
 
-Runs against `/agent-ws` and `GET /stations/me/games` and prints PASS/FAIL per
-line. It flips the row's `enrollment_status` and restores it at the end. It
-never handshakes with the real station's valid token, so the real agent stays
-connected, except while the row is not ENROLLED (it is refused and reconnects).
+The profile's role gives its scope: GAMER = self, EMPLOYEE = staff, MANAGER = admin,
+ADMIN = hq. The palette lists a command only when the scope meets the command's
+minimum (the `@RequireScope` of its route). Numbers never change between profiles.
+
+| Group | # | Command | Min |
+|---|---|---|---|
+| Secure Access | 1 | login as another profile | public |
+| | 2 | whoami `GET /auth/me` | self |
+| | 3 | refresh tokens `POST /auth/refresh` | self |
+| | 4 | logout `POST /auth/logout` | self |
+| | 5 | register a gamer `POST /users` | public |
+| | 6 | create EMPLOYEE / MANAGER `POST /employees` | admin |
+| | 7 | change role `PATCH /users/:id/role` | admin |
+| | 8 | get a user `GET /users/:id` | self |
+| Node Tracking | 9, 10 | list / get stations `GET /api/v1/stations[/:id]` | staff |
+| | 11, 12 | list / get machines `GET /machines[/:id]` | staff |
+| | 13 | same GET as every logged-in identity (branch scoping) | self |
+| Station Provisioning | 14 | mint one-time enrollment token `POST /machines/enrollment-tokens` | admin |
+| | 15 | stand-in: redeem a token `POST /enrollment/request` | public |
+| | 16, 17, 18 | approve / reject / revoke `POST /machines/:id/...` | admin |
+| | 19 | rotate credential `POST /machines/:id/rotate-token` | admin |
+| | 20 | stand-in: provision end to end | admin |
+| | 21 | stand-ins: list | public |
+| | 22 | negative admission cases (forgeries) | admin |
+| Games Catalog | 23 | list games `GET /api/v1/games` | self |
+| | 24, 25 | create / update game | admin |
+| | 26, 27 | attach / detach to branch | admin |
+| | 28, 29 | attach / detach to station | admin |
+| | 30 | station's games `GET /api/v1/stations/:id/games` | staff |
+| | 31 | agent catalog pull `GET /stations/me/games` | station token |
+| Remote Admin | 32 | send command `POST /api/v1/stations/:id/commands` | staff |
+| | 33, 34 | list / get commands | staff |
+| Telemetry & Anti-Theft | 35 | station telemetry | staff |
+| | 36, 37 | list / resolve alerts | staff |
+| Session & Financial Control | 38, 39, 40 | create (PIN) / get / end session | staff |
+| Electronic Wallet | 41, 42 | my wallet / my ledger | self |
+| | 43, 44 | wallet / ledger of a gamer | staff |
+| | 45, 46 | credit / debit | staff |
+| Subscription & Membership | 47, 53 | list membership / subscription plans | self |
+| | 48 to 50, 54 to 56 | create / update / delete plans | admin |
+| | 51, 57 | my memberships / my subscriptions | self |
+| | 52, 58 | buy a membership / subscription | self |
+| Advance Reservation | 59 to 62 | my reservations, book ahead, walk-in, cancel | self |
+| Multi-Agency & Pricing | 63 | branch pricing `GET /branches/:branchId/pricing` | staff |
+| | 64 | set branch pricing `PUT` | admin |
+
+What each profile sees:
+
+| Profile (scope) | Sees |
+|---|---|
+| Logged out | Login, register a gamer, stand-in redeem and list, agent catalog pull |
+| GAMER (self) | + whoami, refresh, logout, get user, games list, own wallet and ledger, plans (list, buy, own), reservations (book, walk-in, cancel) |
+| EMPLOYEE (staff) | + stations and machines, station games, commands, telemetry, alerts, sessions, wallets of gamers (credit, debit), branch pricing (read) |
+| MANAGER (admin) | + staff accounts and roles, enrollment tokens, approve / reject / revoke / rotate, admission cases, game catalog management, plan management, pricing change. Own branch only |
+| ADMIN (hq) | Everything, every branch |
+
+A command above your scope is hidden (`v` shows it greyed). Typing its number still
+works: the console asks for confirmation, sends it, and you see the server's
+401 / 403. Use this to prove the server enforces the scope, not only the palette.
+
+### 1.2 Identity switching
+
+One operator drives both sides. Typical setup:
+
+1. The console starts as `hq-admin`.
+2. `l`, `n`: log in as `gamer.wood` / `password123`. The gamer is now active.
+3. `s`: back to `hq-admin`. `s` again: back to the gamer.
+
+`l` lists every saved identity with its role, scope and branch. Tokens are refreshed
+on their own: a 401 on the active identity triggers one refresh (or a new login with
+the stored password) and a retry.
+
+Reservations are gamer calls (`/reservations` works on the caller's own gamer
+profile), sessions are staff calls: the session flow (§13) switches with `s`.
+
+### 1.3 Observer
+
+`o` connects to `/dashboard-io` with the active identity's token and prints every
+frame with a timestamp: `station_status`, `command_update`, `catalog_status`,
+`alert`, `alert_resolved`, `session_runout_warning`, and any other event.
+`telemetry_update` is hidden until you press `t`. The observer only prints; it
+never reacts to a frame.
+
+The observer keeps the identity it connected with. After a swap, press `o` twice to
+reconnect it as the new identity. A staff identity without a branch (hq) receives
+every branch; a branch user receives only its branch.
+
+---
+
+## 2. Enrollment and admission
+
+Enrollment is the real API. A station gets its credential in four steps:
+
+```text
+admin:  POST /machines/enrollment-tokens {branchId, ttlMinutes}  -> one-time token
+agent:  POST /enrollment/request (signed with its P-256 key)     -> PENDING, machine row created
+admin:  POST /machines/:id/approve                               -> ENROLLED
+agent:  POST /enrollment/request again (poll)                    -> ENROLLED + stationToken (JWT)
+```
+
+Every refusal of `/enrollment/request` is a **200** with
+`{"status":"REJECTED","reason":"..."}`; the backend log prints the reason
+(`enrollment request rejected: <REASON>`).
+
+### 2.1 Real agent
+
+| # | Action | Expected | P/F |
+|---|---|---|---|
+| 2.1 | As ADMIN or the branch MANAGER: `14` mint a token for the station's branch (`branchId`: `11` lists the branch ids seen) | Token printed, 43 characters | |
+| 2.2 | On the PC, start the agent **elevated** with this token | Backend log `enrollment request: PENDING machine <id> (serial <serial>)` | |
+| 2.3 | `11` with status `PENDING` | The new machine, with the PC's serial | |
+| 2.4 | `16` approve it | 2xx, `enrollmentStatus ENROLLED` | |
+| 2.5 | Wait for the agent's next poll | Log `enrollment request: ENROLLED ...`, then `agent connected`, `served catalog`. Observer: `[station_status] ONLINE`, then `[catalog_status]` | |
+| 2.6 | Restart the agent (elevated) | Connects with its stored credential, no new enrollment request | |
+| 2.7 | Restart the agent **not** elevated | It cannot read its DPAPI credential. Note what it does (expected: tries to enroll again, token consumed: `INVALID_ENROLLMENT_TOKEN`) | |
+| 2.8 | Give the agent a token cut by 1 character | `REJECTED`, `INVALID_ENROLLMENT_TOKEN` (or `INVALID_REQUEST` if under 20 characters) | |
+| 2.9 | Mint with `ttlMinutes 1`, wait 2 minutes, give it to the agent | `REJECTED`, `INVALID_ENROLLMENT_TOKEN` | |
+| 2.10 | Enroll, then `17` reject instead of approve | Agent's next poll: `REJECTED`, `ENROLLMENT_REJECTED`. Machine `DEACTIVATED` | |
+| 2.11 | `18` revoke an ENROLLED station, restart the agent | Close 1008 `station not enrolled`. Station stays OFFLINE | |
+| 2.12 | `19` rotate the credential of an ENROLLED station, give the rotation token to the agent | Agent redeems with a new key: `ENROLLED` with a new station token. Note whether the old station token still connects | |
+
+If the agent holds a station token for a machine that no longer exists (for example
+after `npm run db:reset`), the backend logs `no MACHINE row for station <id>` and
+the agent never enrolls again. Clear the agent's stored credential and enroll it
+with a new token.
+
+### 2.2 Stand-in agent
+
+The console can act as an agent without a PC: it generates a P-256 key, signs the
+canonical string exactly like the agent
+(`BARONDESK-ENROLL-V1\n<token>\n<serial>\n<mac>\n<ip>\n<publicKey>\n<signedAt>`,
+ECDSA-SHA256, DER, Base64) and redeems. Keys live only in the console process.
+
+| # | Action | Expected | P/F |
+|---|---|---|---|
+| 2.13 | `20` provision end to end, serial `STANDIN-...` | Mint 201, redeem `PENDING`, approve 2xx, redeem `ENROLLED` with `stationToken` | |
+| 2.14 | `21` list stand-ins | The serial, its machine id and its station token | |
+| 2.15 | `31` agent catalog pull with the stand-in | 200, the station's resolved catalog | |
+| 2.16 | `14` mint, `15` redeem twice without approving | `PENDING` both times, same `machineId` | |
+| 2.17 | `14` mint, `15` redeem it with the serial of an existing machine (for example seeded `MNR-PC-01`) | `REJECTED`, `SERIAL_NUMBER_TAKEN` | |
+| 2.18 | `15` redeem a token already consumed (after 2.13) | `REJECTED`, `INVALID_ENROLLMENT_TOKEN` | |
+| 2.19 | `19` rotate, then `15` redeem with the same serial and a new key pair (`y`) | `ENROLLED`, new station token | |
+
+The stand-in does not connect to `/agent-ws`: it stays OFFLINE, so commands and
+sessions need the real agent.
+
+### 2.3 Scope of enrollment
+
+| # | Action | Expected | P/F |
+|---|---|---|---|
+| 2.20 | As EMPLOYEE, `14` (send anyway) | 403 | |
+| 2.21 | As a MANAGER, `14` for another branch | 403 | |
+| 2.22 | As a MANAGER, `16` approve a machine of another branch | 403 | |
+
+### 2.4 Negative admission cases (forgeries)
+
+`22` runs against `/agent-ws` and `GET /stations/me/games` with a stand-in that has
+a station token (§2.2), and prints PASS/FAIL per line. **Cases b to e are
+forgeries**: station JWTs the console signs itself with `JWT_ACCESS_SECRET`
+(ghost machine, moved branch, expired) and direct `enrollment_status` writes
+through `psql`. Every forged step is printed in magenta and labelled. They exist only
+to prove the backend refuses them. The row's status is restored at the end. Run them
+on a stand-in, not on the real station.
 
 | Case | Checks | P/F |
 |---|---|---|
-| a | ENROLLED + valid token: socket stays open, catalog 200 | |
-| b | PENDING / INACTIVE / DEACTIVATED: socket closed 1008, catalog 403. Back to ENROLLED: open again | |
-| c | Valid signature, no MACHINE row: 1008 on upgrade and handshake, catalog 403, no row created | |
-| d | Token branch differs from the row: 1008 / 401. Handshake serial differs from the token: 1008 | |
-| e | No token, `?serialNumber=` or `x-station-serial` only, garbage, expired or user token: 401. No row auto-created | |
+| a | Real station token, ENROLLED: socket stays open, catalog 200 | |
+| b | Row forced to PENDING / INACTIVE / DEACTIVATED: socket closed 1008, catalog 403 | |
+| c | Forged token for a machine id with no row: 1008 on upgrade and handshake, catalog 403, `GET /machines/:id` 404 | |
+| d | Forged token with another branch: 1008 / 401. Real token, handshake with another serial: 1008 | |
+| e | No token, `?serialNumber=` or `x-station-serial` only, garbage, forged expired, user access token: 401. No row auto-created | |
 
 Result line: `all passed`, or the number of failures.
 
-### 1.b With the real agent
+---
 
-| # | Action | Expected on server | Expected on PC | P/F |
-|---|---|---|---|---|
-| 1.1 | Start the agent with a valid token | Log `agent connected`, `served catalog`. Console: `[station_status] ONLINE`, then `[catalog_status]`. `s` shows `ONLINE`, `lastSeen` moves, `ip` set | Agent log: handshake acked, catalog synced | |
-| 1.2 | Stop the agent, clear `Agent__StationToken`, start it | Upgrade refused with HTTP 401, no `agent connected` | Agent loops on connection errors | |
-| 1.3 | Start with a tampered token (change 1 char) | HTTP 401 | Same as 1.2 | |
-| 1.4 | Valid token, `Agent__SerialNumber` = another value | Close 1008 `serial number does not match station token` | Agent reports the close and retries | |
-| 1.5 | Console `e`, `3`: set `INACTIVE` (revoke), then restart the agent | Close 1008 `station not enrolled`. Station stays OFFLINE | Agent cannot connect | |
-| 1.6 | Same as 1.5 while the agent is connected (do not restart) | Socket stays open (known limitation, STATION_AGENT §9). Next reconnect is refused | Agent keeps working until it reconnects | |
-| 1.7 | `e`, `3`: set back `ENROLLED`, restart agent | Connects again (1.1) | Normal | |
-| 1.10 | `e`, `2`: mint a token valid `0` days (already expired), give it to the agent | HTTP 401 | Agent loops on connection errors | |
-| 1.11 | `e`, `1`: enroll a second serial `STATION-DEV-02`, mint its token, give it to the agent with `Agent__SerialNumber = STATION-DEV-02` | Connects as a new station. `p` lists both | Normal | |
-| 1.12 | `e`, `5`: agent's view of the catalog | 200 with the station's resolved games (same as what the agent syncs) | - | |
-| 1.8 | Start a second agent process with the same token and serial (or a test client) | Old socket closed 4000, new one registered | First agent reports replaced connection | |
-| 1.9 | Change the PC clock 2 minutes ahead, restart agent | Frames dropped (`ts_out_of_window`) or close 4400 | Agent cannot hold a session | |
+## 3. Presence
 
-Reset the PC clock after 1.9.
+Start: real agent enrolled and running (§2.1). Observer on (`o`).
+
+| # | Action | Expected on server | P/F |
+|---|---|---|---|
+| 3.1 | Agent running, idle 1 minute | `10`: `ONLINE`, `lastSeen` moves. No `OFFLINE` | |
+| 3.2 | Stop the agent cleanly | `[station_status] OFFLINE` at once | |
+| 3.3 | Kill the agent process (Task Manager) | `[station_status] OFFLINE` at once | |
+| 3.4 | Start the agent, then pull the network cable | `[station_status] OFFLINE` after 45 to 55 s (watchdog) | |
+| 3.5 | Plug the network back | Agent reconnects: `ONLINE` | |
+| 3.6 | Restart the backend with the agent running | Agent reconnects on its own | |
+| 3.7 | Start a second agent process with the same credential | Old socket closed 4000, new one registered | |
+| 3.8 | Change the PC clock 2 minutes ahead, restart agent | Frames dropped (`ts_out_of_window`) or close 4400. Reset the clock after | |
 
 ---
 
-## 2. Presence
+## 4. Remote commands (`32`)
 
-| # | Action | Expected on server | Expected on PC | P/F |
-|---|---|---|---|---|
-| 2.1 | Agent running, idle 1 minute | `s`: `ONLINE`, `lastSeen` updates. No `OFFLINE` | - | |
-| 2.2 | Stop the agent cleanly | `[station_status] OFFLINE` at once | - | |
-| 2.3 | Kill the agent process (Task Manager, End task) | `[station_status] OFFLINE` at once (OS closes TCP) | - | |
-| 2.4 | Start agent, then pull the network cable / disable Wi-Fi | `[station_status] OFFLINE` after 45 to 55 s (watchdog) | - | |
-| 2.5 | Plug the network back | Agent reconnects: `ONLINE`, `state_report` fields in `[station_status]` | Agent reconnects on its own | |
-| 2.6 | Restart the backend (`npm run docker:up` after a stop) with agent running | Agent reconnects. Rows left ONLINE by the old process are fixed by the watchdog | Agent reconnects on its own | |
+The final status of each command comes as `[command_update]` in the observer, or
+with `34` get command. `ACKED` only means the agent accepted the command: check
+the effect on the PC and in the next `[station_status]`.
 
----
+UNLOCK over REST is the admin unlock only (empty payload). A session unlock is sent
+by the backend after an accepted PIN login (§13); it cannot be built over REST.
 
-## 3. Remote commands (console main menu)
-
-Start each case from the state named in the "Start" column.
-
-| # | Start | Console action | Expected result | Expected on PC | P/F |
+| # | Start | Action | Expected | On PC | P/F |
 |---|---|---|---|---|---|
-| 3.1 | Unlocked | `1` LOCK | `ACKED`. `[station_status] locked=true` | Lock screen (LockUI) covers the desktop | |
-| 3.2 | Locked | `1` LOCK again | `ACKED` (idempotent) | Stays locked, no second lock screen | |
-| 3.3 | Locked | `2` UNLOCK (admin) | `ACKED`. `locked=false`, lease granted | Lock screen closes, desktop usable | |
-| 3.4 | Locked | `3` UNLOCK booking, keep default sessionId, PIN `4821` | `ACKED`. `sessionId` set, `locked` stays `true` | LockUI asks for the PIN | |
-| 3.5 | After 3.4 | Type a wrong PIN on the PC | No change on server | LockUI refuses, stays locked | |
-| 3.6 | After 3.4 | Type `4821` on the PC | `[station_status] locked=false`, same `sessionId` | Desktop unlocks | |
-| 3.7 | Unlocked, no session (after 3.3) | `4` LAUNCH_GAME `notepad` | 409 `STATION_NOT_IN_SESSION`. No command row (`c`) | Nothing | |
-| 3.8 | Session active (after 3.6), game installed (§4) | `4` LAUNCH_GAME `notepad` | `ACKED` | Notepad opens | |
-| 3.9 | Session active | `4` LAUNCH_GAME `does-not-exist` | 404 `GAME_NOT_FOUND` | Nothing | |
-| 3.10 | Session active, game running | `5` END_SESSION reason `staff_end` | `ACKED`. `[station_status]` `sessionId=null`, `locked=true`. Backend emits `presence.sessionEnded` with reason `staff_end` (billing log) | Game closes, session ends, lock screen | |
-| 3.11 | No session | `5` END_SESSION | 409 `NO_ACTIVE_SESSION` | Nothing | |
-| 3.12 | Session active | End the session from the PC side (agent UI or lease expiry) | `sessionEnded` with reason `agent_reported` | Lock screen | |
-| 3.13 | Any | `6` CATALOG_UPDATE | `ACKED`. Log `served catalog to ...`, then `[catalog_status]` | Agent re-syncs its catalog | |
-| 3.14 | Any, logged in as ADMIN | `7` SHUTDOWN, confirm `y` | `ACKED` | Agent logs the shutdown. PC stays on (stub) | |
-| 3.15 | Logged in as a STAFF user (not MANAGER/ADMIN) | `7` SHUTDOWN | 403 `INSUFFICIENT_SCOPE`. No command row | Nothing | |
-| 3.16 | Agent stopped (OFFLINE) | `1` LOCK | 409 `STATION_OFFLINE`. No command row | - | |
-| 3.17 | Any | `c` recent commands | Every command above with its final status, nack code and reason | - | |
-
-For 3.15, create an EMPLOYEE with the console (`u`, `3`, case 8.3), then run a
-second console with `CONSOLE_USER` / `CONSOLE_PASS` set to it.
-
-### 3.x Delivery, retry and timeout
-
-| # | Action | Expected result | P/F |
-|---|---|---|---|
-| 3.18 | Freeze the agent: Resource Monitor, CPU tab, right-click the agent process, **Suspend process**. Within 45 s send `1` LOCK | `SENT`, no ack for 10 s, second attempt (`attempts=2`, same commandId), then `TIMEOUT` | |
-| 3.19 | **Resume process** right after 3.18 | If the agent still acks the command: status goes from `TIMEOUT` to `ACKED` (late reply wins). PC locks | |
-| 3.20 | Kill the agent, then send a command in the ~1 s before `OFFLINE` shows (or stop it between queue and send) | Final status `FAILED` (`COMMAND_OFFLINE_STATUS`), reason names no live socket | |
+| 4.1 | Unlocked | LOCK | `ACKED`, `[station_status] locked=true` | Lock screen | |
+| 4.2 | Locked | LOCK again | `ACKED` (idempotent) | Stays locked | |
+| 4.3 | Locked | UNLOCK | `ACKED`, `locked=false` | Desktop usable | |
+| 4.4 | Unlocked, no session | LAUNCH_GAME `notepad` | 409 `STATION_NOT_IN_SESSION`. No command row (`33`) | Nothing | |
+| 4.5 | Session active (§13), game installed (§5) | LAUNCH_GAME `notepad` | `ACKED` | Notepad opens | |
+| 4.6 | Session active | LAUNCH_GAME `does-not-exist` | 404 `GAME_NOT_FOUND` | Nothing | |
+| 4.7 | Session active | END_SESSION reason `staff_end` | `ACKED`, `sessionId=null`, `locked=true` | Game closes, lock screen | |
+| 4.8 | No session | END_SESSION | 409 `NO_ACTIVE_SESSION` | Nothing | |
+| 4.9 | Any | CATALOG_UPDATE | `ACKED`, then `[catalog_status]` | Agent re-syncs | |
+| 4.10 | As ADMIN | SHUTDOWN, confirm `y` | `ACKED` | Agent logs the shutdown (stub) | |
+| 4.11 | As EMPLOYEE | SHUTDOWN | 403 `INSUFFICIENT_SCOPE`. No command row | Nothing | |
+| 4.12 | Agent stopped | LOCK | 409 `STATION_OFFLINE` | - | |
+| 4.13 | Any | `r` POST `/api/v1/stations/<id>/commands` body `{"type":"LOCK","gameId":"x"}` | 400 `gameId is only accepted for LAUNCH_GAME` | - | |
+| 4.14 | Any | `r` body `{"type":"UNLOCK","payload":{"sessionId":"x"}}` | 400 (payload must be empty) | - | |
+| 4.15 | Any | `r` body `{"type":"REBOOT"}` | 400 | - | |
+| 4.16 | Freeze the agent (Resource Monitor, Suspend process), send LOCK within 45 s | `SENT`, second attempt (`attempts=2`), then `TIMEOUT` | - | |
+| 4.17 | Resume right after 4.16 | Late ack wins: `TIMEOUT` to `ACKED` | PC locks | |
 
 ---
 
-## 4. Game catalog (console `g`)
+## 5. Game catalog
 
-Start: station ONLINE, session active and unlocked (3.4 + 3.6).
+Start: station ONLINE, session active (§13).
 
-| # | Console action | Expected result | Expected on PC | P/F |
+| # | Action | Expected | On PC | P/F |
 |---|---|---|---|---|
-| 4.1 | `3` create game, `exe`, defaults (`notepad`, `C:\Windows\System32\notepad.exe`) | 201, game listed in `1` | Nothing yet (not assigned) | |
-| 4.2 | `3` create game `exe` with target `notepad.exe` (not a full path) | 400, validation message about the full path | - | |
-| 4.3 | `4` assign `notepad` to this station | 2xx. A `CATALOG_UPDATE` is sent on its own (`[command_update] CATALOG_UPDATE ACKED`), then `[catalog_status]` with `notepad installed=true` | Agent re-syncs | |
-| 4.4 | `2` station catalog | `notepad` in the resolved list, and in the last `catalog_status` | - | |
-| 4.5 | Main menu `4` LAUNCH_GAME `notepad` | `ACKED` | Notepad opens | |
-| 4.6 | `3` create game `exe`, gameId `ghost`, target `C:\Games\Ghost\ghost.exe` (missing file), then `4` assign | `[catalog_status]` `ghost installed=false` with a reason | - | |
-| 4.7 | LAUNCH_GAME `ghost` | 409 `GAME_NOT_INSTALLED` | Nothing | |
-| 4.8 | `8` disable `notepad` | Automatic `CATALOG_UPDATE`. LAUNCH_GAME `notepad` gives 409 `GAME_DISABLED` | Agent re-syncs, game gone from its catalog | |
-| 4.9 | `8` enable `notepad` again | Automatic `CATALOG_UPDATE`, launch works again | - | |
-| 4.10 | `9` edit `notepad` field `arguments` = `C:\Windows\win.ini` | Automatic `CATALOG_UPDATE`. Next launch opens win.ini in Notepad | Notepad shows win.ini | |
-| 4.11 | `5` unassign `notepad` from this station | Automatic `CATALOG_UPDATE`. LAUNCH_GAME gives 409 `GAME_NOT_ASSIGNED` | - | |
-| 4.12 | `6` assign `notepad` to the branch (branchId prefilled once a `[station_status]` or `[command_update]` came in) | Automatic `CATALOG_UPDATE`. Launch works again | - | |
-| 4.13 | `4` assign to station with override target `C:\Windows\System32\mspaint.exe`, then launch `notepad` | Paint opens instead of Notepad (station override wins) | Paint opens | |
-| 4.14 | `7` unassign from branch, `5` unassign from station | Catalog empty for this game | - | |
-| 4.15 | Stop the agent, change the catalog, start the agent | No CATALOG_UPDATE while offline. On connect: `served catalog`, then `[catalog_status]` with the change | Agent has the new catalog | |
-| 4.16 | Steam game (`3`, `steam`, target `730`), assign, launch (Steam installed on PC) | `ACKED` | Steam starts the game | |
-| 4.17 | New game, first launch before any `catalog_status` for it (send LAUNCH_GAME fast, or on a station that never synced) | 409 `GAME_STATUS_UNKNOWN` | - | |
+| 5.1 | `24` create `exe`, defaults (`notepad`, `C:\Windows\System32\notepad.exe`) | 201, listed in `23` | - | |
+| 5.2 | `24` `exe` with target `notepad.exe` | 400, full path required | - | |
+| 5.3 | `28` attach `notepad` to the station | 2xx. Automatic `CATALOG_UPDATE`, then `[catalog_status]` `notepad installed=true` | Agent re-syncs | |
+| 5.4 | `30` station's games | `notepad` in the resolved list | - | |
+| 5.5 | `32` LAUNCH_GAME `notepad` | `ACKED` | Notepad opens | |
+| 5.6 | `24` `ghost` with target `C:\Games\Ghost\ghost.exe`, `28` attach | `[catalog_status]` `ghost installed=false` with a reason | - | |
+| 5.7 | LAUNCH_GAME `ghost` | 409 `GAME_NOT_INSTALLED` | Nothing | |
+| 5.8 | `25` patch `{"enabled":false}` on `notepad` | Automatic `CATALOG_UPDATE`. LAUNCH_GAME 409 `GAME_DISABLED` | Game gone from its catalog | |
+| 5.9 | `25` `{"enabled":true}` | Launch works again | - | |
+| 5.10 | `25` `{"arguments":"C:\\Windows\\win.ini"}` | Next launch opens win.ini | Notepad shows win.ini | |
+| 5.11 | `29` detach from the station | LAUNCH_GAME 409 `GAME_NOT_ASSIGNED` | - | |
+| 5.12 | `26` attach to the branch | Launch works again | - | |
+| 5.13 | `28` attach with overrides `{"target":"C:\\Windows\\System32\\mspaint.exe"}` | Paint opens instead (station override wins) | Paint opens | |
+| 5.14 | `27` and `29` detach from branch and station | Game gone from the station's catalog | - | |
+| 5.15 | Stop the agent, change the catalog, start it | On connect: `served catalog`, then `[catalog_status]` with the change | New catalog | |
+| 5.16 | As EMPLOYEE: `24` (send anyway) | 403 | - | |
 
 ---
 
-## 5. Fault injection (console `8`, needs `NODE_ENV` not `production`)
+## 6. Fault injection (`32`, `simulate`, needs `NODE_ENV` not `production`)
 
-| # | Simulation | Expected result | P/F |
+| # | Simulation | Expected | P/F |
 |---|---|---|---|
-| 5.1 | `stale_ts` with LOCK | `NACKED`, nack code `STALE`. PC does not lock | |
-| 5.2 | `duplicate_send` with LOCK | `ACKED` once. Agent log shows the duplicate re-acked, action ran once | |
-| 5.3 | `invalid_payload` | `FAILED`, `INVALID_PAYLOAD`, reason `gameId is required (1-128 characters).` | |
-| 5.4 | `exec_failed` while locked | `FAILED`, `EXEC_FAILED`, reason "must be unlocked with an active session" | |
-| 5.5 | `exec_failed` while unlocked with a session | `FAILED`, `EXEC_FAILED`, reason "not in catalog" | |
-| 5.6 | Backend with `NODE_ENV=production`, any simulation | 400 `SIMULATION_DISABLED` | |
+| 6.1 | `stale_ts` with LOCK | `NACKED`, `STALE`. PC does not lock | |
+| 6.2 | `duplicate_send` with LOCK | `ACKED` once. Agent re-acks the duplicate | |
+| 6.3 | `invalid_payload` | `FAILED`, `INVALID_PAYLOAD` | |
+| 6.4 | `exec_failed` while locked | `FAILED`, `EXEC_FAILED`, "must be unlocked with an active session" | |
+| 6.5 | `exec_failed` unlocked with a session | `FAILED`, `EXEC_FAILED`, "not in catalog" | |
+| 6.6 | Backend with `NODE_ENV=production` | 400 `SIMULATION_DISABLED` | |
 
 ---
 
-## 6. Telemetry and alerts
+## 7. Telemetry and alerts
 
-| # | Action | Expected result | P/F |
+| # | Action | Expected | P/F |
 |---|---|---|---|
-| 6.1 | Console `f`, turn on telemetry | `[telemetry_update]` lines with CPU, GPU, RAM metrics every few seconds | |
-| 6.2 | Console `t` | Latest metrics for the station | |
-| 6.3 | Wait over 1 minute, then `SELECT count(*) FROM node_telemetry;` | Count grows (one snapshot per minute) | |
-| 6.4 | Load the CPU on the PC (stress tool, or a game) until CPU temp > 85 °C (or lower `CPU_TEMP_THRESHOLD_C` in `.env` and restart backend to test) | `[alert]` hardware / CPU temperature. Console `a` lists it as open | |
-| 6.5 | Keep the load on | No new alert per sample: repeats fold into the open alert | |
-| 6.6 | Unplug a USB device (mouse, keyboard) on the PC | `[alert]` from the agent (anti_theft / device category) | |
-| 6.7 | Console `a`, resolve the alert by id | `[alert_resolved]`. `a` with `resolved` shows it | |
-| 6.8 | Plug the device back, unplug again | New open alert | |
+| 7.1 | Observer on, `t` | `[telemetry_update]` with CPU, GPU, RAM every few seconds | |
+| 7.2 | `35` | Latest metrics for the station | |
+| 7.3 | Load the CPU above the threshold (or lower `CPU_TEMP_THRESHOLD_C`) | `[alert]` hardware. `36` lists it open | |
+| 7.4 | Keep the load on | No new alert per sample: repeats fold into the open alert | |
+| 7.5 | Unplug a USB device on the PC | `[alert]` anti_theft | |
+| 7.6 | `37` resolve it | `[alert_resolved]`. `36` with `resolved` shows it | |
 
 ---
 
-## 7. Dashboard feed and REST scope
+## 8. Branch scoping and REST scope
 
-| # | Action | Expected result | P/F |
+Log in with several identities first (`l`): `hq-admin`, `manager.manar`,
+`employee.manar1`, `gamer.wood`.
+
+| # | Action | Expected | P/F |
 |---|---|---|---|
-| 7.1 | HQ admin console (no branch) | Events from every branch | |
-| 7.2 | Console with a user of another branch | No events and 403/404 for this station | |
-| 7.3 | `curl http://localhost:3000/api/v1/stations` (no token) | 401 | |
-| 7.4 | Console `r` `POST /api/v1/stations/<id>/commands` body `{"type":"LOCK","gameId":"x"}` | 400 `gameId is only accepted for LAUNCH_GAME` | |
-| 7.5 | `r` body `{"type":"UNLOCK","payload":{"sessionId":"not-a-uuid","pin":"1"}}` | 400 | |
-| 7.6 | `r` body `{"type":"REBOOT"}` | 400 (type not allowed) | |
-| 7.7 | `curl -k https://localhost/stations/me/games -H "Authorization: Bearer <station jwt>"` | 200, resolved catalog | |
-| 7.8 | Same without the header / with a user token | 401 `MISSING_STATION_TOKEN` / `INVALID_STATION_TOKEN` | |
-| 7.9 | Same with a valid token after `enrollment_status='INACTIVE'` | 403 `STATION_NOT_ENROLLED` | |
-| 7.10 | Connect to `/dashboard-io` with a **GAMER** access token (for example a small socket.io client, or the old console behaviour) | Refused: a gamer must not see station status, commands, telemetry or alerts. **Known to fail today**: a gamer has no `branchId`, so the gateway puts it in `branch:all` and it receives every branch's events (see §14) | |
-| 7.11 | Console as GAMER (`CONSOLE_USER` = a gamer): main menu | Only profile, own wallet, plans (browse, buy), games (browse), raw request. No station, users admin, billing or enrollment items | |
-| 7.12 | Console as EMPLOYEE | No SHUTDOWN, no enrollment, no plan / game management, no staff account creation, no pricing change | |
-| 7.13 | Console as MANAGER: `u` | Can create EMPLOYEE only, in its own branch. Role change limited to GAMER / EMPLOYEE | |
+| 8.1 | `13` with path `/machines` | hq: every branch. manager / employee: their branch only. gamer: 403 | |
+| 8.2 | `13` with `/api/v1/alerts?status=open` | Same split | |
+| 8.3 | As `manager.manar`: `63` for the other branch's id | 403 | |
+| 8.4 | As `manager.manar`: `64` for its own branch | 2xx | |
+| 8.5 | Observer as hq, then as `manager.manar` (`s`, `o`, `o`) | hq: events of every branch. manager: its branch only | |
+| 8.6 | Observer as `gamer.wood` | Should be refused. **Known to fail today**: a gamer has no branch and joins `branch:all` (§15) | |
+| 8.7 | `r` with no token: `GET /api/v1/stations` | 401 | |
+| 8.8 | `r` with the stand-in token: `GET /stations/me/games` | 200. With the active user token: 401 | |
 
 ---
 
-## 8. Users and roles (console `u`)
+## 9. Users and roles
 
-Roles map to scopes: GAMER = self, EMPLOYEE = staff, MANAGER = admin, ADMIN = hq.
-
-| # | Console action | Expected result | P/F |
+| # | Action | Expected | P/F |
 |---|---|---|---|
-| 8.1 | `1` create gamer (default name, password `gamer-pass-123`) | 201. Console logs in as the gamer and prints its `gamerProfileId` (from `GET /wallets/me`) | |
-| 8.2 | `1` again with the same username | 409 (username taken) | |
-| 8.3 | `3` create EMPLOYEE for the station's branch | 201, `branchId` set. Note username / password for 3.15 and 8.6 | |
-| 8.4 | `3` create MANAGER for the station's branch | 201 | |
-| 8.5 | `6` gamer `/auth/me` | Role `GAMER`, scope `self` | |
-| 8.6 | Second console as the EMPLOYEE: `m`, `2` create a membership plan | 403 (admin scope needed) | |
-| 8.7 | Second console as the MANAGER: `u`, `3` create a MANAGER | 403 (a manager may only create EMPLOYEE, in its own branch) | |
-| 8.8 | `4` change the EMPLOYEE to `GAMER`, then log in with it | Logs in, staff routes give 403 | |
-| 8.9 | `r` raw request as HQ: `POST /employees` with an unknown `branchId` | 4xx, no user created | |
+| 9.1 | `5` register a gamer, log in as it (`y`) | 201, identity switches to the gamer | |
+| 9.2 | `5` same username again | 409 | |
+| 9.3 | As hq: `6` create EMPLOYEE for a branch | 201, `branchId` set | |
+| 9.4 | As hq: `6` create MANAGER | 201 | |
+| 9.5 | As the new MANAGER: `6` role MANAGER | 403 (a manager creates EMPLOYEE only, in its branch) | |
+| 9.6 | `7` change the EMPLOYEE to `GAMER`, then log in with it | Logs in, staff commands give 403 | |
+| 9.7 | `6` with an unknown `branchId` | 4xx, no user created | |
+| 9.8 | `3` refresh, then `4` logout; `r` `POST /auth/refresh` with the old refresh token | 401 | |
 
 ---
 
-## 9. Branch pricing (console `b`)
+## 10. Branch pricing
 
-`paygRate` and `bookingRate` are **cents per hour**. The session rate is
-`round(paygRate * (1 - membership discount) / 60)` cents per minute.
-The console suggests `6000` (60.00 per hour = 100 cents per minute) so one
-minute of play is easy to see in the wallet.
+`paygRate` and `bookingRate` are integers per hour, in the wallet's minor unit. The
+session rate is `round(paygRate * (1 - membership discount) / 60)` per minute.
 
-| # | Console action | Expected result | P/F |
+| # | Action | Expected | P/F |
 |---|---|---|---|
-| 9.1 | `1` show pricing on a branch never priced | 404 `PRICING_NOT_SET` | |
-| 9.2 | `6` start a session in that state (needs a reservation, §12) | 404 `PRICING_NOT_SET`. No session row (`l`) and no UNLOCK sent | |
-| 9.3 | `2` set pricing `6000` / `6000` | 2xx. `1` shows the rates and `100 cents/minute` | |
-| 9.4 | `2` set `paygRate` `0` or `12.5` | 400 | |
-| 9.5 | Second console as EMPLOYEE: `b`, `2` | 403 (admin scope needed). `1` works (staff) | |
+| 10.1 | `63` on the seeded branch | The seeded rates | |
+| 10.2 | `64` set `6000` / `6000` | 2xx. `63` shows them | |
+| 10.3 | `64` `paygRate` `0` or `12.5` | 400 | |
+| 10.4 | As EMPLOYEE: `64` | 403. `63` works | |
 
 ---
 
-## 10. Wallet and ledger (console `w`)
+## 11. Wallet and ledger
 
-Amounts are integer **cents**. A reused `idempotencyKey` must not post twice.
+Amounts are integers in the minor unit. A reused `idempotencyKey` must not post twice.
 
-| # | Console action | Expected result | P/F |
+| # | Action | Expected | P/F |
 |---|---|---|---|
-| 10.1 | `1` gamer `GET /wallets/me` on a new gamer | Balance `0` (wallet created on first read) | |
-| 10.2 | `3` credit `10000` | 2xx, entry `CREDIT +10000`, `balanceAfter 10000` | |
-| 10.3 | `3` credit `500` with key `topup-1`, then again with `topup-1` | Second call posts nothing new: balance grows by 500 only once (`2`) | |
-| 10.4 | `6` debit `200` | Entry `DEBIT -200`, balance down by 200 | |
-| 10.5 | `6` debit more than the balance | 409 `INSUFFICIENT_FUNDS`. Balance unchanged | |
-| 10.6 | `3` credit `0`, `-5` or `1.5` | 400 | |
-| 10.7 | `4` / `5` staff view of the same wallet | Same balance and entries as the gamer view | |
-| 10.8 | `r` raw request with the gamer: not possible from `r` (staff token). Use curl with the gamer token on `POST /wallets/<id>/credit` | 403 (staff scope needed) | |
+| 11.1 | As a new gamer: `41` | Balance `0`, `gamerProfileId` remembered | |
+| 11.2 | `s` to staff, `45` credit `10000` | 2xx, entry `CREDIT +10000` | |
+| 11.3 | `45` credit `500` key `topup-1`, twice | Balance grows by 500 once | |
+| 11.4 | `46` debit `200` | Balance down by 200 | |
+| 11.5 | `46` more than the balance | 409 `INSUFFICIENT_FUNDS` | |
+| 11.6 | `45` amount `0`, `-5`, `1.5` | 400 | |
+| 11.7 | `43`, `44` staff view; `s`, `41`, `42` gamer view | Same balance and entries | |
+| 11.8 | As the gamer: `45` (send anyway) | 403 | |
 
 ---
 
-## 11. Membership and subscription plans (console `m`)
+## 12. Membership and subscription plans
 
-Plan `price` is in currency units. A purchase debits `price x 100` cents from the
-gamer's wallet. At most one ACTIVE membership per gamer. The membership
-`discountPercent` (snapshot at purchase) lowers the session rate (§12).
+Plan `price` is in currency units; a purchase debits `price x 100` minor units.
+At most one ACTIVE membership per gamer.
 
-| # | Console action | Expected result | P/F |
+| # | Action | Expected | P/F |
 |---|---|---|---|
-| 11.1 | `2` create membership plan `price 5`, `discountPercent 50`, `30` days | 201 | |
-| 11.2 | `2` same name again | 409 (name unique) | |
-| 11.3 | `5` gamer purchase, key `m-1`, wallet ≥ 500 | 2xx, membership ACTIVE. Wallet: `PAYMENT -500` | |
-| 11.4 | `5` again with key `m-1` | Same membership returned. No second debit | |
-| 11.5 | `5` again with another key (or none) | 409 `MEMBERSHIP_ALREADY_ACTIVE`. No debit | |
-| 11.6 | New gamer with balance 0: `5` purchase | 409 `INSUFFICIENT_FUNDS`. No membership | |
-| 11.7 | `m` gamer `GET /memberships/me` | The ACTIVE membership, with start / end dates and discount snapshot | |
-| 11.8 | `3` update the plan `discountPercent 25` | 2xx. Existing membership keeps its 50% snapshot (check with the rate in 12.5) | |
-| 11.9 | `4` delete a plan with memberships | Refused (plan in use) | |
-| 11.10 | `4` delete an unused plan | 2xx | |
-| 11.11 | `7` create subscription plan (default benefits: every day, 00:00 to 23:59, 20%) | 201 | |
-| 11.12 | `7` with benefits `{"windows":[{"daysOfWeek":[9],"startTime":"25:00","endTime":"x","discountPercent":20}]}` | 400 | |
-| 11.13 | `p` gamer purchase subscription (wallet ≥ price x 100) | 2xx, subscription ACTIVE, wallet debited | |
-| 11.14 | `p` with balance too low | 409 `INSUFFICIENT_FUNDS` | |
-| 11.15 | `s` gamer `GET /subscriptions/me` | The subscription with its benefits snapshot | |
+| 12.1 | As admin: `48` membership `price 5`, `discountPercent 50` | 201 | |
+| 12.2 | `48` same name | 409 | |
+| 12.3 | As the gamer (wallet ≥ 500): `52` key `m-1` | 2xx, ACTIVE. Ledger `PAYMENT -500` | |
+| 12.4 | `52` again with `m-1` | Same membership, no second debit | |
+| 12.5 | `52` with another key | 409 `MEMBERSHIP_ALREADY_ACTIVE` | |
+| 12.6 | New gamer, balance 0: `52` | 409 `INSUFFICIENT_FUNDS` | |
+| 12.7 | `51` | The membership with its discount snapshot | |
+| 12.8 | As admin: `49` `{"discountPercent":25}` | 2xx. Existing membership keeps 50% | |
+| 12.9 | `50` delete a plan in use / unused | Refused / 2xx | |
+| 12.10 | `54` subscription plan (default benefits) | 201 | |
+| 12.11 | `54` benefits `{"windows":[{"daysOfWeek":[9],"startTime":"25:00","endTime":"x","discountPercent":20}]}` | 400 | |
+| 12.12 | As the gamer: `58`, then `57` | 2xx, ACTIVE, wallet debited; listed with its benefits | |
 
 ---
 
-## 12. Reservation, session and billing (console `b`)
-
-Reservations have no REST route yet: the console inserts them with SQL
-(`docker compose exec postgres psql`, so run the console from the repo root with
-the stack up). If that fails, the console prints the SQL to run with
-`npm run db:psql`.
+## 13. Reservation, session, run-out and billing
 
 How it fits together:
 
 ```text
-POST /sessions {reservationId}
-  -> session PENDING, rate fixed, PIN returned
-  -> booking UNLOCK {sessionId, pin} sent to the station
-PC shows the PIN prompt, gamer types the PIN
-  -> heartbeat locked=false with sessionId -> session ACTIVE, metering starts
-staff LOCK (or wrong state)      -> locked=true  -> PAUSED, metered seconds banked
-staff UNLOCK                     -> locked=false -> ACTIVE again
-POST /sessions/:id/end (or the agent ends it)
-  -> END_SESSION command -> agent stops the game, clears the session, locks
-  -> presence.sessionEnded -> settlement:
-     COMPLETED, billingBreakdown, wallet PAYMENT -totalCents (key session-settlement:<id>)
+gamer:  POST /reservations/walk-in {machineId, durationMinutes}  -> reservation (starts now)
+staff:  POST /sessions {reservationId}                            -> session PENDING, rate fixed, PIN (shown once)
+PC:     gamer types the PIN on the lock screen -> agent login_request
+        backend checks the PIN -> login_result accepted -> session UNLOCK
+        heartbeat locked=false with sessionId -> session ACTIVE, metering starts,
+        run-out timer scheduled from the wallet balance and the rate
+backend: warn job   -> [session_runout_warning] (SESSION_RUNOUT_WARNING_LEAD_S before lock, default 300 s)
+         lock job   -> system LOCK -> heartbeat locked=true -> session PAUSED
+staff:  wallet credit during the session -> timers rescheduled from the new balance
+staff:  POST /sessions/:id/end -> END_SESSION -> settlement: COMPLETED, billingBreakdown, PAYMENT entry
 ```
 
-Start: station ONLINE and locked, pricing `6000` (§9), gamer with wallet
-`10000` and no membership (§8, §10).
+Start: real station ONLINE and locked, pricing `6000` (§10), `gamer.wood` with a
+wallet balance, observer on as staff. Identities: `hq-admin` and `gamer.wood`.
 
-| # | Console action | Expected result | Expected on PC | P/F |
+| # | Action | Expected | On PC | P/F |
 |---|---|---|---|---|
-| 12.1 | `3` create reservation, status `PENDING` | Reservation id printed | - | |
-| 12.2 | `6` start session on it | 409 `RESERVATION_NOT_CONFIRMED`. No session | Nothing | |
-| 12.3 | `6` with a random uuid | 404 `RESERVATION_NOT_FOUND` | Nothing | |
-| 12.4 | `5` set it `CONFIRMED`, `6` start session | 201: session `PENDING`, `rateCentsPerMinute 100`, **PIN** printed. `[command_update] UNLOCK ... ACKED` | PIN prompt on the lock screen | |
-| 12.5 | `6` again on the same reservation | 409 `SESSION_ALREADY_STARTED` | Nothing | |
-| 12.6 | `7` show session before the PIN | `PENDING`, `metered=0` | Still locked | |
-| 12.7 | Type a wrong PIN on the PC | Session stays `PENDING` | Refused, stays locked | |
-| 12.8 | Type the right PIN, then `8` watch session | `ACTIVE` within one heartbeat. `[station_status] locked=false sessionId=<session id>` | Desktop unlocked | |
-| 12.9 | Main menu `4` LAUNCH_GAME `notepad` | `ACKED` | Notepad opens | |
-| 12.10 | Play 2 minutes, main menu `1` LOCK, `7` show session | `PAUSED`, `lockedAt` set, `metered` ≈ 120 s | Lock screen | |
-| 12.11 | Wait 1 minute locked, `7` | `metered` unchanged (no billing while locked) | - | |
-| 12.12 | Main menu `2` UNLOCK (admin), wait 1 minute, `7` | `ACTIVE` again, `lockedAt` cleared, metering restarted | Desktop unlocked, same session | |
-| 12.13 | `9` end session, reason `staff_end`, then `8` watch | `[command_update] END_SESSION ACKED`, then `COMPLETED`, `settledAt` set, `billingBreakdown` `{ rateCentsPerMinute: 100, meteredSeconds: ≈180, totalCents: ≈300, appliedMembershipId: null }` | Game closes, session ends, lock screen | |
-| 12.14 | `w`, `2` gamer ledger | `PAYMENT -totalCents` with `sessionId` = the session, balance `10000 - totalCents` | - | |
-| 12.15 | `9` end the same session again | 409 `SESSION_NOT_OPEN` | Nothing | |
-| 12.16 | `l` list sessions | The session `COMPLETED` with its breakdown | - | |
+| 13.1 | As the gamer: `61` walk-in on the station, `60` minutes | 201, reservation remembered | - | |
+| 13.2 | `59` | The reservation | - | |
+| 13.3 | `s` to staff: `38` create session | 201, `PENDING`, `rateCentsPerMinute`, **PIN** printed | Still locked | |
+| 13.4 | `38` again | 409 `SESSION_ALREADY_STARTED` | - | |
+| 13.5 | `38` with a random uuid | 404 `RESERVATION_NOT_FOUND` | - | |
+| 13.6 | Agent stopped: `38` on a new reservation | 409 `STATION_OFFLINE` | - | |
+| 13.7 | Type a wrong PIN on the PC | Backend log `login_request ... rejected (invalid_pin)`. Session stays `PENDING` | Refused | |
+| 13.8 | Type the right PIN | `[station_status] locked=false sessionId=<id>`. `39`: `ACTIVE` | Desktop unlocked | |
+| 13.9 | Lock (`32`), then type the same PIN again (single use) | Refused (`no_pending_session` or `pin_used` in the log) | Stays locked | |
+| 13.10 | Balance low (for example `46` debit down to about 5 minutes of play) before 13.3, then play | `[session_runout_warning] {sessionId, machineId}` about `SESSION_RUNOUT_WARNING_LEAD_S` before the lock | - | |
+| 13.11 | After the warning: `45` credit | Timers rescheduled: the lock comes later than planned. A new warning follows later | - | |
+| 13.12 | Let the balance run out | System `[command_update] LOCK ACKED`, `locked=true`, `39`: `PAUSED`, `lockedAt` set | Lock screen | |
+| 13.13 | `32` LOCK during an ACTIVE session, wait 1 minute, `39` | `PAUSED`, `meteredSeconds` unchanged while locked | Lock screen | |
+| 13.14 | `32` UNLOCK, wait 1 minute | `ACTIVE` again | Desktop unlocked | |
+| 13.15 | `40` end session `staff_end` | `[command_update] END_SESSION ACKED`, `39`: `COMPLETED`, `settledAt`, `billingBreakdown` | Lock screen | |
+| 13.16 | `44` ledger | `PAYMENT -totalCents` with the session id | - | |
+| 13.17 | `40` again | 409 `SESSION_NOT_OPEN` | - | |
+| 13.18 | As the gamer: `60` book ahead (start in 5 minutes), `62` cancel it | 201, then 2xx. `59` shows the new status | - | |
+| 13.19 | `60` with a start time in the past | 400 `INVALID_RESERVATION_TIME` | - | |
 
 Check the numbers: `totalCents = round(meteredSeconds / 60 * rateCentsPerMinute)`.
 
-### 12.x Billing variants
+Billing variants (each needs a new reservation and session):
 
-Each variant needs a new CONFIRMED reservation (`3`) and a new session (`6`).
-
-| # | Setup / action | Expected result | P/F |
+| # | Setup | Expected | P/F |
 |---|---|---|---|
-| 12.17 | Gamer with an ACTIVE 50% membership (§11.3), start session | `rateCentsPerMinute 50`. Breakdown `appliedMembershipId` = the membership | |
-| 12.18 | After 11.8 (plan changed to 25%), start a session for the same gamer | Still `50` per minute (snapshot at purchase) | |
-| 12.19 | Gamer with an ACTIVE subscription and no membership | Rate is the full `paygRate`: subscription windows are not applied to sessions yet (see §14). Note what you see | |
-| 12.20 | Gamer wallet `0`, play 1 minute, end | Session still `COMPLETED`. Breakdown has `debitFailed: true`. No PAYMENT entry | |
-| 12.21 | Start, type PIN, then end the session from the PC side (agent UI, or let the lease expire) | `COMPLETED` with settlement. Backend log shows reason `agent_reported` | |
-| 12.22 | Start, type PIN, then main menu `5` END_SESSION (command, not REST) | Same settlement as 12.13: billing follows the station, not the route | |
-| 12.23 | Start a session, never type the PIN, end it with `9` | Allowed while `PENDING`: `COMPLETED`, `meteredSeconds 0`, `totalCents 0`, no ledger entry | |
-| 12.24 | Stop the agent, then `6` start a session | 201 with PIN, session `PENDING`, backend log `booking UNLOCK not sent`. Start the agent, then main menu `3` booking UNLOCK with this session id and PIN: PIN prompt appears, flow continues as 12.8 | |
-| 12.25 | During an ACTIVE session, kill the agent (Task Manager) | Station OFFLINE. Session state after restart: note whether it stays `ACTIVE` (metering keeps counting) or ends. Report it | |
-| 12.26 | During an ACTIVE session, stop the backend 1 minute, start it again | Session keeps its state. Check `meteredSeconds` at the end | |
-| 12.27 | Two sessions in a row for the same gamer (new reservation each) | Two PAYMENT entries, each with its own `sessionId` | |
+| 13.20 | Gamer with an ACTIVE 50% membership | Rate halved, `appliedMembershipId` set | |
+| 13.21 | Plan changed to 25% after purchase | Still 50% (snapshot) | |
+| 13.22 | Wallet `0`, play 1 minute, end | `COMPLETED`, `debitFailed: true`, no PAYMENT | |
+| 13.23 | End the session from the PC side | Settlement with reason `agent_reported` | |
+| 13.24 | Start, never type the PIN, `40` end | `COMPLETED`, `meteredSeconds 0`, no ledger entry | |
 
 ---
 
-## 13. Full walkthrough (smoke test, about 10 minutes)
+## 14. Full walkthrough (smoke test, about 10 minutes)
 
-One run through every part. Stop at the first failure and note the step.
-
-1. Start the stack. Console: `node scripts/station-console.mjs`. `e`, `1`: enroll `STATION-DEV-01` and mint its token. `e`, `4`: admission cases `all passed`. Start the agent with the printed lines, pick the station.
-2. `[station_status] ONLINE`, `[catalog_status]` arrive.
-3. `u`, `1`: create a gamer. Note the `gamerProfileId`.
-4. `b`, `2`: pricing `6000` / `6000`.
-5. `w`, `3`: credit `10000`. `w`, `1`: balance `10000`.
-6. `m`, `2`: membership plan price `5`, discount `50`. `m`, `5`: purchase. Wallet `9500`.
-7. `g`, `3` then `4`: create `notepad` and assign it to the station. `[catalog_status]` `notepad installed=true`.
-8. `1` LOCK: PC locked.
-9. `b`, `3`: CONFIRMED reservation. `b`, `6`: start session, rate `50`, note the PIN.
-10. Type the PIN on the PC: desktop unlocks. `b`, `7`: `ACTIVE`.
-11. `4` LAUNCH_GAME `notepad`: Notepad opens.
-12. Wait 2 minutes. `1` LOCK: `PAUSED`, about 120 s metered.
-13. `2` UNLOCK. Wait 1 minute.
-14. `b`, `9` end session. `b`, `8` watch: `COMPLETED`, `totalCents` about 150.
-15. `w`, `2`: `PAYMENT -150` (about) with the session id. Balance about `9350`.
-16. `t` telemetry and `a` alerts answer. `c` shows every command `ACKED`.
+1. Stack up. `node scripts/station-console.mjs` (logs in as `hq-admin`). `o`: observer on.
+2. `11`: note the branch id. `14`: mint a token. Start the real agent **elevated** with it.
+3. `11` status `PENDING`: the PC's machine. `16` approve. `[station_status] ONLINE`, `[catalog_status]`.
+4. `20`: provision a stand-in. `22`: admission cases `all passed`.
+5. `64`: pricing `6000` / `6000`.
+6. `l`, `n`: log in as `gamer.wood`. `41`: note the balance. `s`: back to admin.
+7. `45`: credit `10000` to the gamer.
+8. `24`, `28`: create `notepad` and attach it to the real station. `[catalog_status]` `notepad installed=true`.
+9. `32` LOCK: PC locked.
+10. `s` (gamer): `61` walk-in 60 minutes. `s` (admin): `38` create session, note the PIN.
+11. Type the PIN on the PC: desktop unlocks. `39`: `ACTIVE`.
+12. `32` LAUNCH_GAME `notepad`: Notepad opens.
+13. Wait 2 minutes. `40` end session. `39`: `COMPLETED`, `totalCents` about 200.
+14. `44`: `PAYMENT` with the session id.
+15. `35` telemetry and `36` alerts answer. `33`: every command `ACKED`.
 
 ---
 
-## 14. Known limitations (not failures)
+## 15. Known limitations (not failures)
 
 - SHUTDOWN is a stub on the agent: the PC stays on.
-- `runningGameId` only updates on reconnect (`state_report`), so it shows `-`
-  after a launch until the agent reconnects.
-- Deactivating a station does not close its open socket.
+- `runningGameId` only updates on reconnect (`state_report`).
+- Revoking a station does not close its open socket; the next reconnect is refused.
+- No REST route undoes a revoke: the machine must enroll again.
 - In dev on Docker Desktop, `ip` shows the Docker gateway, not the PC.
-- Reservations have no REST route: created with SQL for this test.
 - Starting or ending a session does not change the reservation's status.
 - Subscription benefit windows are not applied to the session rate; only the
   membership discount is.
-- No run-out timer yet: a session keeps metering when the wallet cannot cover it.
-  The shortfall only shows as `debitFailed: true` at settlement.
-- A session started while the station is offline stays `PENDING`, and a second
-  `POST /sessions` is refused (`SESSION_ALREADY_STARTED`). Resend the booking
-  UNLOCK by hand (12.24).
-- **Security gap, to fix (7.10):** `/dashboard-io` accepts any user token and
-  puts a user without `branchId` in `branch:all`. A GAMER has no branch, so it
-  receives every branch's station, command, telemetry and alert events. The
-  gateway should refuse scopes below staff.
+- The stand-in agent enrolls but does not connect to `/agent-ws`: it stays OFFLINE.
+- **Security gap, to fix (8.6):** `/dashboard-io` accepts any user token and puts a
+  user without `branchId` in `branch:all`. A GAMER has no branch, so it receives
+  every branch's events. The gateway should refuse scopes below staff.
