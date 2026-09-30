@@ -384,6 +384,18 @@ describe('EnrollmentService', () => {
       });
     });
 
+    it('rejects a rotation whose bound machine no longer exists', async () => {
+      tokensRepo.findByHash.mockResolvedValue(rotationRecord());
+      machinesRepo.findById.mockResolvedValue(null);
+
+      await expect(service.redeem(enrollmentDto())).resolves.toEqual({
+        status: 'REJECTED',
+        reason: 'MACHINE_NOT_FOUND',
+      });
+      expect(tokensRepo.consume).not.toHaveBeenCalled();
+      expect(machinesRepo.rotateCredential).not.toHaveBeenCalled();
+    });
+
     it('rejects a rotation whose serial number does not match the bound machine', async () => {
       tokensRepo.findByHash.mockResolvedValue(rotationRecord());
       machinesRepo.findById.mockResolvedValue(
