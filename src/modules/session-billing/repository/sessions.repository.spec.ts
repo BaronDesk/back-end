@@ -104,3 +104,35 @@ describe('SessionsRepository early no-show', () => {
     expect(tx.reservation.updateMany).not.toHaveBeenCalled();
   });
 });
+
+describe('SessionsRepository.closeAsNoShow', () => {
+  function setup(sessionCount: number) {
+    const tx = {
+      session: { updateMany: vi.fn(async (_args: any) => ({ count: sessionCount })) },
+      reservation: { updateMany: vi.fn(async (_args: any) => ({ count: 1 })) },
+    };
+    const prisma = { $transaction: vi.fn(async (fn: (t: unknown) => unknown) => fn(tx)) };
+    return { tx, prisma, repo: new SessionsRepository(prisma as any) };
+  }
+
+  it('cancels a PENDING session, drops its PIN, and marks the reservation NO_SHOW in one transaction', async () => {
+    const { tx, prisma, repo } = setup(1);
+    expect(await repo.closeAsNoShow('s1', 'r1')).toBe(true);
+    expect(prisma.$transaction).toHaveBeenCalledOnce();
+    expect(tx.session.updateMany).toHaveBeenCalledWith({
+      where: { id: 's1', status: 'PENDING' },
+      data: { status: 'CANCELLED', pinHash: null },
+    });
+    expect(tx.reservation.updateMany).toHaveBeenCalledWith({
+      where: { id: 'r1', status: { in: ['CONFIRMED', 'ACTIVE'] } },
+      data: { status: 'NO_SHOW' },
+    });
+  });
+
+  it('can require the PIN unused, and leaves the reservation alone when the session was not PENDING', async () => {
+    const { tx, repo } = setup(0);
+    expect(await repo.closeAsNoShow('s1', 'r1', { unusedPinOnly: true })).toBe(false);
+    expect(tx.session.updateMany.mock.calls[0][0].where).toEqual({ id: 's1', status: 'PENDING', pinUsedAt: null });
+    expect(tx.reservation.updateMany).not.toHaveBeenCalled();
+  });
+});

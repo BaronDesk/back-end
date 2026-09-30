@@ -179,9 +179,12 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
 
   /**
    * Staff close-out that does not wait for the station. Asks the station to
-   * end the session (skipped if offline), then settles at once from server
-   * state, metered up to now. A later presence sessionEnded finds the session
-   * COMPLETED and does nothing; the debit key is shared, so it never bills twice.
+   * end the session (skipped if offline), then closes at once from server
+   * state, the session and its reservation in one transaction:
+   * - ACTIVE/PAUSED (it played): settled, metered up to now -> COMPLETED / COMPLETED.
+   * - PENDING (never activated): no metering, no debit -> CANCELLED / NO_SHOW.
+   * A later presence sessionEnded finds the session closed and does nothing;
+   * the debit key is shared, so it never bills twice.
    */
   async forceClose(caller: AccessTokenPayload, id: string, reason?: string) {
     const session = await this.repo.findByIdWithReservation(id);
@@ -196,8 +199,14 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
       // The station may be gone for good; settlement must not depend on it.
       this.logger.warn(`force-close END_SESSION for session ${id} failed: ${(err as Error).message}`);
     }
-    if (!(await this.settle(session, new Date()))) {
-      this.logger.log(`force-close of session ${id}: already settled by another path`);
+    // One retry covers a PENDING session that presence activated between the read and the close.
+    let current: typeof session | null = session;
+    for (let attempt = 0; attempt < 2 && current && OPEN_SESSION_STATUSES.includes(current.status); attempt++) {
+      const closed = current.status === 'PENDING'
+        ? await this.repo.closeAsNoShow(current.id, current.reservationId)
+        : await this.settle(current, new Date());
+      if (closed) break;
+      current = await this.repo.findByIdWithReservation(id);
     }
     await this.runoutTimer.cancel(id);
     const closed = await this.repo.findByIdWithReservation(id);
@@ -343,8 +352,9 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
       }
       for (const session of await this.repo.findOverdueOpen(now)) {
         if (session.status === 'PENDING' && !session.pinUsedAt) {
-          await this.repo.cancelPending(session.id);
-          this.logger.log(`session ${session.id} cancelled: reservation window passed without a login`);
+          if (await this.repo.closeAsNoShow(session.id, session.reservationId, { unusedPinOnly: true })) {
+            this.logger.log(`session ${session.id} cancelled, reservation NO_SHOW: window passed without a login`);
+          }
         } else {
           await this.closeOverdue(session);
         }

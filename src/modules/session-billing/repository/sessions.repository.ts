@@ -104,7 +104,12 @@ export class SessionsRepository extends BaseRepository {
     return count === 1;
   }
 
-  /** Closes a PENDING session nobody logged into, expiring its PIN. */
+  /**
+   * Cancels a PENDING session nobody logged into, expiring its PIN. Leaves the
+   * reservation CONFIRMED: only for start()'s dead-PIN replacement, which
+   * creates the new session in the same transaction. To close a session for
+   * good, use closeAsNoShow() or complete().
+   */
   cancelPending(id: string, tx?: Prisma.TransactionClient) {
     return (tx ?? this.prisma).session.updateMany({
       where: { id, status: 'PENDING', pinUsedAt: null },
@@ -131,6 +136,27 @@ export class SessionsRepository extends BaseRepository {
       await tx.reservation.updateMany({
         where: { id: reservationId, status: { in: ['CONFIRMED', 'ACTIVE'] } },
         data: { status: 'COMPLETED' },
+      });
+      return true;
+    });
+  }
+
+  /**
+   * A PENDING session that never played closes as CANCELLED (PIN hash dropped)
+   * and its reservation -> NO_SHOW, in one transaction. unusedPinOnly skips a
+   * session whose PIN was spent meanwhile. False if the session was no longer
+   * PENDING: nothing changes.
+   */
+  closeAsNoShow(id: string, reservationId: string, { unusedPinOnly = false } = {}): Promise<boolean> {
+    return this.prisma.$transaction(async (tx) => {
+      const { count } = await tx.session.updateMany({
+        where: { id, status: 'PENDING', ...(unusedPinOnly ? { pinUsedAt: null } : {}) },
+        data: { status: 'CANCELLED', pinHash: null },
+      });
+      if (count === 0) return false;
+      await tx.reservation.updateMany({
+        where: { id: reservationId, status: { in: ['CONFIRMED', 'ACTIVE'] } },
+        data: { status: 'NO_SHOW' },
       });
       return true;
     });

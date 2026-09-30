@@ -76,6 +76,7 @@ describe('SessionsService', () => {
       findOverdueOpen: vi.fn(async () => []),
       findExpiredUnusedPins: vi.fn(async () => []),
       expireAsNoShow: vi.fn(async () => true),
+      closeAsNoShow: vi.fn(async () => true),
       markNoShows: vi.fn(async () => 0),
     };
     presence = { statusChanges: new Subject(), sessionEnded: new Subject(), isOnline: vi.fn(() => true) };
@@ -443,7 +444,8 @@ describe('SessionsService', () => {
       repo.findOverdueOpen.mockResolvedValueOnce([sessionRow({ id: 'p1', status: 'PENDING', pinUsedAt: null, ...past })]);
       repo.markNoShows.mockResolvedValueOnce(1);
       await service.sweep();
-      expect(repo.cancelPending).toHaveBeenCalledWith('p1');
+      expect(repo.closeAsNoShow).toHaveBeenCalledWith('p1', 'res-1', { unusedPinOnly: true });
+      expect(repo.cancelPending).not.toHaveBeenCalled();
       expect(repo.markNoShows).toHaveBeenCalledWith(expect.any(Date));
       expect(wallet.debit).not.toHaveBeenCalled();
       expect(commands.issueSystemEndSession).not.toHaveBeenCalled();
@@ -462,18 +464,38 @@ describe('SessionsService', () => {
   });
 
   describe('forceClose', () => {
-    /** One stored session row that complete() closes only while it is still open, like the guarded repo write. */
-    let row: ReturnType<typeof sessionRow>;
+    /**
+     * One stored session row plus its reservation's status. complete() and
+     * closeAsNoShow() move both together, and only while the session is still
+     * open / PENDING, like the guarded repo writes.
+     */
+    let row: Record<string, any>;
+    let reservationStatus: string;
 
     beforeEach(() => {
       row = sessionRow({ status: 'ACTIVE', meteringStartedAt: new Date(Date.now() - 5 * 60_000) });
+      reservationStatus = 'ACTIVE';
       repo.findByIdWithReservation.mockImplementation(async () => ({ ...row }));
       repo.findForSettlement.mockImplementation(async () => ({ ...row }));
       repo.complete.mockImplementation(async (_id: string, _reservationId: string, data: Record<string, unknown>) => {
         if (!['PENDING', 'ACTIVE', 'PAUSED'].includes(row.status)) return false;
         row = { ...row, ...data };
+        if (['CONFIRMED', 'ACTIVE'].includes(reservationStatus)) reservationStatus = 'COMPLETED';
         return true;
       });
+      repo.closeAsNoShow.mockImplementation(async () => {
+        if (row.status !== 'PENDING') return false;
+        row = { ...row, status: 'CANCELLED', pinHash: null };
+        if (['CONFIRMED', 'ACTIVE'].includes(reservationStatus)) reservationStatus = 'NO_SHOW';
+        return true;
+      });
+    });
+
+    afterEach(() => {
+      // Whatever force-close did, the reservation never stays standing behind a closed session.
+      if (!['PENDING', 'ACTIVE', 'PAUSED'].includes(row.status)) {
+        expect(['CONFIRMED', 'ACTIVE']).not.toContain(reservationStatus);
+      }
     });
 
     it('settles an ACTIVE session at once, completes the reservation, ends it on the station and cancels the run-out timer', async () => {
@@ -489,6 +511,54 @@ describe('SessionsService', () => {
       expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED', meteredSeconds: 300 }));
       expect(runoutTimer.cancel).toHaveBeenCalledWith('s1');
       expect(result).toMatchObject({ id: 's1', status: 'COMPLETED' });
+      expect(reservationStatus).toBe('COMPLETED');
+      expect(repo.closeAsNoShow).not.toHaveBeenCalled();
+    });
+
+    it('closes a never-logged-in PENDING session as CANCELLED and its reservation as NO_SHOW, without settlement or debit', async () => {
+      row = sessionRow({ status: 'PENDING', pinHash: '$argon2id$hash', pinExpiresAt: new Date(Date.now() + 60_000) });
+      reservationStatus = 'CONFIRMED';
+
+      const result = await service.forceClose(caller(), 's1');
+
+      expect(commands.issueSystemEndSession).toHaveBeenCalledWith('m1', 'force_close');
+      expect(repo.closeAsNoShow).toHaveBeenCalledWith('s1', 'res-1');
+      expect(row).toMatchObject({ status: 'CANCELLED', pinHash: null });
+      expect(reservationStatus).toBe('NO_SHOW');
+      expect(result).toMatchObject({ status: 'CANCELLED' });
+      expect(wallet.debit).not.toHaveBeenCalled();
+      expect(repo.complete).not.toHaveBeenCalled();
+      expect(runoutTimer.cancel).toHaveBeenCalledWith('s1');
+    });
+
+    it('settles instead when a PENDING session was activated between the read and the close', async () => {
+      row = sessionRow({ status: 'PENDING', pinUsedAt: new Date() });
+      reservationStatus = 'CONFIRMED';
+      repo.closeAsNoShow.mockImplementationOnce(async () => {
+        // Presence reported the unlock first: the session is ACTIVE now.
+        row = { ...row, status: 'ACTIVE', meteringStartedAt: new Date(Date.now() - 60_000) };
+        reservationStatus = 'ACTIVE';
+        return false;
+      });
+
+      await service.forceClose(caller(), 's1');
+
+      expect(repo.complete).toHaveBeenCalledOnce();
+      expect(row.status).toBe('COMPLETED');
+      expect(reservationStatus).toBe('COMPLETED');
+      expect(wallet.debit).toHaveBeenCalledOnce();
+    });
+
+    it('a late sessionEnded after force-closing a PENDING session does nothing', async () => {
+      row = sessionRow({ status: 'PENDING' });
+      reservationStatus = 'CONFIRMED';
+      await service.forceClose(caller(), 's1');
+      presence.sessionEnded.next({ sessionId: 's1', endedAt: new Date().toISOString() });
+      await flush();
+      expect(repo.complete).not.toHaveBeenCalled();
+      expect(repo.closeAsNoShow).toHaveBeenCalledOnce();
+      expect(wallet.debit).not.toHaveBeenCalled();
+      expect(reservationStatus).toBe('NO_SHOW');
     });
 
     it('meters no further than the reservation window', async () => {
@@ -513,6 +583,7 @@ describe('SessionsService', () => {
       expect(wallet.debit).toHaveBeenCalledOnce();
       expect(repo.complete).toHaveBeenCalledOnce();
       expect(row.billingBreakdown).toMatchObject({ meteredSeconds: 300, totalCents: 500 });
+      expect(reservationStatus).toBe('COMPLETED');
     });
 
     it('racing sessionEnded that read the session while open closes nothing twice and reuses the debit key', async () => {
@@ -532,10 +603,13 @@ describe('SessionsService', () => {
 
     it.each(['COMPLETED', 'CANCELLED'])('409s SESSION_NOT_OPEN for a %s session and touches nothing', async (status) => {
       row = sessionRow({ status });
+      reservationStatus = status === 'COMPLETED' ? 'COMPLETED' : 'NO_SHOW';
       await expect(service.forceClose(caller(), 's1')).rejects.toMatchObject({ response: { code: 'SESSION_NOT_OPEN' } });
       expect(commands.issueSystemEndSession).not.toHaveBeenCalled();
       expect(wallet.debit).not.toHaveBeenCalled();
       expect(repo.complete).not.toHaveBeenCalled();
+      expect(repo.closeAsNoShow).not.toHaveBeenCalled();
+      expect(runoutTimer.cancel).not.toHaveBeenCalled();
     });
 
     it('404s a missing session and rejects a cross-branch caller', async () => {
