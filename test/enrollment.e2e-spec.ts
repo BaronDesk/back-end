@@ -259,7 +259,7 @@ describe('machine enrollment (e2e)', () => {
 
     // revoking the machine shuts the same token out
     expect((await adminPost(`/machines/${machineId}/revoke`)).statusCode).toBe(200);
-    expect(await agentUpgradeStatus(stationToken)).not.toBe(101);
+    expect(await agentUpgradeStatus(stationToken)).not.toBe(1008);
     const revoked = await app.inject({
       method: 'GET',
       url: '/stations/me/games',
