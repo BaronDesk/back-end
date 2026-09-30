@@ -43,6 +43,8 @@ function toLease(seconds: number, now: Date): StationLease {
 
 const notFound = (code: string, error: string) => new NotFoundException({ code, error });
 
+const machineBusy = () => new ConflictException({ code: 'MACHINE_BUSY', error: 'station already has an active session' });
+
 type SettlementSession = NonNullable<Awaited<ReturnType<SessionsRepository['findForSettlement']>>>;
 
 /**
@@ -125,26 +127,33 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
     if (!this.presence.isOnline(reservation.machine.serialNumber)) {
       throw new ConflictException({ code: 'STATION_OFFLINE', error: 'station is not online' });
     }
-    const open = await this.repo.findActiveForReservation(reservationId);
-    if (open) {
-      // A PIN that expired or was burned unused can be replaced; anything else is a live session.
-      if (!this.isDeadPin(open, now)) {
-        throw new ConflictException({ code: 'SESSION_ALREADY_STARTED', error: 'reservation already has an open session' });
-      }
-      await this.repo.cancelPending(open.id);
-    }
-
     const rate = await this.computeRate(reservation.machine.branchId, reservation.gamerProfileId);
     const pin = generatePin();
+    const pinHash = await hashPin(pin);
     const pinWindowStart = Math.max(now.getTime(), reservation.startTime.getTime());
-    const session = await this.repo.create({
-      reservationId,
-      appliedMembershipId: rate.membershipId,
-      startTime: reservation.startTime,
-      endTime: reservation.endTime,
-      rateCentsPerMinute: rate.centsPerMinute,
-      pinHash: await hashPin(pin),
-      pinExpiresAt: new Date(Math.min(pinWindowStart + this.pinTtlMs, reservation.endTime.getTime())),
+
+    // A station holds at most one open session. Check and create under the
+    // station's advisory lock so concurrent starts cannot both win.
+    const session = await this.repo.withMachineLock(reservation.machineId, async (tx) => {
+      const open = await this.repo.findOpenSessionForMachine(reservation.machineId, tx);
+      if (open) {
+        if (open.reservationId !== reservationId) throw machineBusy();
+        // A PIN that expired or was burned unused can be replaced; anything else is a live session.
+        if (!this.isDeadPin(open, now)) {
+          throw new ConflictException({ code: 'SESSION_ALREADY_STARTED', error: 'reservation already has an open session' });
+        }
+        await this.repo.cancelPending(open.id, tx);
+        if (await this.repo.findOpenSessionForMachine(reservation.machineId, tx)) throw machineBusy();
+      }
+      return this.repo.create({
+        reservationId,
+        appliedMembershipId: rate.membershipId,
+        startTime: reservation.startTime,
+        endTime: reservation.endTime,
+        rateCentsPerMinute: rate.centsPerMinute,
+        pinHash,
+        pinExpiresAt: new Date(Math.min(pinWindowStart + this.pinTtlMs, reservation.endTime.getTime())),
+      }, tx);
     });
 
     return { ...toSessionDto(session as SessionRecord), pin };

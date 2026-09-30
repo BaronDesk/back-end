@@ -1,0 +1,39 @@
+import { describe, expect, it, vi } from 'vitest';
+
+import { SessionsRepository } from './sessions.repository.js';
+
+describe('SessionsRepository station lock', () => {
+  it('runs the callback in one transaction holding the station advisory lock', async () => {
+    const order: string[] = [];
+    const tx = {
+      $executeRaw: vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        order.push(`lock:${strings.join('?')}:${values.join(',')}`);
+      }),
+    };
+    const prisma = { $transaction: vi.fn(async (fn: (t: unknown) => unknown) => fn(tx)) };
+    const repo = new SessionsRepository(prisma as any);
+
+    const result = await repo.withMachineLock('m1', async (t) => {
+      order.push('fn');
+      expect(t).toBe(tx);
+      return 'done';
+    });
+
+    expect(result).toBe('done');
+    expect(prisma.$transaction).toHaveBeenCalledOnce();
+    expect(order).toEqual(['lock:SELECT pg_advisory_xact_lock(hashtext(?)):m1', 'fn']);
+  });
+
+  it('finds open sessions by the reservation machine, on the given transaction', async () => {
+    const tx = { session: { findFirst: vi.fn(async () => null) } };
+    const prisma = { session: { findFirst: vi.fn() } };
+    const repo = new SessionsRepository(prisma as any);
+
+    await repo.findOpenSessionForMachine('m1', tx as any);
+
+    expect(prisma.session.findFirst).not.toHaveBeenCalled();
+    expect(tx.session.findFirst).toHaveBeenCalledWith({
+      where: { status: { in: ['PENDING', 'ACTIVE', 'PAUSED'] }, reservation: { machineId: 'm1' } },
+    });
+  });
+});

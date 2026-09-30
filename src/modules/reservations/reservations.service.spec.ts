@@ -21,6 +21,7 @@ describe('ReservationsRepository.createIfAvailable', () => {
     tx = {
       $executeRaw: vi.fn(async () => undefined),
       machine: { findUnique: vi.fn(async () => ({ id: MACHINE_ID, enrollmentStatus: 'ENROLLED', status: 'ONLINE' })) },
+      session: { findFirst: vi.fn(async () => null) },
       reservation: {
         findFirst: vi.fn(async () => null),
         create: vi.fn(async ({ data }) => ({ id: 'r1', ...data })),
@@ -43,6 +44,23 @@ describe('ReservationsRepository.createIfAvailable', () => {
     expect(await repo.createIfAvailable('g1', slot(), true)).toEqual({ kind: 'slot_taken' });
     expect(tx.reservation.findFirst.mock.calls[0][0].where.status).toEqual({ in: ['PENDING', 'CONFIRMED', 'ACTIVE'] });
     expect(tx.reservation.create).not.toHaveBeenCalled();
+  });
+
+  it('rejects a walk-in while the station holds an open session, under the station lock', async () => {
+    tx.session.findFirst.mockResolvedValueOnce({ id: 's-open' });
+    expect(await repo.createIfAvailable('g1', slot(), true)).toEqual({ kind: 'slot_taken' });
+    expect(tx.$executeRaw).toHaveBeenCalledBefore(tx.session.findFirst);
+    expect(tx.session.findFirst.mock.calls[0][0].where).toEqual({
+      status: { in: ['PENDING', 'ACTIVE', 'PAUSED'] },
+      reservation: { machineId: MACHINE_ID },
+    });
+    expect(tx.reservation.create).not.toHaveBeenCalled();
+  });
+
+  it('does not check open sessions for a future booking', async () => {
+    const later = { ...slot(), startTime: new Date(Date.now() + 60 * 60_000), endTime: new Date(Date.now() + 2 * 60 * 60_000) };
+    expect(await repo.createIfAvailable('g1', later)).toMatchObject({ kind: 'created' });
+    expect(tx.session.findFirst).not.toHaveBeenCalled();
   });
 });
 

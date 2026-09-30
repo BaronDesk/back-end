@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 
 import { BaseRepository } from '../../common/repository/base.repository.js';
 import { PrismaService } from '../../infra/prisma/prisma.service.js';
+import { OPEN_SESSION_STATUSES } from '../session-billing/repository/sessions.repository.js';
 import type { CreateReservationDto } from './reservations.schemas.js';
 
 @Injectable()
@@ -37,6 +38,16 @@ export class ReservationsRepository extends BaseRepository {
 
       if (walkIn && input.startTime.getTime() > Date.now() + 60_000) {
         return { kind: 'invalid_walk_in' as const };
+      }
+
+      // A walk-in starts now: fail fast if the station still holds an open
+      // session, even one whose reservation window no longer overlaps.
+      if (walkIn) {
+        const busy = await tx.session.findFirst({
+          where: { status: { in: OPEN_SESSION_STATUSES }, reservation: { machineId: input.machineId } },
+          select: { id: true },
+        });
+        if (busy) return { kind: 'slot_taken' as const };
       }
 
       // ACTIVE = a session is running on this reservation (set by session-billing).

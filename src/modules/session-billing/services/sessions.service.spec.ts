@@ -60,7 +60,8 @@ describe('SessionsService', () => {
   beforeEach(() => {
     repo = {
       findReservationForStart: vi.fn(async () => reservation()),
-      findActiveForReservation: vi.fn(async () => null),
+      withMachineLock: vi.fn(async (_machineId, fn) => fn('tx')),
+      findOpenSessionForMachine: vi.fn(async () => null),
       create: vi.fn(async (data) => sessionRow(data)),
       cancelPending: vi.fn(async () => ({ count: 1 })),
       findById: vi.fn(async () => sessionRow({ status: 'PENDING', pinUsedAt: new Date() })),
@@ -129,7 +130,7 @@ describe('SessionsService', () => {
       membership.getActiveDiscountForGamer.mockResolvedValueOnce({ membershipId: 'ms1', discountPercent: 10 });
       await service.start(caller(), 'res-1');
       // 6000c/hr * 0.9 = 5400c/hr = 90c/min
-      expect(repo.create).toHaveBeenCalledWith(expect.objectContaining({ rateCentsPerMinute: 90, appliedMembershipId: 'ms1' }));
+      expect(repo.create.mock.calls[0][0]).toMatchObject({ rateCentsPerMinute: 90, appliedMembershipId: 'ms1' });
     });
 
     it('404s for a missing reservation, and rejects a cross-branch caller', async () => {
@@ -166,17 +167,79 @@ describe('SessionsService', () => {
     });
 
     it('rejects a reservation with a live open session', async () => {
-      repo.findActiveForReservation.mockResolvedValueOnce(sessionRow({ pinExpiresAt: new Date(Date.now() + 60_000) }));
+      repo.findOpenSessionForMachine.mockResolvedValueOnce(sessionRow({ pinExpiresAt: new Date(Date.now() + 60_000) }));
+      await expect(service.start(caller(), 'res-1')).rejects.toMatchObject({ response: { code: 'SESSION_ALREADY_STARTED' } });
+      repo.findOpenSessionForMachine.mockResolvedValueOnce(sessionRow({ status: 'ACTIVE' }));
       await expect(service.start(caller(), 'res-1')).rejects.toBeInstanceOf(ConflictException);
-      repo.findActiveForReservation.mockResolvedValueOnce(sessionRow({ status: 'ACTIVE' }));
-      await expect(service.start(caller(), 'res-1')).rejects.toBeInstanceOf(ConflictException);
+      expect(repo.create).not.toHaveBeenCalled();
     });
 
-    it('replaces a PENDING session whose PIN expired unused', async () => {
-      repo.findActiveForReservation.mockResolvedValueOnce(sessionRow({ id: 'old', pinExpiresAt: new Date(Date.now() - 1000) }));
+    it('replaces a PENDING session whose PIN expired unused, inside the station lock', async () => {
+      repo.findOpenSessionForMachine.mockResolvedValueOnce(sessionRow({ id: 'old', pinExpiresAt: new Date(Date.now() - 1000) }));
       await service.start(caller(), 'res-1');
-      expect(repo.cancelPending).toHaveBeenCalledWith('old');
+      expect(repo.withMachineLock).toHaveBeenCalledWith('m1', expect.any(Function));
+      expect(repo.cancelPending).toHaveBeenCalledWith('old', 'tx');
+      expect(repo.create).toHaveBeenCalledWith(expect.objectContaining({ reservationId: 'res-1' }), 'tx');
+    });
+
+    it('replaces a PENDING session whose PIN ran out of attempts', async () => {
+      repo.findOpenSessionForMachine.mockResolvedValueOnce(
+        sessionRow({ id: 'old', pinExpiresAt: new Date(Date.now() + 60_000), pinAttempts: MAX_ATTEMPTS }),
+      );
+      await service.start(caller(), 'res-1');
+      expect(repo.cancelPending).toHaveBeenCalledWith('old', 'tx');
       expect(repo.create).toHaveBeenCalled();
+    });
+
+    it('409s MACHINE_BUSY when another reservation holds an open session on the station', async () => {
+      for (const open of [
+        sessionRow({ id: 'other', reservationId: 'res-2', status: 'ACTIVE' }),
+        sessionRow({ id: 'other', reservationId: 'res-2', status: 'PAUSED' }),
+        // Even a dead PIN on another reservation is not this start's to replace.
+        sessionRow({ id: 'other', reservationId: 'res-2', pinExpiresAt: new Date(Date.now() - 1000) }),
+      ]) {
+        repo.findOpenSessionForMachine.mockResolvedValueOnce(open);
+        await expect(service.start(caller(), 'res-1')).rejects.toMatchObject({
+          response: { code: 'MACHINE_BUSY', error: 'station already has an active session' },
+        });
+      }
+      expect(repo.findOpenSessionForMachine).toHaveBeenCalledWith('m1', 'tx');
+      expect(repo.cancelPending).not.toHaveBeenCalled();
+      expect(repo.create).not.toHaveBeenCalled();
+    });
+
+    it('409s MACHINE_BUSY if another open session remains after replacing a dead PIN', async () => {
+      repo.findOpenSessionForMachine
+        .mockResolvedValueOnce(sessionRow({ id: 'old', pinExpiresAt: new Date(Date.now() - 1000) }))
+        .mockResolvedValueOnce(sessionRow({ id: 'other', reservationId: 'res-2', status: 'ACTIVE' }));
+      await expect(service.start(caller(), 'res-1')).rejects.toMatchObject({ response: { code: 'MACHINE_BUSY' } });
+      expect(repo.create).not.toHaveBeenCalled();
+    });
+
+    it('lets exactly one of two concurrent starts on one station win', async () => {
+      // In-memory station: the lock mock serializes callbacks the way pg_advisory_xact_lock does.
+      const sessions: any[] = [];
+      let tail: Promise<unknown> = Promise.resolve();
+      repo.withMachineLock.mockImplementation((_machineId: string, fn: (tx: unknown) => Promise<unknown>) => {
+        const run = tail.then(() => fn('tx'));
+        tail = run.catch(() => undefined);
+        return run;
+      });
+      repo.findOpenSessionForMachine.mockImplementation(async () => sessions.find((s) => ['PENDING', 'ACTIVE', 'PAUSED'].includes(s.status)) ?? null);
+      repo.create.mockImplementation(async (data: Record<string, unknown>) => {
+        await flush(); // yield, so an unlocked check-then-create would interleave
+        const row = sessionRow({ id: `s${sessions.length + 1}`, ...data });
+        sessions.push(row);
+        return row;
+      });
+      repo.findReservationForStart.mockImplementation(async (id: string) => reservation({ id }));
+
+      const results = await Promise.allSettled([service.start(caller(), 'res-1'), service.start(caller(), 'res-2')]);
+
+      expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+      const [loser] = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+      expect(loser.reason).toMatchObject({ response: { code: 'MACHINE_BUSY' } });
+      expect(sessions).toHaveLength(1);
     });
   });
 

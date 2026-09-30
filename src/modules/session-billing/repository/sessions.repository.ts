@@ -44,8 +44,22 @@ export class SessionsRepository extends BaseRepository {
     return this.prisma.reservation.findUnique({ where: { id: reservationId }, include: { machine: true } });
   }
 
-  findActiveForReservation(reservationId: string) {
-    return this.prisma.session.findFirst({ where: { reservationId, status: { in: OPEN_SESSION_STATUSES } } });
+  /** Any PENDING/ACTIVE/PAUSED session on this station; a station holds at most one. */
+  findOpenSessionForMachine(machineId: string, tx?: Prisma.TransactionClient) {
+    return (tx ?? this.prisma).session.findFirst({
+      where: { status: { in: OPEN_SESSION_STATUSES }, reservation: { machineId } },
+    });
+  }
+
+  /**
+   * Runs fn in one transaction holding the station's advisory lock — the same
+   * lock reservations take — so check-then-create on a station is serialized.
+   */
+  withMachineLock<T>(machineId: string, fn: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${machineId}))`;
+      return fn(tx);
+    });
   }
 
   /** The ACTIVE session for a gamer, if any — reschedules on a wallet top-up. */
@@ -56,8 +70,8 @@ export class SessionsRepository extends BaseRepository {
     });
   }
 
-  create(data: CreateSessionInput) {
-    return this.prisma.session.create({ data: { ...data, status: 'PENDING' } });
+  create(data: CreateSessionInput, tx?: Prisma.TransactionClient) {
+    return (tx ?? this.prisma).session.create({ data: { ...data, status: 'PENDING' } });
   }
 
   update(id: string, data: Prisma.SessionUpdateInput) {
@@ -91,8 +105,8 @@ export class SessionsRepository extends BaseRepository {
   }
 
   /** Closes a PENDING session nobody logged into, expiring its PIN. */
-  cancelPending(id: string) {
-    return this.prisma.session.updateMany({
+  cancelPending(id: string, tx?: Prisma.TransactionClient) {
+    return (tx ?? this.prisma).session.updateMany({
       where: { id, status: 'PENDING', pinUsedAt: null },
       data: { status: 'CANCELLED', pinHash: null },
     });
