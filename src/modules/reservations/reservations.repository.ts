@@ -57,9 +57,9 @@ export class ReservationsRepository extends BaseRepository {
           machineId: input.machineId,
           startTime: input.startTime,
           endTime: input.endTime,
-          // Walk-ins are CONFIRMED like any booking: staff start the session
-          // from it, and session-billing alone moves it to ACTIVE once the
-          // station reports the session running.
+          // Walk-ins are CONFIRMED like any booking: the gamer checks in on
+          // it for their PIN, and session-billing alone moves it to ACTIVE
+          // once the station reports the session running.
           status: 'CONFIRMED',
         },
         include: { machine: { select: { id: true, name: true, serialNumber: true, branchId: true } } },

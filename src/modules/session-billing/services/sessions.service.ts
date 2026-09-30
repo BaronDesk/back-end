@@ -31,6 +31,9 @@ import { RunoutTimerService } from './runout-timer.service.js';
 /** The only login method the backend accepts from the lock screen. */
 const PIN_METHOD = 'pin';
 
+/** A gamer can get their PIN from 15 minutes before the booked time. */
+const CHECK_IN_EARLY_MS = 15 * 60_000;
+
 const rejected = (reason: string): LoginDecision => ({ accepted: false, reason });
 
 function secondsBetween(from: Date, to: Date): number {
@@ -44,6 +47,7 @@ function toLease(seconds: number, now: Date): StationLease {
 const notFound = (code: string, error: string) => new NotFoundException({ code, error });
 
 type SettlementSession = NonNullable<Awaited<ReturnType<SessionsRepository['findForSettlement']>>>;
+type StartableReservation = NonNullable<Awaited<ReturnType<SessionsRepository['findReservationForStart']>>>;
 
 /**
  * Owns Session lifecycle, station login, leases, derived metering and
@@ -107,18 +111,47 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
   }
 
   /**
-   * Creates the PENDING session with a fresh PIN. Only the PIN's hash is
-   * stored; the plaintext is returned here, once, for staff to hand the gamer.
-   * Nothing is sent to the station: it unlocks only after an accepted login.
+   * Staff start: creates the PENDING session with a fresh PIN for the desk to
+   * hand the gamer. Gamers normally get their PIN themselves (checkIn).
    */
   async start(caller: AccessTokenPayload, reservationId: string) {
     const reservation = await this.repo.findReservationForStart(reservationId);
     if (!reservation) throw notFound('RESERVATION_NOT_FOUND', 'reservation not found');
     assertScope(caller, { branchId: reservation.machine.branchId });
+    const { session, pin } = await this.issuePin(reservation, new Date(), false);
+    return { ...toSessionDto(session as SessionRecord), pin };
+  }
+
+  /**
+   * The gamer's own check-in: the same PENDING session and PIN as start(),
+   * handed straight to the gamer. Opens CHECK_IN_EARLY_MS before the booking.
+   * Asking again replaces a PIN nobody has typed yet, so a lost PIN is never
+   * a dead end. The caller has already resolved the gamer's profile.
+   */
+  async checkIn(gamerProfileId: string, reservationId: string) {
+    const reservation = await this.repo.findReservationForStart(reservationId);
+    if (!reservation || reservation.gamerProfileId !== gamerProfileId) {
+      throw notFound('RESERVATION_NOT_FOUND', 'reservation not found');
+    }
+    const now = new Date();
+    if (reservation.startTime.getTime() - CHECK_IN_EARLY_MS > now.getTime()) {
+      throw new ConflictException({ code: 'RESERVATION_NOT_STARTED', error: 'check-in opens 15 minutes before the booking' });
+    }
+    const { session, pin } = await this.issuePin(reservation, now, true);
+    return { sessionId: session.id, reservationId, pin, pinExpiresAt: session.pinExpiresAt };
+  }
+
+  /**
+   * Creates the PENDING session with a fresh PIN. Only the PIN's hash is
+   * stored; the plaintext is returned here, once. Nothing is sent to the
+   * station: it unlocks only after an accepted login. `replaceUnusedPin`
+   * lets a PIN nobody typed yet be replaced even while it is still valid.
+   */
+  private async issuePin(reservation: StartableReservation, now: Date, replaceUnusedPin: boolean) {
+    const reservationId = reservation.id;
     if (reservation.status !== 'CONFIRMED') {
       throw new ConflictException({ code: 'RESERVATION_NOT_CONFIRMED', error: 'reservation is not confirmed' });
     }
-    const now = new Date();
     if (reservation.endTime <= now) {
       throw new ConflictException({ code: 'RESERVATION_EXPIRED', error: 'reservation window is over' });
     }
@@ -128,7 +161,8 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
     const open = await this.repo.findActiveForReservation(reservationId);
     if (open) {
       // A PIN that expired or was burned unused can be replaced; anything else is a live session.
-      if (!this.isDeadPin(open, now)) {
+      const replaceable = replaceUnusedPin ? open.status === 'PENDING' && !open.pinUsedAt : this.isDeadPin(open, now);
+      if (!replaceable) {
         throw new ConflictException({ code: 'SESSION_ALREADY_STARTED', error: 'reservation already has an open session' });
       }
       await this.repo.cancelPending(open.id);
@@ -147,7 +181,7 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
       pinExpiresAt: new Date(Math.min(pinWindowStart + this.pinTtlMs, reservation.endTime.getTime())),
     });
 
-    return { ...toSessionDto(session as SessionRecord), pin };
+    return { session, pin };
   }
 
   async get(caller: AccessTokenPayload, id: string) {

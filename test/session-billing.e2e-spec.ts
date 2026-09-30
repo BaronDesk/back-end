@@ -112,6 +112,10 @@ describe('session billing (e2e)', () => {
   /** Start + accepted login + the agent reporting itself unlocked: the session is ACTIVE. */
   async function startAndLogIn(agent: Agent, reservationId: string): Promise<string> {
     const { id: sessionId, pin } = (await start(reservationId)).json();
+    return logIn(agent, sessionId, pin);
+  }
+
+  async function logIn(agent: Agent, sessionId: string, pin: string): Promise<string> {
     expect(await typePin(agent, pin)).toMatchObject({ accepted: true });
     await vi.waitFor(() => expect(agent.commands.some((c) => c.type === 'UNLOCK')).toBe(true));
     agent.send('heartbeat', { locked: false, sessionId });
@@ -376,7 +380,7 @@ describe('session billing (e2e)', () => {
     agent.socket.close();
   });
 
-  it('starts a session from a gamer booking and from a walk-in; the session, not the booking, makes it ACTIVE', async () => {
+  it('the gamer gets the PIN for their booking and their walk-in; the session, not the booking, makes it ACTIVE', async () => {
     const gamer = await createGamer();
     await creditWallet(gamer.profileId, 100_000);
 
@@ -394,7 +398,9 @@ describe('session billing (e2e)', () => {
     });
     expect(booking.statusCode).toBe(201);
     expect(booking.json().status).toBe('CONFIRMED');
-    await startAndLogIn(bookedAgent, booking.json().id);
+    const checkIn = await app.inject({ method: 'POST', url: `/reservations/${booking.json().id}/check-in`, headers: as(gamer.token) });
+    expect(checkIn.statusCode).toBe(201);
+    await logIn(bookedAgent, checkIn.json().sessionId, checkIn.json().pin);
     expect(await reservationStatus(booking.json().id)).toBe('ACTIVE');
     bookedAgent.socket.close();
 
@@ -408,7 +414,8 @@ describe('session billing (e2e)', () => {
     });
     expect(walkIn.statusCode).toBe(201);
     expect(walkIn.json().status).toBe('CONFIRMED');
-    const sessionId = await startAndLogIn(walkInAgent, walkIn.json().id);
+    // Play now: the PIN comes with the walk-in, no desk step.
+    const sessionId = await logIn(walkInAgent, walkIn.json().checkIn.sessionId, walkIn.json().checkIn.pin);
     expect(await reservationStatus(walkIn.json().id)).toBe('ACTIVE');
 
     // A reservation whose session is already running cannot start a second one.

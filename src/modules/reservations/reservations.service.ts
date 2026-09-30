@@ -2,16 +2,23 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 
 import type { AccessTokenPayload } from '../../common/types/jwt-payload.js';
+import { SessionsService } from '../session-billing/services/sessions.service.js';
 import { ReservationsRepository } from './reservations.repository.js';
 import type { CreateReservationDto, WalkInDto } from './reservations.schemas.js';
 
 @Injectable()
 export class ReservationsService {
-  constructor(private readonly reservations: ReservationsRepository) {}
+  private readonly logger = new Logger(ReservationsService.name);
+
+  constructor(
+    private readonly reservations: ReservationsRepository,
+    private readonly sessions: SessionsService,
+  ) {}
 
   async list(caller: AccessTokenPayload) {
     const gamer = await this.getGamer(caller.sub);
@@ -34,7 +41,22 @@ export class ReservationsService {
       startTime,
       endTime: new Date(startTime.getTime() + input.durationMinutes * 60_000),
     }, true);
-    return this.unwrap(result);
+    const reservation = this.unwrap(result);
+    // The gamer plays now, so they get their PIN now. The booking stands even
+    // if that fails: the gamer can ask again with check-in.
+    let checkIn: Awaited<ReturnType<SessionsService['checkIn']>> | null = null;
+    try {
+      checkIn = await this.sessions.checkIn(gamer.id, reservation.id);
+    } catch (err) {
+      this.logger.warn(`walk-in ${reservation.id}: no PIN issued: ${(err as Error).message}`);
+    }
+    return { ...reservation, checkIn };
+  }
+
+  /** The gamer gets the PIN to type on the station for their own booking. */
+  async checkIn(caller: AccessTokenPayload, id: string) {
+    const gamer = await this.getGamer(caller.sub);
+    return this.sessions.checkIn(gamer.id, id);
   }
 
   async cancel(caller: AccessTokenPayload, id: string) {

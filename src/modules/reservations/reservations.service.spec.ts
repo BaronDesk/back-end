@@ -57,7 +57,7 @@ describe('ReservationsService.cancel', () => {
       findOwned: vi.fn(),
       cancel: vi.fn(async (id) => ({ id, status: 'CANCELLED' })),
     };
-    service = new ReservationsService(repo as any);
+    service = new ReservationsService(repo as any, {} as any);
   });
 
   it.each(['PENDING', 'CONFIRMED'])('cancels a %s reservation that has not started', async (status) => {
@@ -69,5 +69,36 @@ describe('ReservationsService.cancel', () => {
     repo.findOwned.mockResolvedValueOnce({ id: 'r1', status, startTime: future() });
     await expect(service.cancel(GAMER, 'r1')).rejects.toBeInstanceOf(ConflictException);
     expect(repo.cancel).not.toHaveBeenCalled();
+  });
+});
+
+describe('ReservationsService walk-in and check-in', () => {
+  let repo: Record<string, ReturnType<typeof vi.fn>>;
+  let sessions: { checkIn: ReturnType<typeof vi.fn> };
+  let service: ReservationsService;
+  const pin = { sessionId: 's1', reservationId: 'r1', pin: '123456', pinExpiresAt: new Date() };
+
+  beforeEach(() => {
+    repo = {
+      findGamerProfileId: vi.fn(async () => ({ id: 'g1' })),
+      createIfAvailable: vi.fn(async () => ({ kind: 'created', reservation: { id: 'r1', status: 'CONFIRMED' } })),
+    };
+    sessions = { checkIn: vi.fn(async () => pin) };
+    service = new ReservationsService(repo as any, sessions as any);
+  });
+
+  it('gives the walk-in gamer their PIN in the same answer', async () => {
+    await expect(service.walkIn(GAMER, { machineId: MACHINE_ID, durationMinutes: 60 })).resolves.toMatchObject({ id: 'r1', checkIn: pin });
+    expect(sessions.checkIn).toHaveBeenCalledWith('g1', 'r1');
+  });
+
+  it('keeps the walk-in when the PIN cannot be issued yet, without a PIN', async () => {
+    sessions.checkIn.mockRejectedValueOnce(new ConflictException({ code: 'STATION_OFFLINE' }));
+    await expect(service.walkIn(GAMER, { machineId: MACHINE_ID, durationMinutes: 60 })).resolves.toMatchObject({ id: 'r1', checkIn: null });
+  });
+
+  it("checks in on the caller's own gamer profile", async () => {
+    await expect(service.checkIn(GAMER, 'r1')).resolves.toBe(pin);
+    expect(sessions.checkIn).toHaveBeenCalledWith('g1', 'r1');
   });
 });

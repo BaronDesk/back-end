@@ -36,6 +36,14 @@ export class ReservationsController {
     return this.reservations.walkIn(caller, dto);
   }
 
+  @Post(':id/check-in')
+  checkIn(
+    @CurrentUser() caller: AccessTokenPayload,
+    @Param('id', new ZodValidationPipe(reservationIdSchema)) id: string,
+  ) {
+    return this.reservations.checkIn(caller, id);
+  }
+
   @Delete(':id')
   cancel(
     @CurrentUser() caller: AccessTokenPayload,

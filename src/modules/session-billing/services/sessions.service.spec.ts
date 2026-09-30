@@ -180,6 +180,39 @@ describe('SessionsService', () => {
     });
   });
 
+  describe('checkIn (the gamer gets the PIN)', () => {
+    it('hands the gamer the PIN of a fresh PENDING session for their own booking', async () => {
+      const result = await service.checkIn('g1', 'res-1');
+      expect(result).toMatchObject({ sessionId: 's1', reservationId: 'res-1', pin: expect.stringMatching(/^\d{6}$/) });
+      expect(result.pinExpiresAt).toBeInstanceOf(Date);
+      expect(repo.create.mock.calls[0][0].pinHash).not.toContain(result.pin);
+      for (const fn of Object.values(commands)) expect(fn).not.toHaveBeenCalled();
+    });
+
+    it("404s another gamer's booking", async () => {
+      await expect(service.checkIn('someone-else', 'res-1')).rejects.toBeInstanceOf(NotFoundException);
+      expect(repo.create).not.toHaveBeenCalled();
+    });
+
+    it('opens 15 minutes before the booking', async () => {
+      const now = Date.now();
+      repo.findReservationForStart.mockResolvedValueOnce(reservation({ startTime: new Date(now + 20 * 60_000), endTime: new Date(now + HOUR) }));
+      await expect(service.checkIn('g1', 'res-1')).rejects.toMatchObject({ response: { code: 'RESERVATION_NOT_STARTED' } });
+
+      repo.findReservationForStart.mockResolvedValueOnce(reservation({ startTime: new Date(now + 10 * 60_000), endTime: new Date(now + HOUR) }));
+      await expect(service.checkIn('g1', 'res-1')).resolves.toMatchObject({ pin: expect.any(String) });
+    });
+
+    it('replaces a still-valid PIN nobody typed, but not a session already logged into', async () => {
+      repo.findActiveForReservation.mockResolvedValueOnce(sessionRow({ id: 'old', pinExpiresAt: new Date(Date.now() + 60_000) }));
+      await service.checkIn('g1', 'res-1');
+      expect(repo.cancelPending).toHaveBeenCalledWith('old');
+
+      repo.findActiveForReservation.mockResolvedValueOnce(sessionRow({ pinUsedAt: new Date() }));
+      await expect(service.checkIn('g1', 'res-1')).rejects.toMatchObject({ response: { code: 'SESSION_ALREADY_STARTED' } });
+    });
+  });
+
   describe('login', () => {
     let pin: string;
 
