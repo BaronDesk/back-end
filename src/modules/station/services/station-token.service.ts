@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { z } from 'zod';
 
+import type { StationTokenPayload } from '../../../common/types/jwt-payload.js';
 import { TokenService } from '../../identity/services/token.service.js';
 
 /** Who a verified station token speaks for. Taken from the token, never from the handshake. */
@@ -21,7 +22,7 @@ const stationClaimsSchema = z.object({
   serialNumber: z.string().trim().min(1),
   branchId: z.string().uuid(),
   exp: z.number(),
-});
+}) satisfies z.ZodType<StationTokenPayload & { exp: number }>;
 
 export class InvalidStationTokenError extends Error {}
 

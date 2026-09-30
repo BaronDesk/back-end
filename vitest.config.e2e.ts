@@ -11,6 +11,8 @@ export default defineConfig({
     // on the same queue. In parallel, one spec's worker takes another spec's
     // jobs without holding the agent socket, so specs run one at a time.
     fileParallelism: false,
+    // each spec boots the full AppModule; that can exceed the 10s default
+    hookTimeout: 30_000,
     // Short presence timings so the watchdog case runs in seconds. Must be set
     // here, not in the spec: ConfigModule.forRoot validates env when AppModule
     // is imported, and ESM imports run before any code in the spec body.

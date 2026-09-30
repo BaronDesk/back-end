@@ -13,6 +13,7 @@ import { RedisModule } from './infra/redis/redis.module.js';
 import { HealthModule } from './health/health.module.js';
 import { GamesModule } from './modules/games/games.module.js';
 import { IdentityModule } from './modules/identity/identity.module.js';
+import { MachinesModule } from './modules/machines/machines.module.js';
 import { OpsModule } from './modules/ops/ops.module.js';
 import { PricingModule } from './modules/pricing/pricing.module.js';
 import { StationModule } from './modules/station/station.module.js';
@@ -30,6 +31,7 @@ import { ReservationsModule } from './modules/reservations/reservations.module.j
     RedisModule,
     QueueModule,
     IdentityModule,
+    MachinesModule,
     StationModule,
     GamesModule,
     OpsModule,

@@ -16,3 +16,12 @@ export interface RefreshTokenPayload {
   iat?: number;
   exp?: number;
 }
+
+export interface StationTokenPayload {
+  sub: string;
+  type: 'station';
+  serialNumber: string;
+  branchId: string;
+  iat?: number;
+  exp?: number;
+}

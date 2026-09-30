@@ -4,12 +4,13 @@ import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 
-import type { AccessTokenPayload, RefreshTokenPayload } from '../../../common/types/jwt-payload.js';
+import type { AccessTokenPayload, RefreshTokenPayload, StationTokenPayload } from '../../../common/types/jwt-payload.js';
 import { ROLE_SCOPE, type Role } from '../../../common/utils/scope.js';
 
 /**
- * Single source of truth for signing/verifying user tokens, and for checking
- * the access-key signature of station tokens (StationTokenService). Registered
+ * Single source of truth for signing/verifying user tokens, for issuing
+ * station tokens (enrollment), and for checking the access-key signature of
+ * station tokens (StationTokenService owns their claim check). Registered
  * once here and reused everywhere a token must be checked (HTTP guard,
  * dashboard-io handshake) so there is exactly one place that knows the
  * claim shape and the two secrets.
@@ -56,6 +57,18 @@ export class TokenService {
   async verifyAccessKeySignature(token: string): Promise<Record<string, unknown>> {
     return this.jwt.verifyAsync<Record<string, unknown>>(token, {
       secret: this.config.getOrThrow('JWT_ACCESS_SECRET'),
+    });
+  }
+
+  /**
+   * Issued by enrollment once a machine is ENROLLED. Same key as user access
+   * tokens; `type: "station"` keeps it from passing verifyAccessToken, and
+   * StationTokenService checks these claims on /agent-ws and station REST.
+   */
+  signStationToken(claims: Omit<StationTokenPayload, 'iat' | 'exp'>): string {
+    return this.jwt.sign(claims, {
+      secret: this.config.getOrThrow('JWT_ACCESS_SECRET'),
+      expiresIn: '365d',
     });
   }
 

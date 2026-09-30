@@ -39,6 +39,20 @@ describe('StationTokenService', () => {
   });
 });
 
+describe('TokenService.signStationToken (enrollment issuer)', () => {
+  const issued = () => tokens.signStationToken({ sub: machineId, type: 'station', serialNumber: 'SN-1', branchId });
+
+  it('issues a token the station verifier accepts', async () => {
+    await expect(service.verify(issued())).resolves.toEqual({ machineId, serialNumber: 'SN-1', branchId });
+  });
+
+  it('issues a token that expires in a year and never passes as a user', async () => {
+    const { exp, iat } = jwt.decode(issued()) as { exp: number; iat: number };
+    expect(exp - iat).toBe(365 * 24 * 60 * 60);
+    await expect(tokens.verifyAccessToken(issued())).rejects.toThrow();
+  });
+});
+
 describe('TokenService.verifyAccessToken', () => {
   it('does not accept a station token as a user', async () => {
     await expect(tokens.verifyAccessToken(sign(stationClaims))).rejects.toThrow();

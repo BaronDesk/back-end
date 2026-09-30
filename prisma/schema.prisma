@@ -157,6 +157,7 @@ model Branch {
   telemetryAlerts   TelemetryAlert[]
   commands          Command[]
   gameBranches      GameBranch[]
+  enrollmentTokens  EnrollmentToken[]
 
   @@index([name])
   @@map("branches")
@@ -192,6 +193,7 @@ model User {
   auditLogs          AuditLog[]
   acknowledgedAlerts TelemetryAlert[]
   refreshTokens      RefreshToken[]
+  enrollmentTokens   EnrollmentToken[]
 
   @@index([username])
   @@index([role])
@@ -313,7 +315,8 @@ model Machine {
   nodeTelemetry   NodeTelemetry[]
   telemetryAlerts TelemetryAlert[]
   reservations    Reservation[]
-  commands        Command[]
+  commands         Command[]
+  enrollmentTokens EnrollmentToken[]
 
   @@index([branchId])
   @@index([serialNumber])
@@ -322,6 +325,27 @@ model Machine {
   @@map("machines")
 }
 
+// One-time enrollment credential. Only the SHA-256 of the token is stored.
+// machineId null = fresh-station enrollment; set = credential rotation.
+model EnrollmentToken {
+  id         String    @id @default(uuid()) @db.Uuid
+  tokenHash  String    @unique @map("token_hash")
+  branchId   String    @map("branch_id") @db.Uuid
+  machineId  String?   @map("machine_id") @db.Uuid
+  issuedById String    @map("issued_by_id") @db.Uuid
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz
+  consumedAt DateTime? @map("consumed_at") @db.Timestamptz
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  branch   Branch   @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  machine  Machine? @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  issuedBy User     @relation(fields: [issuedById], references: [id], onDelete: Cascade)
+
+  @@index([branchId])
+  @@index([machineId])
+  @@index([expiresAt])
+  @@map("enrollment_tokens")
+}
 
 
 // Backend-side game catalog. A station pulls its resolved view over
