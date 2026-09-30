@@ -1,4 +1,4 @@
-import { Body, Controller, Param, Post } from '@nestjs/common';
+import { Body, Controller, HttpCode, Param, Post } from '@nestjs/common';
 
 import { CurrentUser } from '../../../common/decorators/current-user.decorator.js';
 import { Public } from '../../../common/decorators/public.decorator.js';
@@ -9,16 +9,15 @@ import {
   issueEnrollmentTokenSchema,
   redeemEnrollmentTokenSchema,
   type IssueEnrollmentTokenDto,
-  type RedeemEnrollmentTokenDto,
 } from '../schemas/enrollment.schemas.js';
 import { idParamSchema } from '../schemas/machines.schemas.js';
-import { EnrollmentService } from '../services/enrollment.service.js';
+import { EnrollmentService, type EnrollmentResult } from '../services/enrollment.service.js';
 
 @Controller()
 export class EnrollmentController {
   constructor(private readonly enrollment: EnrollmentService) {}
 
-  
+
   @RequireScope('admin')
   @Post('machines/enrollment-tokens')
   issueToken(
@@ -28,17 +27,21 @@ export class EnrollmentController {
     return this.enrollment.issueToken(caller, dto);
   }
 
-  
+
   @RequireScope('admin')
   @Post('machines/:id/rotate-token')
   rotateToken(@CurrentUser() caller: AccessTokenPayload, @Param('id', new ZodValidationPipe(idParamSchema)) id: string) {
     return this.enrollment.rotateToken(caller, id);
   }
 
-  
+  // The agent polls this and reads only the body's status, so refusals
+  // (including a malformed body) are a 200 REJECTED rather than a 4xx.
   @Public()
+  @HttpCode(200)
   @Post('enrollment/request')
-  redeem(@Body(new ZodValidationPipe(redeemEnrollmentTokenSchema)) dto: RedeemEnrollmentTokenDto) {
-    return this.enrollment.redeem(dto);
+  async redeem(@Body() body: unknown): Promise<EnrollmentResult> {
+    const parsed = redeemEnrollmentTokenSchema.safeParse(body);
+    if (!parsed.success) return { status: 'REJECTED', reason: 'INVALID_REQUEST' };
+    return this.enrollment.redeem(parsed.data);
   }
 }

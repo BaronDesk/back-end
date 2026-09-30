@@ -23,7 +23,16 @@ export class EnrollmentTokensRepository extends BaseRepository {
     return this.prisma.enrollmentToken.findUnique({ where: { tokenHash } });
   }
 
-  consume(id: string) {
-    return this.prisma.enrollmentToken.update({ where: { id }, data: { consumedAt: new Date() } });
+  // Conditional so two concurrent polls can't both burn (and both be answered with) the same token.
+  async consume(id: string): Promise<boolean> {
+    const { count } = await this.prisma.enrollmentToken.updateMany({
+      where: { id, consumedAt: null },
+      data: { consumedAt: new Date() },
+    });
+    return count === 1;
+  }
+
+  bindMachine(id: string, machineId: string) {
+    return this.prisma.enrollmentToken.update({ where: { id }, data: { machineId } });
   }
 }
