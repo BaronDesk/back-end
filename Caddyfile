@@ -22,3 +22,10 @@ https://localhost, https://cstam-server.local {
 http://localhost, http://cstam-server.local {
 	redir https://{host}{uri} permanent
 }
+# Cloudflare Tunnel enters Caddy here.
+# IMPORTANT: no HTTPS redirect on this listener.
+:80 {
+	reverse_proxy backend:3000 {
+		header_up X-Real-IP {remote_host}
+	}
+}
