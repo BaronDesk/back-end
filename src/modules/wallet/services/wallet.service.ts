@@ -7,11 +7,23 @@ import { WalletRepository } from '../repository/wallet.repository.js';
 import type { CreditDto, DebitDto, ListEntriesQuery } from '../schemas/wallet.schemas.js';
 import { toPublicEntry, toPublicWallet } from '../util/public-wallet.js';
 
+/** Money of the gamer's that other spending must not touch (e.g. what a running session already used). */
+export type ReserveProvider = (gamerProfileId: string) => Promise<number>;
+
 @Injectable()
 export class WalletService {
   readonly credited = new Subject<{ gamerProfileId: string; amount: number; balanceAfter: number }>();
+  /** Every debit but a session settlement: the money a running session can still use went down. */
+  readonly debited = new Subject<{ gamerProfileId: string; amount: number; balanceAfter: number }>();
+
+  private reserve?: ReserveProvider;
 
   constructor(private readonly wallets: WalletRepository) {}
+
+  /** Session-billing registers what running sessions have used so far (it can't be imported here). */
+  setReserveProvider(provider: ReserveProvider): void {
+    this.reserve = provider;
+  }
 
   async getOrCreateWallet(gamerProfileId: string) {
     const existing = await this.wallets.findByGamerProfileId(gamerProfileId);
@@ -61,8 +73,19 @@ export class WalletService {
     return toPublicEntry(entry);
   }
 
+  /**
+   * A purchase, a desk debit: never overdraws, and never spends what a
+   * running session has already used (that is paid when the session ends).
+   */
   async debit(gamerProfileId: string, dto: DebitDto) {
     const wallet = await this.getOrCreateWallet(gamerProfileId);
+    const reserved = this.reserve ? await this.reserve(gamerProfileId) : 0;
+    if (reserved > 0 && wallet.balance - reserved < dto.amount) {
+      throw new ConflictException({
+        code: 'INSUFFICIENT_FUNDS',
+        error: 'part of the balance is held for the session in progress',
+      });
+    }
     const entry = await this.wallets.postEntry({
       walletId: wallet.id,
       amount: -dto.amount,
@@ -73,6 +96,7 @@ export class WalletService {
     if (!entry) {
       throw new ConflictException({ code: 'INSUFFICIENT_FUNDS', error: 'wallet balance cant go negative' }); // this isn't GTA
     }
+    this.debited.next({ gamerProfileId, amount: dto.amount, balanceAfter: entry.balanceAfter });
     return toPublicEntry(entry);
   }
 

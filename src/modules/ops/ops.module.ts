@@ -37,6 +37,6 @@ import { TelemetryService } from './services/telemetry.service.js';
     CommandProcessor,
     StationSessionPort,
   ],
-  exports: [DashboardGateway, CommandsService, StationSessionPort],
+  exports: [DashboardGateway, AgentGateway, CommandsService, StationSessionPort],
 })
 export class OpsModule {}

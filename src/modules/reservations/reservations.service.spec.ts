@@ -90,9 +90,42 @@ describe('ReservationsService.cancel', () => {
   });
 });
 
+describe('ReservationsService for the desk', () => {
+  const STAFF = { sub: 's1', role: 'EMPLOYEE', scope: 'staff', branchId: 'b1', jti: 'j' } as AccessTokenPayload;
+  const HQ = { sub: 'h1', role: 'ADMIN', scope: 'hq', branchId: null, jti: 'j' } as AccessTokenPayload;
+  let repo: Record<string, ReturnType<typeof vi.fn>>;
+  let service: ReservationsService;
+
+  beforeEach(() => {
+    repo = {
+      listForStaff: vi.fn(async () => [{ id: 'r1', gamerProfile: { id: 'g1', user: { username: 'ali' } } }]),
+      findForStaff: vi.fn(async () => ({ id: 'r1', status: 'CONFIRMED', machine: { branchId: 'b1' }, sessions: [] })),
+      cancel: vi.fn(async (id) => ({ id, status: 'CANCELLED' })),
+    };
+    service = new ReservationsService(repo as any, {} as any, {} as any);
+  });
+
+  it("lists the caller's branch with who booked, HQ any branch or all", async () => {
+    await expect(service.listForStaff(STAFF, { limit: 200 })).resolves.toEqual([{ id: 'r1', gamerUsername: 'ali' }]);
+    expect(repo.listForStaff).toHaveBeenLastCalledWith(expect.objectContaining({ branchId: 'b1' }));
+    await service.listForStaff(HQ, { limit: 200 });
+    expect(repo.listForStaff).toHaveBeenLastCalledWith(expect.objectContaining({ branchId: null }));
+    await expect(service.listForStaff(STAFF, { limit: 200, branchId: '00000000-0000-0000-0000-000000000009' })).rejects.toThrow();
+  });
+
+  it('cancels a booking nobody plays on, never a running one or another branch’s', async () => {
+    await expect(service.cancelByStaff(STAFF, 'r1')).resolves.toMatchObject({ status: 'CANCELLED' });
+    repo.findForStaff.mockResolvedValueOnce({ id: 'r1', status: 'CONFIRMED', machine: { branchId: 'b1' }, sessions: [{ id: 's' }] });
+    await expect(service.cancelByStaff(STAFF, 'r1')).rejects.toMatchObject({ response: { code: 'SESSION_RUNNING' } });
+    repo.findForStaff.mockResolvedValueOnce({ id: 'r1', status: 'CONFIRMED', machine: { branchId: 'b2' }, sessions: [] });
+    await expect(service.cancelByStaff(STAFF, 'r1')).rejects.toThrow();
+    expect(repo.cancel).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('ReservationsService walk-in and check-in', () => {
   let repo: Record<string, ReturnType<typeof vi.fn>>;
-  let sessions: { checkIn: ReturnType<typeof vi.fn> };
+  let sessions: Record<string, ReturnType<typeof vi.fn>>;
   let membership: { getBookingAdvanceDays: ReturnType<typeof vi.fn> };
   let service: ReservationsService;
   const pin = { sessionId: 's1', reservationId: 'r1', pin: '123456', pinExpiresAt: new Date() };
@@ -101,8 +134,14 @@ describe('ReservationsService walk-in and check-in', () => {
     repo = {
       findGamerProfileId: vi.fn(async () => ({ id: 'g1' })),
       createIfAvailable: vi.fn(async () => ({ kind: 'created', reservation: { id: 'r1', status: 'CONFIRMED' } })),
+      findMachine: vi.fn(async () => ({ id: MACHINE_ID, branchId: 'b1' })),
     };
-    sessions = { checkIn: vi.fn(async () => pin) };
+    sessions = {
+      checkIn: vi.fn(async () => pin),
+      assertAffordable: vi.fn(async () => ({ centsPerMinute: 100, totalCents: 6000, membershipId: null })),
+      extend: vi.fn(async () => ({ endsAt: 'x' })),
+      extendOptions: vi.fn(async () => ({ options: [] })),
+    };
     membership = { getBookingAdvanceDays: vi.fn(async () => 0) };
     service = new ReservationsService(repo as any, sessions as any, membership as any);
   });
@@ -117,6 +156,27 @@ describe('ReservationsService walk-in and check-in', () => {
     membership.getBookingAdvanceDays.mockResolvedValue(7);
     await expect(service.create(GAMER, booking(6 * 24))).resolves.toMatchObject({ id: 'r1' });
     await expect(service.create(GAMER, booking(8 * 24))).rejects.toMatchObject({ response: { code: 'BOOKING_TOO_FAR_AHEAD' } });
+  });
+
+  it('refuses a booking or walk-in the wallet cannot pay for, before anything is created', async () => {
+    sessions.assertAffordable.mockRejectedValue(new ConflictException({ code: 'INSUFFICIENT_FUNDS' }));
+    await expect(service.create(GAMER, booking(2))).rejects.toMatchObject({ response: { code: 'INSUFFICIENT_FUNDS' } });
+    await expect(service.walkIn(GAMER, { machineId: MACHINE_ID, durationMinutes: 60 })).rejects.toMatchObject({
+      response: { code: 'INSUFFICIENT_FUNDS' },
+    });
+    expect(repo.createIfAvailable).not.toHaveBeenCalled();
+  });
+
+  it('quotes a booking at the booking rate and a walk-in at the walk-in rate, for their length', async () => {
+    await service.create(GAMER, booking(2));
+    expect(sessions.assertAffordable).toHaveBeenLastCalledWith(expect.objectContaining({ gamerProfileId: 'g1', branchId: 'b1', isWalkIn: false, minutes: 60 }));
+    await service.walkIn(GAMER, { machineId: MACHINE_ID, durationMinutes: 90 });
+    expect(sessions.assertAffordable).toHaveBeenLastCalledWith(expect.objectContaining({ isWalkIn: true, minutes: 90 }));
+  });
+
+  it('extends on the caller’s own gamer profile', async () => {
+    await service.extend(GAMER, 'r1', 30);
+    expect(sessions.extend).toHaveBeenCalledWith('g1', 'r1', 30);
   });
 
   it('refuses a second booking overlapping one the gamer already holds', async () => {

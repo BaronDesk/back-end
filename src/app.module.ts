@@ -22,6 +22,7 @@ import { MembershipModule } from './modules/membership/membership.module.js';
 import { SubscriptionsModule } from './modules/subscriptions/subscriptions.module.js';
 import { SessionBillingModule } from './modules/session-billing/session-billing.module.js';
 import { ReservationsModule } from './modules/reservations/reservations.module.js';
+import { BranchesModule } from './modules/branches/branches.module.js';
 
 
 @Module({
@@ -40,6 +41,7 @@ import { ReservationsModule } from './modules/reservations/reservations.module.j
     MembershipModule,
     SubscriptionsModule,
     ReservationsModule,
+    BranchesModule,
     SessionBillingModule,
     HealthModule,
   ],

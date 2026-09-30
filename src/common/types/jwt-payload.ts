@@ -22,6 +22,8 @@ export interface StationTokenPayload {
   type: 'station';
   serialNumber: string;
   branchId: string;
+  /** Machine.credentialVersion when issued; missing on tokens issued before versions (= 1). */
+  ver?: number;
   iat?: number;
   exp?: number;
 }

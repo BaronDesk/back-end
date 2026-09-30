@@ -24,6 +24,16 @@ const isUniqueViolation = (error: unknown) =>
 const startOfUtcDay = (date: Date) =>
   new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
 
+/** What is left of a membership's price, in millimes, by whole days remaining. */
+function remainingValue(
+  membership: { endDate: Date; membershipPlan: { price: Prisma.Decimal; durationDays: number } },
+  now: Date,
+): number {
+  const daysLeft = Math.max(Math.ceil((membership.endDate.getTime() - startOfUtcDay(now).getTime()) / 86_400_000), 0);
+  const days = Math.max(membership.membershipPlan.durationDays, 1);
+  return Math.floor((dinarsToMillimes(membership.membershipPlan.price) * Math.min(daysLeft, days)) / days);
+}
+
 const alreadyActive = () =>
   new ConflictException({
     code: 'MEMBERSHIP_ALREADY_ACTIVE',
@@ -113,11 +123,15 @@ export class MembershipService {
 
     const now = new Date();
     await this.memberships.expireLapsed(gamerProfileId, startOfUtcDay(now));
-    if (await this.memberships.findActiveForGamer(gamerProfileId)) {
+    const current = await this.memberships.findActiveForGamer(gamerProfileId);
+    // Only a dearer tier replaces the active one (an upgrade); the same or a cheaper tier waits for it to end.
+    if (current && Number(plan.price) <= Number(current.membershipPlan.price)) {
       throw alreadyActive();
     }
 
-    const price = dinarsToMillimes(plan.price);
+    // An upgrade pays the new price minus what is left of the old one (by days).
+    const credit = current ? remainingValue(current, now) : 0;
+    const price = Math.max(dinarsToMillimes(plan.price) - credit, 0);
     const ledgerKey = `membership:${key ?? randomUUID()}`;
     if (price > 0) {
       await this.wallet.debit(gamerProfileId, {
@@ -126,6 +140,8 @@ export class MembershipService {
         idempotencyKey: ledgerKey,
       });
     }
+
+    if (current) await this.memberships.setStatus(current.id, 'CANCELLED');
 
     try {
       return await this.memberships.create({
@@ -148,10 +164,21 @@ export class MembershipService {
       }
 
       if (price > 0) await this.refund(gamerProfileId, price, ledgerKey);
+      if (current) await this.memberships.setStatus(current.id, 'ACTIVE').catch(() => undefined);
       // otherwise the one-active partial unique index caught a concurrent purchase
       if (uniqueViolation) throw alreadyActive();
       throw error;
     }
+  }
+
+  /** Ends the gamer's active membership now. No refund: the tier's price bought the whole period. */
+  async cancelMine(caller: AccessTokenPayload) {
+    const gamerProfileId = await this.resolveGamerProfileId(caller);
+    const current = await this.findCurrent(gamerProfileId);
+    if (!current) {
+      throw new NotFoundException({ code: 'NO_ACTIVE_MEMBERSHIP', error: 'you have no active membership' });
+    }
+    return this.memberships.setStatus(current.id, 'CANCELLED');
   }
 
   /** Internal accessor: the gamer's active membership discount, if any. A lapsed membership gives none. */

@@ -36,6 +36,7 @@ import {
   type ListCommandsQuery,
 } from '../schemas/command.schemas.js';
 import { CommandAckTracker, type CommandReply } from './command-ack-tracker.js';
+import { StationSessionPort } from './station-session.port.js';
 
 export const COMMAND_QUEUE = 'station-commands';
 
@@ -114,6 +115,7 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
     @InjectQueue(COMMAND_QUEUE) private readonly queue: Queue<CommandJobData>,
     private readonly config: ConfigService,
     private readonly games: GamesService,
+    private readonly sessions: StationSessionPort,
   ) {
     this.simulationsAllowed = config.get('NODE_ENV') !== 'production';
   }
@@ -162,6 +164,14 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
         throw new ConflictException({ code: 'NO_ACTIVE_SESSION', error: 'station has no active session' });
       }
       payload = body.reason ? { reason: body.reason } : {};
+    } else if (body.type === 'UNLOCK' && !body.simulate) {
+      // The agent only unlocks for a session: resume the station's own one (409 without).
+      const sessions = this.sessions.current;
+      if (!sessions) throw new ConflictException({ code: 'NO_SESSION_TO_UNLOCK', error: 'sessions are unavailable' });
+      payload = await sessions.unlockFor(station);
+    } else if (body.type === 'SHUTDOWN') {
+      // The gamer stops playing now: settle before the PC goes dark (its session end arrives later, already closed).
+      await this.sessions.current?.closeForShutdown(station);
     }
 
     // Labels the session.ended event, which fires only once the agent reports
@@ -354,12 +364,14 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
 
   /**
    * System END_SESSION for a session that ended or ran past its window. Only
-   * while the station reports a session, and one open END_SESSION per station
-   * is enough. Settlement follows presence's session.ended as for any other end.
+   * while the station reports that very session (END_SESSION ends whatever
+   * the PC runs, so it must never reach the next gamer's session), and one
+   * open END_SESSION per station is enough. Settlement follows presence's
+   * session.ended as for any other end.
    */
-  async issueSystemEndSession(machineId: string, reason: string): Promise<boolean> {
+  async issueSystemEndSession(machineId: string, reason: string, sessionId: string): Promise<boolean> {
     return this.issueSystem(machineId, 'END_SESSION', reason, { reason }, async (station) => {
-      if (!this.presence.sessionOf(station.serialNumber)) return false;
+      if (this.presence.sessionOf(station.serialNumber) !== sessionId) return false;
       if (await this.repo.hasOpen(station.machineId, 'END_SESSION')) return false;
       this.presence.expectSessionEnd(station.serialNumber, reason);
       return true;

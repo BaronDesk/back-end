@@ -19,8 +19,9 @@ const MACHINE = {
   status: 'ONLINE',
   lastSeen: new Date(),
   ipAddress: null,
+  credentialVersion: 1,
 };
-const PRINCIPAL = { machineId: 'm1', serialNumber: 'SN-1', branchId: 'b1' };
+const PRINCIPAL = { machineId: 'm1', serialNumber: 'SN-1', branchId: 'b1', version: 1, expiresAt: Date.now() + 86_400_000 };
 
 describe('assertStationAdmitted', () => {
   it('admits an ENROLLED row matching the token', () => {
@@ -35,6 +36,10 @@ describe('assertStationAdmitted', () => {
       );
     }
     expect(() => assertStationAdmitted({ ...MACHINE, serialNumber: 'SN-2' } as any, PRINCIPAL)).toThrow(
+      StationIdentityMismatchError,
+    );
+    // A rotated credential: the token of the previous version is refused.
+    expect(() => assertStationAdmitted({ ...MACHINE, credentialVersion: 2 } as any, PRINCIPAL)).toThrow(
       StationIdentityMismatchError,
     );
   });

@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { Prisma } from '../../../generated/prisma/index.js';
+import { Prisma, type MembershipStatus } from '../../../generated/prisma/index.js';
 
 import { BaseRepository } from '../../../common/repository/base.repository.js';
 import { PrismaService } from '../../../infra/prisma/prisma.service.js';
@@ -69,7 +69,7 @@ export class MembershipRepository extends BaseRepository {
   findActiveForGamer(gamerProfileId: string) {
     return this.prisma.membership.findFirst({
       where: { gamerProfileId, status: 'ACTIVE' },
-      include: { membershipPlan: { select: { bookingAdvanceDays: true } } },
+      include: { membershipPlan: true },
     });
   }
 
@@ -79,6 +79,10 @@ export class MembershipRepository extends BaseRepository {
       where: { gamerProfileId, status: 'ACTIVE', endDate: { lt: today } },
       data: { status: 'EXPIRED' },
     });
+  }
+
+  setStatus(id: string, status: MembershipStatus) {
+    return this.prisma.membership.update({ where: { id }, data: { status }, include: { membershipPlan: true } });
   }
 
   create(data: CreateMembershipInput) {

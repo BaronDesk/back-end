@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 
 import { BaseRepository } from '../../common/repository/base.repository.js';
-import type { Prisma } from '../../generated/prisma/index.js';
+import type { Prisma, ReservationStatus } from '../../generated/prisma/index.js';
 import { PrismaService } from '../../infra/prisma/prisma.service.js';
 import type { CreateReservationDto } from './reservations.schemas.js';
 
@@ -75,14 +75,52 @@ export class ReservationsRepository extends BaseRepository {
     });
   }
 
+  /** Bookings for the staff app: a branch (or every branch), a time range, a status. */
+  listForStaff(filter: { branchId: string | null; from?: Date; to?: Date; status?: ReservationStatus; limit: number }) {
+    return this.prisma.reservation.findMany({
+      where: {
+        ...(filter.branchId ? { machine: { branchId: filter.branchId } } : {}),
+        ...(filter.status ? { status: filter.status } : {}),
+        ...(filter.to ? { startTime: { lt: filter.to } } : {}),
+        ...(filter.from ? { endTime: { gt: filter.from } } : {}),
+      },
+      include: {
+        machine: { select: { id: true, name: true, serialNumber: true, branchId: true } },
+        gamerProfile: { select: { id: true, user: { select: { username: true } } } },
+      },
+      orderBy: { startTime: 'asc' },
+      take: filter.limit,
+    });
+  }
+
+  /** A booking with its station and whether a gamer already logged in on it. */
+  findForStaff(id: string) {
+    return this.prisma.reservation.findUnique({
+      where: { id },
+      include: {
+        machine: { select: { branchId: true } },
+        sessions: { where: { pinUsedAt: { not: null }, status: { in: ['PENDING', 'ACTIVE', 'PAUSED'] } }, select: { id: true } },
+      },
+    });
+  }
+
+  findMachine(machineId: string) {
+    return this.prisma.machine.findUnique({ where: { id: machineId }, select: { id: true, branchId: true } });
+  }
+
   async findOwned(id: string, gamerProfileId: string) {
     return this.prisma.reservation.findFirst({ where: { id, gamerProfileId } });
   }
 
-  cancel(id: string) {
-    return this.prisma.reservation.update({
-      where: { id },
-      data: { status: 'CANCELLED' },
-    });
+  /** Cancels the booking and any PIN already issued for it (a gamer can check in 15 minutes early). */
+  async cancel(id: string) {
+    const [reservation] = await this.prisma.$transaction([
+      this.prisma.reservation.update({ where: { id }, data: { status: 'CANCELLED' } }),
+      this.prisma.session.updateMany({
+        where: { reservationId: id, status: 'PENDING', pinUsedAt: null },
+        data: { status: 'CANCELLED', pinHash: null },
+      }),
+    ]);
+    return reservation;
   }
 }

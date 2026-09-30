@@ -47,6 +47,7 @@ describe('CommandsService', () => {
   let queue: { add: ReturnType<typeof vi.fn> };
   let games: { findLaunchable: ReturnType<typeof vi.fn>; catalogChanges: Subject<unknown> };
   let tracker: CommandAckTracker;
+  let sessions: { unlockFor: ReturnType<typeof vi.fn>; closeForShutdown: ReturnType<typeof vi.fn> };
   let service: CommandsService;
 
   const GAME = { id: '9d3c1f4e-8a55-4d1b-9a36-2f0f5c1e7b20', gameId: 'cs2', enabled: true };
@@ -75,6 +76,11 @@ describe('CommandsService', () => {
     dashboard = { publishToBranch: vi.fn() };
     queue = { add: vi.fn(async () => ({})) };
     tracker = new CommandAckTracker();
+    sessions = {
+      unlockFor: vi.fn(async () => ({ sessionId: 'sess-1', leaseSeconds: 180, serverTime: new Date().toISOString() })),
+      closeForShutdown: vi.fn(async () => undefined),
+    };
+    const port = { current: sessions };
     service = new CommandsService(
       repo as any,
       presence as any,
@@ -84,6 +90,7 @@ describe('CommandsService', () => {
       queue as any,
       config({ NODE_ENV: 'development', COMMAND_MAX_ATTEMPTS: 2 }),
                                   games as any,
+      port as any,
     );
   });
 
@@ -170,6 +177,17 @@ describe('CommandsService', () => {
     await expect(service.issue(caller(), 'm1', { type: 'SHUTDOWN' })).rejects.toBeInstanceOf(ForbiddenException);
     const dto = await service.issue(caller({ role: 'MANAGER', scope: 'admin' }), 'm1', { type: 'SHUTDOWN' });
     expect(dto.type).toBe('SHUTDOWN');
+    // The session is settled before the PC goes dark.
+    expect(sessions.closeForShutdown).toHaveBeenCalledWith(STATION);
+  });
+
+  it("sends a staff UNLOCK into the station's own session, and refuses one without", async () => {
+    await service.issue(caller(), 'm1', { type: 'UNLOCK' });
+    expect(queue.add).toHaveBeenCalledWith('dispatch', expect.objectContaining({ payload: expect.objectContaining({ sessionId: 'sess-1' }) }), expect.anything());
+
+    sessions.unlockFor.mockRejectedValueOnce(new ConflictException({ code: 'NO_SESSION_TO_UNLOCK' }));
+    await expect(service.issue(caller(), 'm1', { type: 'UNLOCK' })).rejects.toMatchObject({ response: { code: 'NO_SESSION_TO_UNLOCK' } });
+    expect(repo.create).toHaveBeenCalledTimes(1);
   });
 
   it('marks the command FAILED when the queue is unreachable', async () => {
@@ -224,15 +242,17 @@ describe('CommandsService', () => {
     expect(repo.create).not.toHaveBeenCalled();
   });
 
-  it('issueSystemEndSession labels the session end, and sends one only while the station holds a session', async () => {
-    expect(await service.issueSystemEndSession('m1', 'reservation_ended')).toBe(true);
+  it('issueSystemEndSession labels the session end, and sends one only while the station holds that very session', async () => {
+    expect(await service.issueSystemEndSession('m1', 'reservation_ended', 'sess-1')).toBe(true);
     expect(presence.expectSessionEnd).toHaveBeenCalledWith('SN-1', 'reservation_ended');
     expect(queue.add).toHaveBeenCalledWith('dispatch', expect.objectContaining({ payload: { reason: 'reservation_ended' } }), expect.anything());
 
     repo.hasOpen.mockResolvedValueOnce(true);
-    expect(await service.issueSystemEndSession('m1', 'reservation_ended')).toBe(false);
+    expect(await service.issueSystemEndSession('m1', 'reservation_ended', 'sess-1')).toBe(false);
     presence.sessionOf.mockReturnValueOnce(null);
-    expect(await service.issueSystemEndSession('m1', 'reservation_ended')).toBe(false);
+    expect(await service.issueSystemEndSession('m1', 'reservation_ended', 'sess-1')).toBe(false);
+    // The PC already runs the next gamer's session: never end theirs.
+    expect(await service.issueSystemEndSession('m1', 'reservation_ended', 'old-session')).toBe(false);
     expect(repo.create).toHaveBeenCalledTimes(1);
   });
 

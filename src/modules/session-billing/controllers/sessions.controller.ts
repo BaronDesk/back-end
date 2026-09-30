@@ -1,10 +1,18 @@
-import { Body, Controller, Get, HttpCode, Param, Post } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Param, Post, Query } from '@nestjs/common';
 
 import { CurrentUser } from '../../../common/decorators/current-user.decorator.js';
 import { RequireScope } from '../../../common/decorators/require-scope.decorator.js';
 import { ZodValidationPipe } from '../../../common/pipes/zod-validation.pipe.js';
 import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
-import { endSessionBodySchema, idParamSchema, startSessionSchema, type EndSessionBodyDto, type StartSessionDto } from '../schemas/session.schemas.js';
+import {
+  endSessionBodySchema,
+  idParamSchema,
+  listSessionsQuerySchema,
+  startSessionSchema,
+  type EndSessionBodyDto,
+  type ListSessionsQuery,
+  type StartSessionDto,
+} from '../schemas/session.schemas.js';
 import { SessionsService } from '../services/sessions.service.js';
 
 @Controller('sessions')
@@ -15,6 +23,20 @@ export class SessionsController {
   @Post()
   start(@CurrentUser() caller: AccessTokenPayload, @Body(new ZodValidationPipe(startSessionSchema)) dto: StartSessionDto) {
     return this.sessions.start(caller, dto.reservationId);
+  }
+
+  /** The desk's session list (replaces the per-browser list). */
+  @RequireScope('staff')
+  @Get()
+  list(@CurrentUser() caller: AccessTokenPayload, @Query(new ZodValidationPipe(listSessionsQuerySchema)) query: ListSessionsQuery) {
+    return this.sessions.list(caller, query);
+  }
+
+  /** The gamer's own session now (null when not playing). Declared before :id. */
+  @RequireScope('self')
+  @Get('me/current')
+  current(@CurrentUser() caller: AccessTokenPayload) {
+    return this.sessions.currentForGamer(caller.sub);
   }
 
   @RequireScope('staff')

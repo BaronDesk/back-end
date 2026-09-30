@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtModule } from '@nestjs/jwt';
 
+import { RateLimiter } from '../../common/rate-limit/rate-limiter.service.js';
 import { AuthController } from './controllers/auth.controller.js';
 import { UsersController } from './controllers/users.controller.js';
 import { RefreshTokenRepository } from './repository/refresh-token.repository.js';
@@ -23,6 +24,7 @@ import { UsersService } from './services/users.service.js';
   ],
   controllers: [AuthController, UsersController],
   providers: [
+    RateLimiter,
     AuthService,
     UsersService,
     TokenService,

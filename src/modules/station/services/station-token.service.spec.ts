@@ -22,8 +22,17 @@ const sign = (claims: object, options: { secret?: string; expiresIn?: number } =
   jwt.sign(claims, { secret: options.secret ?? SECRET, expiresIn: options.expiresIn ?? 3600 });
 
 describe('StationTokenService', () => {
-  it('returns the principal from a valid station token', async () => {
-    await expect(service.verify(sign(stationClaims))).resolves.toEqual({ machineId, serialNumber: 'SN-1', branchId });
+  it('returns the principal from a valid station token (version 1 when the token has none)', async () => {
+    await expect(service.verify(sign(stationClaims))).resolves.toMatchObject({ machineId, serialNumber: 'SN-1', branchId, version: 1 });
+    await expect(service.verify(sign({ ...stationClaims, ver: 3 }))).resolves.toMatchObject({ version: 3 });
+  });
+
+  it('renews a token only once it has less than 30 days left, keeping its claims', async () => {
+    const principal = await service.verify(sign({ ...stationClaims, ver: 2 }));
+    expect(service.renewIfExpiring({ ...principal, expiresAt: Date.now() + 200 * 24 * 60 * 60_000 })).toBeNull();
+    const renewed = service.renewIfExpiring({ ...principal, expiresAt: Date.now() + 10 * 24 * 60 * 60_000 });
+    expect(renewed).toBeTruthy();
+    await expect(service.verify(renewed!)).resolves.toMatchObject({ machineId, serialNumber: 'SN-1', branchId, version: 2 });
   });
 
   it.each([
@@ -43,7 +52,7 @@ describe('TokenService.signStationToken (enrollment issuer)', () => {
   const issued = () => tokens.signStationToken({ sub: machineId, type: 'station', serialNumber: 'SN-1', branchId });
 
   it('issues a token the station verifier accepts', async () => {
-    await expect(service.verify(issued())).resolves.toEqual({ machineId, serialNumber: 'SN-1', branchId });
+    await expect(service.verify(issued())).resolves.toMatchObject({ machineId, serialNumber: 'SN-1', branchId });
   });
 
   it('issues a token that expires in a year and never passes as a user', async () => {

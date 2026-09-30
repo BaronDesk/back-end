@@ -80,14 +80,33 @@ describe('MembershipService.purchase', () => {
     expect(repository.create).not.toHaveBeenCalled();
   });
 
-  it('rejects with MEMBERSHIP_ALREADY_ACTIVE before charging when the gamer already has one', async () => {
-    repository.findActiveForGamer.mockResolvedValue({ id: 'membership-0' });
+  it('rejects the same or a cheaper tier with MEMBERSHIP_ALREADY_ACTIVE before charging', async () => {
+    repository.findActiveForGamer.mockResolvedValue({
+      id: 'membership-0',
+      endDate: new Date(Date.now() + 10 * 86_400_000),
+      membershipPlan: { price: new Prisma.Decimal('12.50'), durationDays: 30 },
+    });
 
     await expect(service.purchase(caller, 'plan-1', {})).rejects.toMatchObject({
       response: { code: 'MEMBERSHIP_ALREADY_ACTIVE' },
     });
     expect(repository.expireLapsed).toHaveBeenCalled();
     expect(wallet.debit).not.toHaveBeenCalled();
+  });
+
+  it('upgrades to a dearer tier: pays the difference minus what is left of the old one, and cancels it', async () => {
+    const endDate = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate()) + 15 * 86_400_000);
+    repository.findActiveForGamer.mockResolvedValue({
+      id: 'membership-0',
+      endDate,
+      membershipPlan: { price: new Prisma.Decimal('10'), durationDays: 30 },
+    });
+    repository.setStatus = vi.fn().mockResolvedValue({});
+    await service.purchase(caller, 'plan-1', { idempotencyKey: 'up-1' });
+    // 12.50 DT new, 15 of 30 days left of a 10 DT tier = 5 DT credit.
+    expect(wallet.debit).toHaveBeenCalledWith('gamer-1', expect.objectContaining({ amount: 7500 }));
+    expect(repository.setStatus).toHaveBeenCalledWith('membership-0', 'CANCELLED');
+    expect(repository.create).toHaveBeenCalled();
   });
 
   it('returns 404 for an unknown plan without charging', async () => {

@@ -19,6 +19,7 @@ type MachineRow = {
   branchId: string;
   agentPublicKey: string;
   enrollmentStatus: string;
+  credentialVersion: number;
   createdAt: Date;
 };
 
@@ -91,13 +92,27 @@ export class EnrollmentService {
     if (machine.serialNumber !== dto.serialNumber) return rejected('SERIAL_NUMBER_MISMATCH');
 
     // A token minted before its machine existed is an enrollment token that got
-    // bound on the first poll; one minted after is a rotate-token credential swap.
-    if (record.createdAt < machine.createdAt) return this.pollEnrollment(record, machine, dto);
+    // bound on the first poll; one minted after is a rotate-token credential swap,
+    // unless it re-enrolled a deactivated machine (then it waits for approval too).
+    if (record.createdAt < machine.createdAt || machine.enrollmentStatus === 'PENDING') {
+      return this.pollEnrollment(record, machine, dto);
+    }
     return this.redeemRotation(record, machine, dto);
   }
 
   private async redeemFreshToken(record: TokenRecord, dto: RedeemEnrollmentTokenDto): Promise<EnrollmentResult> {
     const existing = await this.machines.findBySerialNumber(dto.serialNumber);
+    if (existing?.enrollmentStatus === 'DEACTIVATED') {
+      // A rejected or revoked PC enrolling again with a fresh token: back to
+      // PENDING (new key, this token's branch); an admin approves it again.
+      const machine = await this.machines.reEnroll(existing.id, {
+        agentPublicKey: dto.agentPublicKey,
+        name: dto.machineName,
+        branchId: record.branchId,
+      });
+      await this.tokens.bindMachine(record.id, machine.id);
+      return { status: 'PENDING', machineId: machine.id };
+    }
     if (existing) {
       // Only the holder of the pinned key may keep polling an existing serial
       // (covers a concurrent first poll racing the token bind below).
@@ -155,7 +170,7 @@ export class EnrollmentService {
     return this.enrolledResponse(updated);
   }
 
-  private enrolledResponse(machine: Pick<MachineRow, 'id' | 'serialNumber' | 'branchId'>): EnrollmentResult {
+  private enrolledResponse(machine: Pick<MachineRow, 'id' | 'serialNumber' | 'branchId' | 'credentialVersion'>): EnrollmentResult {
     return {
       status: 'ENROLLED',
       stationToken: this.stationTokens.signStationToken({
@@ -163,6 +178,7 @@ export class EnrollmentService {
         type: 'station',
         serialNumber: machine.serialNumber,
         branchId: machine.branchId,
+        ver: machine.credentialVersion,
       }),
       machineId: machine.id,
     };

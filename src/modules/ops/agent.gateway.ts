@@ -20,7 +20,9 @@ import {
   handshakePayloadSchema,
   heartbeatPayloadSchema,
   loginRequestPayloadSchema,
+  peripheralStatusPayloadSchema,
   stateReportPayloadSchema,
+  type Peripheral,
 } from '../station/schemas/presence.schemas.js';
 import {
   PresenceService,
@@ -310,6 +312,9 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
         case AGENT_MESSAGE_TYPES.INSTALLED_GAMES:
           await this.onInstalledGames(conn.serialNumber, envelope);
           return;
+        case AGENT_MESSAGE_TYPES.PERIPHERAL_STATUS:
+          await this.onPeripheralStatus(conn.serialNumber, envelope);
+          return;
         default:
           this.logger.debug(`ignored unhandled frame type '${envelope.type}' from ${conn.serialNumber}`);
       }
@@ -370,6 +375,13 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
       `agent connected: ${handshake.serialNumber} [machine ${conn.principal.machineId}, branch ${conn.principal.branchId}] (${handshake.machineName ?? '?'}, v${handshake.agentVersion ?? '?'}) from ${conn.ip}`,
     );
     this.send(socket, conn, SERVER_MESSAGE_TYPES.HANDSHAKE_ACK, {});
+
+    // A token near its end is swapped for a fresh one; the agent stores it for its next connect.
+    const renewed = this.stationAuth.renewalFor(conn.principal);
+    if (renewed) {
+      this.send(socket, conn, SERVER_MESSAGE_TYPES.STATION_CREDENTIAL, { stationToken: renewed });
+      this.logger.log(`renewed the station credential of ${handshake.serialNumber}`);
+    }
   }
 
   private async onHeartbeat(
@@ -398,6 +410,7 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
       return;
     }
     await this.presence.reportState(serialNumber, parsed.data);
+    if (parsed.data.peripherals) await this.publishPeripherals(serialNumber, parsed.data.peripherals);
     await this.sessions.current?.reconcile(stationOf(conn), parsed.data);
   }
 
@@ -529,6 +542,21 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     this.dashboard.publishToBranch(station.branchId, DASHBOARD_EVENTS.CATALOG_STATUS, status);
   }
 
+  /** peripheral_status: the full list of watched peripherals, sent on every change. */
+  private async onPeripheralStatus(serialNumber: string, envelope: Envelope): Promise<void> {
+    const parsed = peripheralStatusPayloadSchema.safeParse(envelope.payload);
+    if (!parsed.success) {
+      this.logger.warn(`malformed peripheral_status payload from ${serialNumber}`);
+      return;
+    }
+    await this.publishPeripherals(serialNumber, parsed.data.peripherals);
+  }
+
+  private async publishPeripherals(serialNumber: string, peripherals: Peripheral[]): Promise<void> {
+    const snapshot = await this.presence.reportPeripherals(serialNumber, peripherals);
+    if (snapshot) this.dashboard.publishToBranch(snapshot.branchId, DASHBOARD_EVENTS.PERIPHERAL_STATUS, snapshot);
+  }
+
   /** installed_games: after every catalog sync, the launcher games this station has installed. */
   private async onInstalledGames(serialNumber: string, envelope: Envelope): Promise<void> {
     const parsed = installedGamesPayloadSchema.safeParse(envelope.payload);
@@ -542,6 +570,24 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
 
   isConnected(serialNumber: string): boolean {
     return this.registry.get(serialNumber)?.readyState === WebSocket.OPEN;
+  }
+
+  /**
+   * A server control frame (not a command: no ack, no retry), e.g. a
+   * session_notice. False when the station has no live, handshaken socket.
+   */
+  sendControl(serialNumber: string, type: string, payload: unknown): boolean {
+    const socket = this.registry.get(serialNumber);
+    const conn = socket && this.connections.get(socket);
+    if (!socket || !conn || conn.serialNumber !== serialNumber || socket.readyState !== WebSocket.OPEN) return false;
+    this.send(socket, conn, type, payload);
+    return true;
+  }
+
+  /** Drops a station's live socket (revoked / rejected): it can't reconnect without a valid credential. */
+  disconnectStation(serialNumber: string, reason: string): void {
+    const socket = this.registry.get(serialNumber);
+    if (socket && socket.readyState === WebSocket.OPEN) socket.close(CLOSE_POLICY_VIOLATION, reason);
   }
 
   /**

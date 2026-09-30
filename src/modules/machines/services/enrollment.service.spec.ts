@@ -46,6 +46,7 @@ describe('EnrollmentService', () => {
     findBySerialNumber: ReturnType<typeof vi.fn>;
     create: ReturnType<typeof vi.fn>;
     rotateCredential: ReturnType<typeof vi.fn>;
+    reEnroll: ReturnType<typeof vi.fn>;
   };
   let service: EnrollmentService;
   let stationTokens: { signStationToken: ReturnType<typeof vi.fn> };
@@ -94,6 +95,7 @@ describe('EnrollmentService', () => {
       findBySerialNumber: vi.fn(),
       create: vi.fn(),
       rotateCredential: vi.fn(),
+      reEnroll: vi.fn(),
     };
     stationTokens = {
       signStationToken: vi.fn().mockReturnValue('signed-station-jwt'),
@@ -297,6 +299,17 @@ describe('EnrollmentService', () => {
         status: 'REJECTED',
         reason: 'ENROLLMENT_REJECTED',
       });
+      expect(stationTokens.signStationToken).not.toHaveBeenCalled();
+    });
+
+    it('lets a rejected or revoked PC enroll again with a fresh token: back to PENDING for approval', async () => {
+      tokensRepo.findByHash.mockResolvedValue(tokenRecord({ machineId: null }));
+      machinesRepo.findBySerialNumber.mockResolvedValue(machine({ enrollmentStatus: 'DEACTIVATED', agentPublicKey: 'old-key' }));
+      machinesRepo.reEnroll.mockResolvedValue(machine({ enrollmentStatus: 'PENDING', agentPublicKey: derKey }));
+
+      await expect(service.redeem(enrollmentDto())).resolves.toEqual({ status: 'PENDING', machineId: 'm1' });
+      expect(machinesRepo.reEnroll).toHaveBeenCalledWith('m1', expect.objectContaining({ agentPublicKey: derKey, branchId: 'branch-a' }));
+      expect(tokensRepo.bindMachine).toHaveBeenCalled();
       expect(stationTokens.signStationToken).not.toHaveBeenCalled();
     });
 

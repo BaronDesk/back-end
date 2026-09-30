@@ -4,9 +4,9 @@ import { Redis } from 'ioredis';
 import { Subject } from 'rxjs';
 
 import { REDIS } from '../../../infra/redis/redis.module.js';
-import type { Machine, MachineStatus } from '../../../generated/prisma/index.js';
+import type { Machine, MachineStatus, Prisma } from '../../../generated/prisma/index.js';
 import { MachinesRepository } from '../repository/machines.repository.js';
-import type { HandshakePayload, HeartbeatPayload, StateReportPayload } from '../schemas/presence.schemas.js';
+import type { HandshakePayload, HeartbeatPayload, Peripheral, StateReportPayload } from '../schemas/presence.schemas.js';
 import type { StationPrincipal } from './station-token.service.js';
 
 export function presenceCacheKey(serialNumber: string): string {
@@ -63,6 +63,8 @@ interface PresenceState {
   runningGameId: string | null;
   leaseExpiresAt: string | null;
   lastPersistedAt: number;
+  /** When the station was last heard from before this connection (null: never, or unknown). */
+  lastSeenBeforeConnect: Date | null;
 }
 
 /** The station token's machine has no MACHINE row. */
@@ -99,6 +101,10 @@ export function assertStationAdmitted(
     throw new StationNotEnrolledError(principal.machineId, machine.enrollmentStatus);
   }
   if (machine.serialNumber !== principal.serialNumber || machine.branchId !== principal.branchId) {
+    throw new StationIdentityMismatchError(principal.machineId);
+  }
+  // A rotated (or re-enrolled) credential bumps the version: the old token is dead.
+  if (machine.credentialVersion !== principal.version) {
     throw new StationIdentityMismatchError(principal.machineId);
   }
 }
@@ -163,8 +169,10 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
     assertStationAdmitted(machine, principal);
 
     const now = new Date();
-    const updated = await this.machines.markOnline(machine.id, { lastSeen: now, ipAddress: ip, name });
     const previous = this.states.get(serialNumber);
+    const lastSeenBeforeConnect = previous?.lastSeen ?? machine.lastSeen ?? null;
+    // The station's own name only fills in a missing one: a staff rename sticks.
+    const updated = await this.machines.markOnline(machine.id, { lastSeen: now, ipAddress: ip, name: machine.name ? null : name });
 
     const state: PresenceState = {
       machineId: updated.id,
@@ -179,6 +187,7 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
       runningGameId: previous?.runningGameId ?? null,
       leaseExpiresAt: previous?.leaseExpiresAt ?? null,
       lastPersistedAt: now.getTime(),
+      lastSeenBeforeConnect,
     };
     this.states.set(serialNumber, state);
     await this.writeCache(state);
@@ -227,6 +236,32 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
     if (report.leaseExpiresAt !== undefined) state.leaseExpiresAt = report.leaseExpiresAt ?? null;
     if (changed && state.status === 'ONLINE') this.emit(state);
     await this.writeCache(state);
+  }
+
+  /** When the station was last heard from before its current connection (for closing out what it dropped meanwhile). */
+  lastSeenBeforeConnect(serialNumber: string): Date | null {
+    return this.states.get(serialNumber)?.lastSeenBeforeConnect ?? null;
+  }
+
+  /**
+   * peripheral_status / state_report.peripherals: stores the full snapshot on
+   * the machine. Returns what to push to dashboards, or null for an unknown station.
+   */
+  async reportPeripherals(serialNumber: string, peripherals: Peripheral[]) {
+    const state = this.states.get(serialNumber);
+    if (!state) return null;
+    const reportedAt = new Date();
+    await this.machines.setPeripherals(state.machineId, peripherals as unknown as Prisma.InputJsonValue, reportedAt);
+    return { machineId: state.machineId, serialNumber, branchId: state.branchId, reportedAt: reportedAt.toISOString(), peripherals };
+  }
+
+  /** A staff rename: the live state (and dashboards) show it at once. */
+  renamed(machineId: string, name: string): void {
+    for (const state of this.states.values()) {
+      if (state.machineId !== machineId) continue;
+      state.name = name;
+      this.emit(state);
+    }
   }
 
   /** The agent's last reported session for a station, or null. */
@@ -311,6 +346,7 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
           runningGameId: null,
           leaseExpiresAt: null,
           lastPersistedAt: Date.now(),
+          lastSeenBeforeConnect: null,
         };
         this.states.set(machine.serialNumber, state);
         await this.writeCache(state);

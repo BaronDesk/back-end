@@ -30,11 +30,15 @@ describe('MachinesService', () => {
     list: ReturnType<typeof vi.fn>;
     updateStatus: ReturnType<typeof vi.fn>;
   };
+  let agents: { disconnectStation: ReturnType<typeof vi.fn> };
+  let sessions: { retireMachine: ReturnType<typeof vi.fn> };
   let service: MachinesService;
 
   beforeEach(() => {
     repo = { findById: vi.fn(), list: vi.fn(), updateStatus: vi.fn() };
-    service = new MachinesService(repo as any);
+    agents = { disconnectStation: vi.fn() };
+    sessions = { retireMachine: vi.fn(async () => undefined) };
+    service = new MachinesService(repo as any, agents as any, sessions as any);
   });
 
   describe('list', () => {
@@ -111,6 +115,7 @@ describe('MachinesService', () => {
       const result = await service.reject(caller(), 'm1');
       expect(repo.updateStatus).toHaveBeenCalledWith('m1', 'DEACTIVATED');
       expect(result.enrollmentStatus).toBe('DEACTIVATED');
+      expect(agents.disconnectStation).toHaveBeenCalledWith('SN-1', 'station rejected');
     });
 
     it('refuses to reject a machine that is not PENDING', async () => {
@@ -125,6 +130,9 @@ describe('MachinesService', () => {
       const result = await service.revoke(caller(), 'm1');
       expect(repo.updateStatus).toHaveBeenCalledWith('m1', 'DEACTIVATED');
       expect(result.enrollmentStatus).toBe('DEACTIVATED');
+      // Out of service at once: disconnected, its session settled, its bookings ahead cancelled.
+      expect(agents.disconnectStation).toHaveBeenCalledWith('SN-1', 'station revoked');
+      expect(sessions.retireMachine).toHaveBeenCalledWith('m1');
     });
 
     it('blocks revoking a machine in another branch', async () => {

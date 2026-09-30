@@ -64,6 +64,13 @@ export class MembershipController {
     return this.memberships.listMine(caller);
   }
 
+  /** Ends the gamer's active membership now (no refund). */
+  @RequireScope('self')
+  @Post('memberships/me/cancel')
+  cancelMine(@CurrentUser() caller: AccessTokenPayload) {
+    return this.memberships.cancelMine(caller);
+  }
+
   @RequireScope('self')
   @Post('membership-plans/:id/purchase')
   purchase(

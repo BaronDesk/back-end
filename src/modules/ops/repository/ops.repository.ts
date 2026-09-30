@@ -18,6 +18,16 @@ export class OpsRepository extends BaseRepository {
     return this.prisma.nodeTelemetry.createMany({ data: rows });
   }
 
+  /** One station's thinned history since `since`, oldest first. */
+  telemetryHistory(machineId: string, since: Date) {
+    return this.prisma.nodeTelemetry.findMany({
+      where: { machineId, recordedAt: { gte: since } },
+      select: { recordedAt: true, metrics: true },
+      orderBy: { recordedAt: 'asc' },
+      take: 5000,
+    });
+  }
+
   pruneTelemetryHistory(before: Date) {
     return this.prisma.nodeTelemetry.deleteMany({ where: { recordedAt: { lt: before } } });
   }

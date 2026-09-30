@@ -62,6 +62,8 @@ describe('AgentGateway session login and lease', () => {
       login: vi.fn(async () => ({ accepted: true, sessionId: 'sess-1', lease: { leaseSeconds: 120, serverTime: new Date().toISOString() } })),
       lease: vi.fn(async () => ({ leaseSeconds: 90, serverTime: new Date().toISOString() })),
       reconcile: vi.fn(async () => undefined),
+      unlockFor: vi.fn(),
+      closeForShutdown: vi.fn(async () => undefined),
     };
     port = new StationSessionPort();
     port.register(handler as unknown as StationSessionHandler);

@@ -6,7 +6,7 @@ import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
 import { REDIS } from '../../../infra/redis/redis.module.js';
 import type { Machine } from '../../../generated/prisma/index.js';
 import { MachinesRepository } from '../repository/machines.repository.js';
-import { presenceCacheKey } from './presence.service.js';
+import { PresenceService, presenceCacheKey } from './presence.service.js';
 
 type CachedPresence = Record<string, string>;
 
@@ -16,6 +16,7 @@ export class StationsService {
 
   constructor(
     private readonly machines: MachinesRepository,
+    private readonly presence: PresenceService,
     @Inject(REDIS) private readonly redis: Redis,
   ) {}
 
@@ -38,7 +39,19 @@ export class StationsService {
       branchId: machine.branchId,
       enrollmentStatus: machine.enrollmentStatus,
       leaseExpiresAt: cached?.leaseExpiresAt || null,
+      peripherals: (machine.peripherals as unknown[] | null) ?? null,
+      peripheralsReportedAt: machine.peripheralsReportedAt?.toISOString() ?? null,
     };
+  }
+
+  /** Staff rename. The station's own name no longer overwrites it. */
+  async rename(caller: AccessTokenPayload, id: string, name: string) {
+    const machine = await this.machines.findById(id);
+    if (!machine) throw new NotFoundException({ code: 'STATION_NOT_FOUND', error: 'station not found' });
+    assertScope(caller, { branchId: machine.branchId });
+    await this.machines.rename(id, name);
+    this.presence.renamed(id, name);
+    return this.get(caller, id);
   }
 
   /** Postgres is authoritative for status; Redis carries the fresher last_seen and agent-reported state. */

@@ -7,12 +7,15 @@ import {
 } from '@nestjs/common';
 
 import type { AccessTokenPayload } from '../../common/types/jwt-payload.js';
+import { assertScope } from '../../common/utils/assert-scope.js';
 import { MembershipService } from '../membership/services/membership.service.js';
 import { SessionsService } from '../session-billing/services/sessions.service.js';
 import { ReservationsRepository } from './reservations.repository.js';
-import type { CreateReservationDto, WalkInDto } from './reservations.schemas.js';
+import type { CreateReservationDto, StaffListQuery, WalkInDto } from './reservations.schemas.js';
 
 const DAY_MS = 24 * 60 * 60_000;
+
+const minutesBetween = (from: Date, to: Date) => Math.ceil((to.getTime() - from.getTime()) / 60_000);
 
 @Injectable()
 export class ReservationsService {
@@ -43,12 +46,27 @@ export class ReservationsService {
         error: `your plan lets you book up to ${advanceDays} day(s) ahead`,
       });
     }
+    // The wallet must cover the whole booking on top of what is already promised.
+    await this.sessions.assertAffordable({
+      gamerProfileId: gamer.id,
+      branchId: await this.branchOf(input.machineId),
+      isWalkIn: false,
+      start: input.startTime,
+      minutes: minutesBetween(input.startTime, input.endTime),
+    });
     return this.unwrap(await this.reservations.createIfAvailable(gamer.id, input));
   }
 
   async walkIn(caller: AccessTokenPayload, input: WalkInDto) {
     const gamer = await this.getGamer(caller.sub);
     const startTime = new Date();
+    await this.sessions.assertAffordable({
+      gamerProfileId: gamer.id,
+      branchId: await this.branchOf(input.machineId),
+      isWalkIn: true,
+      start: startTime,
+      minutes: input.durationMinutes,
+    });
     const result = await this.reservations.createIfAvailable(gamer.id, {
       machineId: input.machineId,
       startTime,
@@ -64,6 +82,47 @@ export class ReservationsService {
       this.logger.warn(`walk-in ${reservation.id}: no PIN issued: ${(err as Error).message}`);
     }
     return { ...reservation, checkIn };
+  }
+
+  /** What extra time the gamer can add to their running booking now, and its cost. */
+  async extendOptions(caller: AccessTokenPayload, id: string) {
+    const gamer = await this.getGamer(caller.sub);
+    return this.sessions.extendOptions(gamer.id, id);
+  }
+
+  /** Adds 30/60/90 minutes (pay-as-you-go rate) to the gamer's running booking. */
+  async extend(caller: AccessTokenPayload, id: string, minutes: number) {
+    const gamer = await this.getGamer(caller.sub);
+    return this.sessions.extend(gamer.id, id, minutes);
+  }
+
+  /**
+   * The desk's bookings view: the caller's branch (HQ: any, or every
+   * branch), with who booked and on which station.
+   */
+  async listForStaff(caller: AccessTokenPayload, query: StaffListQuery) {
+    if (query.branchId) assertScope(caller, { branchId: query.branchId });
+    const branchId = caller.scope === 'hq' ? (query.branchId ?? null) : caller.branchId;
+    if (caller.scope !== 'hq' && !branchId) return [];
+    const rows = await this.reservations.listForStaff({ ...query, branchId });
+    return rows.map(({ gamerProfile, ...r }) => ({ ...r, gamerUsername: gamerProfile.user.username }));
+  }
+
+  /**
+   * The desk cancels a booking nobody is playing on yet (a PIN already
+   * issued for it stops working). A running one is ended instead.
+   */
+  async cancelByStaff(caller: AccessTokenPayload, id: string) {
+    const reservation = await this.reservations.findForStaff(id);
+    if (!reservation) throw new NotFoundException({ code: 'RESERVATION_NOT_FOUND', error: 'reservation not found' });
+    assertScope(caller, { branchId: reservation.machine.branchId });
+    if (reservation.status !== 'CONFIRMED' && reservation.status !== 'PENDING') {
+      throw new ConflictException({ code: 'RESERVATION_NOT_CANCELLABLE', error: 'reservation cannot be cancelled' });
+    }
+    if (reservation.sessions.length > 0) {
+      throw new ConflictException({ code: 'SESSION_RUNNING', error: 'the gamer is playing on it: end the session instead' });
+    }
+    return this.reservations.cancel(id);
   }
 
   /** The gamer gets the PIN to type on the station for their own booking. */
@@ -83,6 +142,13 @@ export class ReservationsService {
       throw new ConflictException({ code: 'RESERVATION_ALREADY_STARTED', error: 'reservation has already started' });
     }
     return this.reservations.cancel(id);
+  }
+
+  /** The branch of the PC being booked (its prices); an unknown PC can't be booked. */
+  private async branchOf(machineId: string): Promise<string> {
+    const machine = await this.reservations.findMachine(machineId);
+    if (!machine) throw new ConflictException({ code: 'MACHINE_UNAVAILABLE', error: 'machine is unavailable' });
+    return machine.branchId;
   }
 
   private async getGamer(userId: string) {

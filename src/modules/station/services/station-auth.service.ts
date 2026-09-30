@@ -66,6 +66,11 @@ export class StationAuthService {
     }
   }
 
+  /** A renewed token for an admitted station whose token is about to expire, else null. */
+  renewalFor(principal: StationPrincipal): string | null {
+    return this.stationTokens.renewIfExpiring(principal);
+  }
+
   /** Reads the MACHINE row fresh (enrollment can change at any time) and applies the admission rules. */
   private async admit(principal: StationPrincipal): Promise<StationRef> {
     const machine = await this.machines.findById(principal.machineId);

@@ -8,6 +8,24 @@ import {
 } from '@nestjs/common';
 import type { FastifyReply } from 'fastify';
 
+import { Prisma } from '../../generated/prisma/index.js';
+
+/**
+ * Database errors that mean something to the client. Anything else from the
+ * database is an internal error.
+ */
+const PRISMA_ERRORS: Record<string, { status: number; code: string; error: string }> = {
+  P2002: { status: HttpStatus.CONFLICT, code: 'CONFLICT', error: 'this record already exists' },
+  P2025: { status: HttpStatus.NOT_FOUND, code: 'NOT_FOUND', error: 'record not found' },
+  P2003: { status: HttpStatus.CONFLICT, code: 'CONFLICT', error: 'the record is still referenced elsewhere' },
+};
+
+/**
+ * One error shape for every answer: `{ error, code, issues? }`. Only
+ * HttpExceptions (thrown on purpose, with a message meant for the client)
+ * reach the client as written; any other error is logged in full and
+ * answered with a generic message, so internals never leak.
+ */
 @Catch()
 export class AllExceptionsFilter implements ExceptionFilter {
   private readonly logger = new Logger(AllExceptionsFilter.name);
@@ -33,9 +51,11 @@ export class AllExceptionsFilter implements ExceptionFilter {
         code = (b.code as string) ?? HttpStatus[status] ?? 'ERROR';
         issues = b.issues;
       }
+    } else if (exception instanceof Prisma.PrismaClientKnownRequestError && PRISMA_ERRORS[exception.code]) {
+      ({ status, code, error } = PRISMA_ERRORS[exception.code]);
+      this.logger.warn(`database ${exception.code}: ${exception.message}`);
     } else if (exception instanceof Error) {
       this.logger.error(exception.message, exception.stack);
-      error = exception.message;
     } else {
       this.logger.error(`unknown exception: ${String(exception)}`);
     }

@@ -12,7 +12,8 @@ export interface RunoutJobData {
 }
 
 export interface ScheduleRunoutInput extends RunoutJobData {
-  rateCentsPerMinute: number | null;
+  /** When the money runs out, from now; Infinity for free play. */
+  lockInMs: number;
 }
 
 // BullMQ rejects custom job ids containing ':' ("Custom Id cannot contain :").

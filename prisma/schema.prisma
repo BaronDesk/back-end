@@ -158,6 +158,7 @@ model Branch {
   commands          Command[]
   gameBranches      GameBranch[]
   enrollmentTokens  EnrollmentToken[]
+  gamers            GamerProfile[]
 
   @@index([name])
   @@map("branches")
@@ -240,16 +241,20 @@ model GamerProfile {
   userId String @unique @map("user_id") @db.Uuid
   xp     Int    @default(0) 
   level  Int    @default(1) 
+  // The branch the gamer plays at: the booking page lists its stations. Changeable in settings.
+  homeBranchId String? @map("home_branch_id") @db.Uuid
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
 
   user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  homeBranch    Branch?        @relation(fields: [homeBranchId], references: [id], onDelete: SetNull)
   wallet        Wallet?
   reservations  Reservation[]
   memberships   Membership[]
   subscriptions Subscription[]
 
   @@index([userId])
+  @@index([homeBranchId])
   @@map("gamer_profiles")
 }
 
@@ -306,6 +311,11 @@ model Machine {
   status           MachineStatus           @default(OFFLINE)
   lastSeen         DateTime?               @map("last_seen") @db.Timestamptz
   ipAddress        String?                 @map("ip_address")
+  // Station tokens carry `ver`; rotating the credential bumps this so the old token stops working.
+  credentialVersion Int                    @default(1) @map("credential_version")
+  // The agent's last full peripheral snapshot (peripheral_status / state_report.peripherals).
+  peripherals      Json?
+  peripheralsReportedAt DateTime?          @map("peripherals_reported_at") @db.Timestamptz
   createdAt        DateTime                @default(now()) @map("created_at") @db.Timestamptz
   updatedAt        DateTime                @updatedAt @map("updated_at") @db.Timestamptz
 
@@ -566,6 +576,13 @@ model Session {
   meteringStartedAt   DateTime?     @map("metering_started_at") @db.Timestamptz
   meteredSeconds      Int           @default(0) @map("metered_seconds")
   rateCentsPerMinute  Int?          @map("rate_cents_per_minute")
+  // Time already costed at an earlier rate, folded in when an extension's rate switch comes due.
+  accruedCents        Int           @default(0) @map("accrued_cents")
+  // An extension at another rate: from rateSwitchAt (the old end) the session bills nextRateCentsPerMinute.
+  nextRateCentsPerMinute Int?       @map("next_rate_cents_per_minute")
+  rateSwitchAt        DateTime?     @map("rate_switch_at") @db.Timestamptz
+  // When the "time left" notice for the current end went out (reset by an extension).
+  endingNoticeSentAt  DateTime?     @map("ending_notice_sent_at") @db.Timestamptz
   billingBreakdown    Json?         @map("billing_breakdown")
   settledAt           DateTime?     @map("settled_at") @db.Timestamptz
   // --- station login PIN: only the hash is stored; single-use, short-lived ---

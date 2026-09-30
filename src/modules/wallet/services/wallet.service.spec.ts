@@ -31,6 +31,20 @@ describe('WalletService', () => {
     service = new WalletService(repo as any);
   });
 
+  it('never spends what a running session already used, and announces every debit', async () => {
+    const entry = { id: 'e1', walletId: 'wallet-1', amount: -1000, balanceAfter: 4000, type: 'PAYMENT', sessionId: null, createdAt: new Date() };
+    repo.postEntry.mockResolvedValue(entry);
+    const debited = vi.fn();
+    service.debited.subscribe(debited);
+    service.setReserveProvider(async () => 4500); // the session in progress used 4.5 DT of the 5 DT
+
+    await expect(service.debit('gamer-1', { amount: 1000 })).rejects.toMatchObject({ response: { code: 'INSUFFICIENT_FUNDS' } });
+    expect(repo.postEntry).not.toHaveBeenCalled();
+
+    await expect(service.debit('gamer-1', { amount: 500 })).resolves.toMatchObject({ id: 'e1' });
+    expect(debited).toHaveBeenCalledWith({ gamerProfileId: 'gamer-1', amount: 500, balanceAfter: 4000 });
+  });
+
   it('creates a wallet lazily when the gamer has none yet', async () => {
     repo.findByGamerProfileId.mockResolvedValueOnce(null);
     repo.createForGamerProfile.mockResolvedValueOnce(wallet);

@@ -24,8 +24,21 @@ export class MachinesRepository extends BaseRepository {
     });
   }
 
+  /** New key, new credential version: every token issued before stops working. */
   rotateCredential(id: string, agentPublicKey: string) {
-    return this.prisma.machine.update({ where: { id }, data: { agentPublicKey } });
+    return this.prisma.machine.update({ where: { id }, data: { agentPublicKey, credentialVersion: { increment: 1 } } });
+  }
+
+  /**
+   * A DEACTIVATED (rejected / revoked) machine enrolling again: back to
+   * PENDING with the new key, name and branch, and a new credential version.
+   * An admin still has to approve it.
+   */
+  reEnroll(id: string, data: { agentPublicKey: string; name: string | null; branchId: string }) {
+    return this.prisma.machine.update({
+      where: { id },
+      data: { ...data, enrollmentStatus: 'PENDING', credentialVersion: { increment: 1 } },
+    });
   }
 
   updateStatus(id: string, enrollmentStatus: MachineEnrollmentStatus) {

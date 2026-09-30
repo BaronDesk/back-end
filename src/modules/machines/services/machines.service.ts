@@ -1,6 +1,8 @@
 import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 
 import { assertScope } from '../../../common/utils/assert-scope.js';
+import { AgentGateway } from '../../ops/agent.gateway.js';
+import { SessionsService } from '../../session-billing/services/sessions.service.js';
 import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
 import type { MachineEnrollmentStatus } from '../../../generated/prisma/index.js';
 import { MachinesRepository } from '../repository/machines.repository.js';
@@ -10,7 +12,11 @@ import { toPublicMachine, type MachineRecord } from '../util/public-machine.js';
 
 @Injectable()
 export class MachinesService {
-  constructor(private readonly machines: MachinesRepository) {}
+  constructor(
+    private readonly machines: MachinesRepository,
+    private readonly agents: AgentGateway,
+    private readonly sessions: SessionsService,
+  ) {}
 
   async list(caller: AccessTokenPayload, query: ListMachinesQueryDto) {
     if (query.branchId) assertScope(caller, { branchId: query.branchId });
@@ -44,15 +50,22 @@ export class MachinesService {
     this.assertStatus(machine, 'PENDING', 'MACHINE_NOT_PENDING', 'machine enrollment is not pending');
 
     const updated = await this.machines.updateStatus(id, 'DEACTIVATED');
+    this.agents.disconnectStation(machine.serialNumber, 'station rejected');
     return toPublicMachine(updated);
   }
 
-  
+  /**
+   * Takes a station out of service at once: its live connection is dropped
+   * (the token is refused from now on), the session on it is settled, and its
+   * bookings still ahead are cancelled. It can enroll again later.
+   */
   async revoke(caller: AccessTokenPayload, id: string) {
     const machine = await this.findOrThrow(id);
     assertScope(caller, { branchId: machine.branchId });
 
     const updated = await this.machines.updateStatus(id, 'DEACTIVATED');
+    this.agents.disconnectStation(machine.serialNumber, 'station revoked');
+    await this.sessions.retireMachine(machine.id);
     return toPublicMachine(updated);
   }
 

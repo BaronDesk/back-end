@@ -24,6 +24,13 @@ export interface StationSessionHandler {
   lease(station: StationRef, sessionId: string | null): Promise<StationLease>;
   /** state_report on (re)connect: resume or close out the reported session. */
   reconcile(station: StationRef, report: StateReportPayload): Promise<void>;
+  /**
+   * A staff UNLOCK: the UNLOCK payload for the station's own open session.
+   * Throws (409) when there is none, or it is locked for funds still missing.
+   */
+  unlockFor(station: StationRef): Promise<{ sessionId: string; leaseSeconds: number; serverTime: string }>;
+  /** Before a SHUTDOWN: settles whatever session the station holds, now. */
+  closeForShutdown(station: StationRef): Promise<void>;
 }
 
 /**

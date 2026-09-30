@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 
 import { BaseRepository } from '../../../common/repository/base.repository.js';
 import { PrismaService } from '../../../infra/prisma/prisma.service.js';
-import type { MachineStatus } from '../../../generated/prisma/index.js';
+import type { MachineStatus, Prisma } from '../../../generated/prisma/index.js';
 
 @Injectable()
 export class MachinesRepository extends BaseRepository {
@@ -44,6 +44,14 @@ export class MachinesRepository extends BaseRepository {
 
   touchLastSeen(id: string, lastSeen: Date) {
     return this.prisma.machine.update({ where: { id }, data: { lastSeen } });
+  }
+
+  setPeripherals(id: string, peripherals: Prisma.InputJsonValue, reportedAt: Date) {
+    return this.prisma.machine.update({ where: { id }, data: { peripherals, peripheralsReportedAt: reportedAt } });
+  }
+
+  rename(id: string, name: string) {
+    return this.prisma.machine.update({ where: { id }, data: { name } });
   }
 
   findStaleOnline(before: Date) {

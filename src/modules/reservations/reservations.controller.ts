@@ -6,9 +6,11 @@ import { ZodValidationPipe } from '../../common/pipes/zod-validation.pipe.js';
 import type { AccessTokenPayload } from '../../common/types/jwt-payload.js';
 import {
   createReservationSchema,
+  extendSchema,
   reservationIdSchema,
   walkInSchema,
   type CreateReservationDto,
+  type ExtendDto,
   type WalkInDto,
 } from './reservations.schemas.js';
 import { ReservationsService } from './reservations.service.js';
@@ -42,6 +44,23 @@ export class ReservationsController {
     @Param('id', new ZodValidationPipe(reservationIdSchema)) id: string,
   ) {
     return this.reservations.checkIn(caller, id);
+  }
+
+  @Get(':id/extend-options')
+  extendOptions(
+    @CurrentUser() caller: AccessTokenPayload,
+    @Param('id', new ZodValidationPipe(reservationIdSchema)) id: string,
+  ) {
+    return this.reservations.extendOptions(caller, id);
+  }
+
+  @Post(':id/extend')
+  extend(
+    @CurrentUser() caller: AccessTokenPayload,
+    @Param('id', new ZodValidationPipe(reservationIdSchema)) id: string,
+    @Body(new ZodValidationPipe(extendSchema)) dto: ExtendDto,
+  ) {
+    return this.reservations.extend(caller, id, dto.minutes);
   }
 
   @Delete(':id')
