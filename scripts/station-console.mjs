@@ -782,12 +782,20 @@ async function listPlans(kind) {
 
 // ---------------------------------------------------------------- Advance Reservation
 
+/** No default: the operator types the time. Re-asks until something is typed; the backend validates it. */
+async function askTime(label) {
+  for (;;) {
+    const value = await ask(`${label} (ISO with offset, e.g. ${new Date().toISOString().slice(0, 16)}:00Z or 2026-10-01T18:00:00+01:00)`);
+    if (value) return value;
+  }
+}
+
 async function createReservation() {
-  const start = new Date(Date.now() + 5 * 60_000);
+  log(c.dim(`now: ${new Date().toISOString()} (UTC). startTime must be in the future.`));
   const body = {
     machineId: await askStation(),
-    startTime: await ask('startTime (ISO, with offset)', start.toISOString()),
-    endTime: await ask('endTime (ISO, with offset)', new Date(start.getTime() + 60 * 60_000).toISOString()),
+    startTime: await askTime('startTime'),
+    endTime: await askTime('endTime'),
   };
   const res = await http('POST', '/reservations', { body });
   if (res.ok) remember({ reservationId: res.data.id });

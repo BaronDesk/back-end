@@ -500,7 +500,7 @@ wallet balance, observer on as staff. Identities: `hq-admin` and `gamer.wood`.
 | 13.15 | `40` end session `staff_end` | `[command_update] END_SESSION ACKED`, `39`: `COMPLETED`, `settledAt`, `billingBreakdown` | Lock screen | |
 | 13.16 | `44` ledger | `PAYMENT -totalCents` with the session id | - | |
 | 13.17 | `40` again | 409 `SESSION_NOT_OPEN` | - | |
-| 13.18 | As the gamer: `60` book ahead (start in 5 minutes), `62` cancel it | 201, then 2xx. `59` shows the new status | - | |
+| 13.18 | As the gamer: `60` book ahead: type `startTime` about 5 minutes from now and `endTime` 1 hour later (ISO with offset, the console prints the current UTC time), then `62` cancel it | 201, then 2xx. `59` shows the new status | - | |
 | 13.19 | `60` with a start time in the past | 400 `INVALID_RESERVATION_TIME` | - | |
 
 Check the numbers: `totalCents = round(meteredSeconds / 60 * rateCentsPerMinute)`.
