@@ -120,15 +120,20 @@ export class SessionsRepository extends BaseRepository {
     ]);
   }
 
-  /** Session settles; its reservation -> COMPLETED. */
-  async complete(id: string, reservationId: string, data: Prisma.SessionUpdateInput) {
-    await this.prisma.$transaction([
-      this.prisma.session.update({ where: { id }, data }),
-      this.prisma.reservation.updateMany({
+  /**
+   * Session settles; its reservation -> COMPLETED. Only an open session is
+   * closed: false if another path (presence, force-close, sweep) closed it first.
+   */
+  complete(id: string, reservationId: string, data: Prisma.SessionUpdateManyMutationInput): Promise<boolean> {
+    return this.prisma.$transaction(async (tx) => {
+      const { count } = await tx.session.updateMany({ where: { id, status: { in: OPEN_SESSION_STATUSES } }, data });
+      if (count === 0) return false;
+      await tx.reservation.updateMany({
         where: { id: reservationId, status: { in: ['CONFIRMED', 'ACTIVE'] } },
         data: { status: 'COMPLETED' },
-      }),
-    ]);
+      });
+      return true;
+    });
   }
 
   /** Open sessions whose reservation window is over. */

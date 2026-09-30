@@ -72,7 +72,7 @@ describe('SessionsService', () => {
       spendPin: vi.fn(async () => true),
       update: vi.fn(async (id, data) => sessionRow({ id, ...data })),
       activate: vi.fn(async () => undefined),
-      complete: vi.fn(async () => undefined),
+      complete: vi.fn(async () => true),
       findOverdueOpen: vi.fn(async () => []),
       markNoShows: vi.fn(async () => 0),
     };
@@ -456,6 +456,91 @@ describe('SessionsService', () => {
       expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED', meteredSeconds: 120 }));
       expect(commands.issueSystemEndSession).toHaveBeenCalledWith('m1', 'reservation_ended');
       expect(repo.cancelPending).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('forceClose', () => {
+    /** One stored session row that complete() closes only while it is still open, like the guarded repo write. */
+    let row: ReturnType<typeof sessionRow>;
+
+    beforeEach(() => {
+      row = sessionRow({ status: 'ACTIVE', meteringStartedAt: new Date(Date.now() - 5 * 60_000) });
+      repo.findByIdWithReservation.mockImplementation(async () => ({ ...row }));
+      repo.findForSettlement.mockImplementation(async () => ({ ...row }));
+      repo.complete.mockImplementation(async (_id: string, _reservationId: string, data: Record<string, unknown>) => {
+        if (!['PENDING', 'ACTIVE', 'PAUSED'].includes(row.status)) return false;
+        row = { ...row, ...data };
+        return true;
+      });
+    });
+
+    it('settles an ACTIVE session at once, completes the reservation, ends it on the station and cancels the run-out timer', async () => {
+      const result = await service.forceClose(caller(), 's1', 'agent crashed');
+
+      expect(commands.issueSystemEndSession).toHaveBeenCalledWith('m1', 'agent crashed');
+      // 5 minutes active at 100c/min = 500c
+      expect(wallet.debit).toHaveBeenCalledOnce();
+      expect(wallet.debit).toHaveBeenCalledWith('g1', expect.objectContaining({
+        amount: 500, sessionId: 's1', idempotencyKey: 'session-settlement:s1',
+      }));
+      expect(repo.complete).toHaveBeenCalledOnce();
+      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED', meteredSeconds: 300 }));
+      expect(runoutTimer.cancel).toHaveBeenCalledWith('s1');
+      expect(result).toMatchObject({ id: 's1', status: 'COMPLETED' });
+    });
+
+    it('meters no further than the reservation window', async () => {
+      row = sessionRow({ status: 'PAUSED', meteredSeconds: 120, endTime: new Date(Date.now() - 60_000) });
+      await service.forceClose(caller(), 's1');
+      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ meteredSeconds: 120 }));
+      expect(commands.issueSystemEndSession).toHaveBeenCalledWith('m1', 'force_close');
+    });
+
+    it('still settles when END_SESSION cannot reach the station', async () => {
+      commands.issueSystemEndSession.mockRejectedValueOnce(new Error('dispatch failed'));
+      await service.forceClose(caller(), 's1');
+      expect(repo.complete).toHaveBeenCalledOnce();
+      expect(row.status).toBe('COMPLETED');
+    });
+
+    it('a later presence sessionEnded does not settle or debit again', async () => {
+      await service.forceClose(caller(), 's1');
+      presence.sessionEnded.next({ sessionId: 's1', endedAt: new Date().toISOString() });
+      await flush();
+
+      expect(wallet.debit).toHaveBeenCalledOnce();
+      expect(repo.complete).toHaveBeenCalledOnce();
+      expect(row.billingBreakdown).toMatchObject({ meteredSeconds: 300, totalCents: 500 });
+    });
+
+    it('racing sessionEnded that read the session while open closes nothing twice and reuses the debit key', async () => {
+      const staleOpen = { ...row };
+      repo.findForSettlement.mockResolvedValueOnce(staleOpen); // presence path read before force-close wrote
+      const firstBreakdown = (await service.forceClose(caller(), 's1'), row.billingBreakdown);
+      presence.sessionEnded.next({ sessionId: 's1', endedAt: new Date().toISOString() });
+      await flush();
+
+      // Only one close-out lands; any repeat debit carries the same idempotency key, so the wallet applies it once.
+      expect(repo.complete).toHaveBeenCalledTimes(2);
+      expect(await repo.complete.mock.results[1].value).toBe(false);
+      expect(row.billingBreakdown).toBe(firstBreakdown);
+      const keys = new Set(wallet.debit.mock.calls.map((c) => c[1].idempotencyKey));
+      expect(keys).toEqual(new Set(['session-settlement:s1']));
+    });
+
+    it.each(['COMPLETED', 'CANCELLED'])('409s SESSION_NOT_OPEN for a %s session and touches nothing', async (status) => {
+      row = sessionRow({ status });
+      await expect(service.forceClose(caller(), 's1')).rejects.toMatchObject({ response: { code: 'SESSION_NOT_OPEN' } });
+      expect(commands.issueSystemEndSession).not.toHaveBeenCalled();
+      expect(wallet.debit).not.toHaveBeenCalled();
+      expect(repo.complete).not.toHaveBeenCalled();
+    });
+
+    it('404s a missing session and rejects a cross-branch caller', async () => {
+      repo.findByIdWithReservation.mockResolvedValueOnce(null);
+      await expect(service.forceClose(caller(), 's1')).rejects.toBeInstanceOf(NotFoundException);
+      await expect(service.forceClose(caller({ branchId: 'other' }), 's1')).rejects.toThrow();
+      expect(repo.complete).not.toHaveBeenCalled();
     });
   });
 

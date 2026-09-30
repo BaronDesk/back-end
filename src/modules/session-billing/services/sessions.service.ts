@@ -178,6 +178,33 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
   }
 
   /**
+   * Staff close-out that does not wait for the station. Asks the station to
+   * end the session (skipped if offline), then settles at once from server
+   * state, metered up to now. A later presence sessionEnded finds the session
+   * COMPLETED and does nothing; the debit key is shared, so it never bills twice.
+   */
+  async forceClose(caller: AccessTokenPayload, id: string, reason?: string) {
+    const session = await this.repo.findByIdWithReservation(id);
+    if (!session) throw notFound('SESSION_NOT_FOUND', 'session not found');
+    assertScope(caller, { branchId: session.reservation.machine.branchId });
+    if (!OPEN_SESSION_STATUSES.includes(session.status)) {
+      throw new ConflictException({ code: 'SESSION_NOT_OPEN', error: 'session is already closed' });
+    }
+    try {
+      await this.commands.issueSystemEndSession(session.reservation.machineId, reason ?? 'force_close');
+    } catch (err) {
+      // The station may be gone for good; settlement must not depend on it.
+      this.logger.warn(`force-close END_SESSION for session ${id} failed: ${(err as Error).message}`);
+    }
+    if (!(await this.settle(session, new Date()))) {
+      this.logger.log(`force-close of session ${id}: already settled by another path`);
+    }
+    await this.runoutTimer.cancel(id);
+    const closed = await this.repo.findByIdWithReservation(id);
+    return toSessionDto((closed ?? session) as SessionRecord);
+  }
+
+  /**
    * RUNOUT_LOCK_HANDLER seam for feat/runout-timer. Just requests the lock —
    * the PAUSED transition and metering close-out happen through
    * onStationStatus once presence reports the station actually locked, same
@@ -349,7 +376,8 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
     return toLease(Math.min(windowSeconds, this.leaseCapSeconds), now);
   }
 
-  private async settle(session: SettlementSession, endedAt: Date): Promise<void> {
+  /** False if the session was already closed by another path; the debit key keeps a repeat from billing twice. */
+  private async settle(session: SettlementSession, endedAt: Date): Promise<boolean> {
     // No lease reaches past the reservation window, so neither does metering.
     const meteredUntil = new Date(Math.min(endedAt.getTime(), session.endTime.getTime()));
     let meteredSeconds = session.meteredSeconds;
@@ -380,7 +408,7 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
       }
     }
 
-    await this.repo.complete(session.id, session.reservationId, {
+    return this.repo.complete(session.id, session.reservationId, {
       status: 'COMPLETED',
       meteringStartedAt: null,
       meteredSeconds,

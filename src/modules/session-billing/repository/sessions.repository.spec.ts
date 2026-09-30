@@ -37,3 +37,33 @@ describe('SessionsRepository station lock', () => {
     });
   });
 });
+
+describe('SessionsRepository.complete', () => {
+  function setup(sessionCount: number) {
+    const tx = {
+      session: { updateMany: vi.fn(async () => ({ count: sessionCount })) },
+      reservation: { updateMany: vi.fn(async () => ({ count: 1 })) },
+    };
+    const prisma = { $transaction: vi.fn(async (fn: (t: unknown) => unknown) => fn(tx)) };
+    return { tx, repo: new SessionsRepository(prisma as any) };
+  }
+
+  it('closes only an open session, then completes its reservation', async () => {
+    const { tx, repo } = setup(1);
+    expect(await repo.complete('s1', 'r1', { status: 'COMPLETED' })).toBe(true);
+    expect(tx.session.updateMany).toHaveBeenCalledWith({
+      where: { id: 's1', status: { in: ['PENDING', 'ACTIVE', 'PAUSED'] } },
+      data: { status: 'COMPLETED' },
+    });
+    expect(tx.reservation.updateMany).toHaveBeenCalledWith({
+      where: { id: 'r1', status: { in: ['CONFIRMED', 'ACTIVE'] } },
+      data: { status: 'COMPLETED' },
+    });
+  });
+
+  it('is a no-op once the session is already closed', async () => {
+    const { tx, repo } = setup(0);
+    expect(await repo.complete('s1', 'r1', { status: 'COMPLETED' })).toBe(false);
+    expect(tx.reservation.updateMany).not.toHaveBeenCalled();
+  });
+});

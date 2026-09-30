@@ -33,4 +33,16 @@ export class SessionsController {
   ) {
     return this.sessions.end(caller, id, dto.reason);
   }
+
+  /** Settles now, without waiting for the station to confirm the end. */
+  @RequireScope('staff')
+  @Post(':id/force-close')
+  @HttpCode(200)
+  forceClose(
+    @CurrentUser() caller: AccessTokenPayload,
+    @Param('id', new ZodValidationPipe(idParamSchema)) id: string,
+    @Body(new ZodValidationPipe(endSessionBodySchema)) dto: EndSessionBodyDto,
+  ) {
+    return this.sessions.forceClose(caller, id, dto.reason);
+  }
 }
