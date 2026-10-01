@@ -37,7 +37,7 @@ describe('session billing (e2e)', () => {
   async function createGamer(balance = 10_000): Promise<{ username: string; profileId: string; token: string }> {
     const username = `sb-gamer-${randomUUID()}`;
     usernames.push(username);
-    await app.inject({ method: 'POST', url: '/users', payload: { username, password } });
+    await app.inject({ method: 'POST', url: '/users', payload: { username, password, branchId } });
     const login = await app.inject({ method: 'POST', url: '/auth/login', payload: { username, password } });
     const user = await prisma.user.findUniqueOrThrow({ where: { username }, include: { gamerProfile: true } });
     if (balance > 0) await creditWallet(user.gamerProfile!.id, balance);

@@ -127,7 +127,7 @@ describe('station commands (e2e)', () => {
       reconnection: false,
       auth: { token: staffToken },
     });
-    await new Promise((resolve) => client.on('connect', resolve));
+    await new Promise<void>((resolve) => client.on('connect', () => resolve()));
     const updates: Record<string, unknown>[] = [];
     client.on('command_update', (e: Record<string, unknown>) => updates.push(e));
 
@@ -370,7 +370,7 @@ describe('station commands (e2e)', () => {
       await assignToBranch(enabled.id);
       await assignToBranch(disabled.id);
 
-      await app.inject({ method: 'POST', url: '/users', payload: { username: usernames[2], password } });
+      await app.inject({ method: 'POST', url: '/users', payload: { username: usernames[2], password, branchId } });
       const login = await app.inject({ method: 'POST', url: '/auth/login', payload: { username: usernames[2], password } });
       const forGamer = (await app.inject({ method: 'GET', url: '/api/v1/games', headers: auth(login.json().accessToken) })).json();
       const gamerIds = forGamer.map((g: { id: string }) => g.id);
@@ -564,7 +564,7 @@ describe('station commands (e2e)', () => {
         reconnection: false,
         auth: { token: staffToken },
       });
-      await new Promise((resolve) => client.on('connect', resolve));
+      await new Promise<void>((resolve) => client.on('connect', () => resolve()));
       const pushed: Record<string, unknown>[] = [];
       client.on('catalog_status', (e: Record<string, unknown>) => pushed.push(e));
 

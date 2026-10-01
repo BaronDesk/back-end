@@ -42,13 +42,28 @@ describe('auth + rbac (e2e)', () => {
     await app.close();
   });
 
-  it('registers a gamer via POST /users', async () => {
+  it('refuses a sign-up without a home branch, or with an unknown one', async () => {
+    const missing = await app.inject({ method: 'POST', url: '/users', payload: { username: gamerUsername, password } });
+    expect(missing.statusCode).toBe(400);
+    expect(missing.json().code).toBe('VALIDATION_ERROR');
+
+    const unknown = await app.inject({
+      method: 'POST',
+      url: '/users',
+      payload: { username: gamerUsername, password, branchId: randomUUID() },
+    });
+    expect(unknown.statusCode).toBe(400);
+    expect(unknown.json().code).toBe('BRANCH_NOT_FOUND');
+  });
+
+  it('registers a gamer via POST /users with their home branch', async () => {
     const res = await app.inject({
       method: 'POST',
       url: '/users',
-      payload: { username: gamerUsername, password },
+      payload: { username: gamerUsername, password, branchId },
     });
     expect(res.statusCode).toBe(201);
+    expect(res.json()).toMatchObject({ username: gamerUsername, role: 'GAMER', homeBranchId: branchId });
   });
 
   it('logs the gamer in with 200', async () => {

@@ -41,7 +41,7 @@ describe('pricing (e2e)', () => {
         employeeProfile: { create: { managedBranchId: branchAId, hireDate: new Date() } },
       },
     });
-    await app.inject({ method: 'POST', url: '/users', payload: { username: gamerUsername, password } });
+    await app.inject({ method: 'POST', url: '/users', payload: { username: gamerUsername, password, branchId: branchAId } });
 
     const login = async (username: string) =>
       (await app.inject({ method: 'POST', url: '/auth/login', payload: { username, password } })).json().accessToken;

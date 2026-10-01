@@ -16,6 +16,7 @@ describe('membership + subscription purchase (e2e)', () => {
   let membershipPlanId: string;
   let subscriptionPlanId: string;
   let otherSubscriptionPlanId: string;
+  let branchId: string;
 
   const password = 'super-secret-1';
   const gamerUsername = `gamer-${randomUUID()}`;
@@ -40,7 +41,8 @@ describe('membership + subscription purchase (e2e)', () => {
 
     const passwordHash = await hash(password);
     await prisma.user.create({ data: { username: adminUsername, passwordHash, role: 'ADMIN' } });
-    await app.inject({ method: 'POST', url: '/users', payload: { username: gamerUsername, password } });
+    branchId = (await prisma.branch.create({ data: { name: `plans-${suffix}`, location: 'test' } })).id;
+    await app.inject({ method: 'POST', url: '/users', payload: { username: gamerUsername, password, branchId } });
 
     gamerToken = (
       await app.inject({ method: 'POST', url: '/auth/login', payload: { username: gamerUsername, password } })
@@ -87,6 +89,7 @@ describe('membership + subscription purchase (e2e)', () => {
     await prisma.membershipPlan.deleteMany({ where: { id: membershipPlanId } });
     await prisma.subscriptionPlan.deleteMany({ where: { id: { in: [subscriptionPlanId, otherSubscriptionPlanId].filter(Boolean) } } });
     await prisma.user.deleteMany({ where: { username: { in: [gamerUsername, adminUsername] } } });
+    await prisma.branch.deleteMany({ where: { id: branchId } });
     await app.close();
   });
 

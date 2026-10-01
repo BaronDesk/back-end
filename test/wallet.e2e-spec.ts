@@ -40,7 +40,7 @@ describe('wallet ledger (e2e)', () => {
     });
     employeeToken = (await app.inject({ method: 'POST', url: '/auth/login', payload: { username: employeeUsername, password } })).json().accessToken;
 
-    await app.inject({ method: 'POST', url: '/users', payload: { username: gamerUsername, password } });
+    await app.inject({ method: 'POST', url: '/users', payload: { username: gamerUsername, password, branchId } });
 
     const gamerLogin = await app.inject({
       method: 'POST',
