@@ -49,13 +49,18 @@ export class SessionsRepository extends BaseRepository {
     return this.prisma.session.findUnique({ where: { id } });
   }
 
-  /** Sessions for the staff app, newest first, with their station and gamer. */
+  /**
+   * Sessions for the staff app, newest first, with their station and gamer.
+   * Only ones a gamer logged into: a booking's session waits PENDING with its
+   * PIN from the moment it is booked, and those are bookings, not play.
+   */
   list(filter: { branchId: string | null; status?: SessionStatus; from?: Date; limit: number }) {
     return this.prisma.session.findMany({
       where: {
         ...(filter.branchId ? { reservation: { machine: { branchId: filter.branchId } } } : {}),
         ...(filter.status ? { status: filter.status } : { status: { not: 'CANCELLED' } }),
         ...(filter.from ? { startTime: { gte: filter.from } } : {}),
+        OR: [{ status: { not: 'PENDING' } }, { pinUsedAt: { not: null } }],
       },
       include: {
         reservation: {

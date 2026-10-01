@@ -138,3 +138,34 @@ describe('SessionsRepository.closeAsNoShow', () => {
     expect(tx.reservation.updateMany).not.toHaveBeenCalled();
   });
 });
+
+describe('SessionsRepository.list', () => {
+  function setup() {
+    const prisma = { session: { findMany: vi.fn(async () => []) } };
+    return { prisma, repo: new SessionsRepository(prisma as any) };
+  }
+
+  it('leaves out sessions still waiting for their PIN (bookings nobody logged into)', async () => {
+    const { prisma, repo } = setup();
+    await repo.list({ branchId: 'b1', limit: 50 });
+    const [args] = prisma.session.findMany.mock.calls[0] as unknown as [{ where: Record<string, unknown>; take: number }];
+    expect(args.where).toEqual({
+      reservation: { machine: { branchId: 'b1' } },
+      status: { not: 'CANCELLED' },
+      OR: [{ status: { not: 'PENDING' } }, { pinUsedAt: { not: null } }],
+    });
+    expect(args.take).toBe(50);
+  });
+
+  it('keeps the status and start filters, every branch for HQ', async () => {
+    const { prisma, repo } = setup();
+    const from = new Date('2026-10-01T00:00:00Z');
+    await repo.list({ branchId: null, status: 'COMPLETED', from, limit: 10 });
+    const [args] = prisma.session.findMany.mock.calls[0] as unknown as [{ where: Record<string, unknown> }];
+    expect(args.where).toEqual({
+      status: 'COMPLETED',
+      startTime: { gte: from },
+      OR: [{ status: { not: 'PENDING' } }, { pinUsedAt: { not: null } }],
+    });
+  });
+});
