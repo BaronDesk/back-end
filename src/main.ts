@@ -6,9 +6,10 @@ import {
   FastifyAdapter,
   NestFastifyApplication,
 } from '@nestjs/platform-fastify';
-import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+import { SwaggerModule } from '@nestjs/swagger';
 
 import { AppModule } from './app.module.js';
+import { buildOpenApiDocument } from './common/swagger/build-document.js';
 
 async function bootstrap() {
   const app = await NestFactory.create<NestFastifyApplication>(
@@ -22,15 +23,7 @@ async function bootstrap() {
   app.enableShutdownHooks();
 
   if (process.env.NODE_ENV !== 'production') {
-    const doc = SwaggerModule.createDocument(
-      app,
-      new DocumentBuilder()
-      .setTitle('cstam backend')
-      .setVersion('0.1')
-      .addBearerAuth()
-      .build(),
-    );
-    SwaggerModule.setup('docs', app, doc);
+    SwaggerModule.setup('docs', app, buildOpenApiDocument(app), { jsonDocumentUrl: 'docs-json' });
   }
 
   const port = Number(process.env.PORT ?? 3000);

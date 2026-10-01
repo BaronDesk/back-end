@@ -17,6 +17,8 @@
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",
     "start:prod": "node dist/main",
+    "docs:export": "nest build && node dist/export-openapi.js docs/openapi.json",
+    "docs:build": "npm run docs:export && node scripts/build-static-docs.mjs",
     "lint": "oxlint src/ test/",
     "test": "vitest run",
     "test:watch": "vitest",
