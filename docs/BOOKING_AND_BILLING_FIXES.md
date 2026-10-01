@@ -292,6 +292,20 @@ Entry types must match the direction of the money (a mismatch is a 400):
     - `INSUFFICIENT_FUNDS`, shortfall settlement
   - `test/plans.e2e-spec.ts`: prices in millimes, one pass at a time.
   - `test/wallet.e2e-spec.ts`: employee permissions, wrong-way entry types.
+- **e2e, updated again on 2026-10-01** for the flow fixes (still not run: they need the 2026-09-30 and
+  2026-10-01 migrations applied first):
+  - every gamer sign-up sends its home `branchId`; `auth` checks a sign-up without one, or with an unknown
+    one, is refused;
+  - `session-billing`:
+    - the PIN comes with the booking, is shown on it, and works only from its start (30 minutes);
+    - the minimum balance is checked at login (`insufficient_funds`), not when the PIN is issued;
+    - a booking or walk-in the wallet can't cover is refused (`INSUFFICIENT_FUNDS`), counting bookings
+      already made;
+    - no-show 30 minutes after the start frees the PC;
+    - a system END_SESSION only reaches the station for the session it runs;
+    - a staff UNLOCK resumes the station's own session, and after a runout lock needs the money;
+  - `commands`: a staff UNLOCK with no session is refused (`NO_SESSION_TO_UNLOCK`);
+  - `realtime`: a gamer's socket gets only its own events.
 
 ## 12. Known limits
 

@@ -440,7 +440,7 @@ npm run test:int  # e2e in the backend container (stack up): realtime, commands,
 | `src/modules/station/services/presence.service.spec.ts` | Admission rule, ONLINE/OFFLINE, watchdog, session end |
 | `src/modules/station/services/station-token.service.spec.ts` | Token verification: claims, expiry, user vs station |
 | `src/modules/ops/services/commands.spec.ts` | Command checks, transitions, nack mapping |
-| `test/realtime.e2e-spec.ts` | `/agent-ws` upgrade, 401 / 1008 cases, handshake, presence, dashboard events |
-| `test/commands.e2e-spec.ts` | Command REST, delivery, ack / nack / timeout |
+| `test/realtime.e2e-spec.ts` | `/agent-ws` upgrade, 401 / 1008 cases, handshake, presence, dashboard events (staff get their branch's; a gamer only their own `user:<id>` events) |
+| `test/commands.e2e-spec.ts` | Command REST, delivery, ack / nack / timeout; a staff UNLOCK with no session on the station is refused (`NO_SESSION_TO_UNLOCK`) and never sent |
 | `test/telemetry.e2e-spec.ts` | Telemetry ingest, alerts |
 | `test/station-token.ts` | `mintStationToken()` helper: mints a token exactly as enrollment must |
