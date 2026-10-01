@@ -24,6 +24,10 @@ export default defineConfig({
       COMMAND_RETRY_BACKOFF_MS: '50',
       // Keeps the running dev server's worker off the test's command jobs.
       BULLMQ_PREFIX: 'bull-e2e',
+      // Every spec calls from one IP and creates many gamers: the production
+      // sign-up limit (30 an hour, counted in Redis across runs) would refuse them.
+      RATE_LIMIT_SIGNUPS_PER_HOUR: '100000',
+      RATE_LIMIT_REFRESHES_PER_MINUTE: '100000',
     },
   },
   plugins: [swc.vite()],

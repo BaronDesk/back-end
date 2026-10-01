@@ -31,7 +31,14 @@ numbers (#n) match the implementation plan
 **Prisma client.** After pulling, run `npx prisma generate`. If the unit tests
 fail with `Cannot read properties of undefined (reading 'validator')`, the
 generated client in `src/generated/prisma/runtime/` was written empty. Run
-`npx prisma generate` again.
+`npx prisma generate` again **on the host**.
+
+The cause, seen on 2026-10-01: the dev container's start-up `prisma generate`
+(`docker/dev-entrypoint.sh`) fails on the Windows / OneDrive bind mount with
+`EPERM: operation not permitted, copyfile … runtime/index-browser.d.ts`. It stops
+halfway, leaving empty `runtime/*.js` files, and `set -e` stops the container.
+The client is plain JS and WASM, so one generated on the host works in the
+container too.
 
 **Settings.** Every new setting has a default; see §9.
 
@@ -95,7 +102,9 @@ A Redis counter answers `429 TOO_MANY_ATTEMPTS` when one of these limits is hit:
 | `POST /auth/refresh` | 60 a minute, per IP |
 | `POST /users` (sign-up) | 30 an hour, per IP |
 
-If Redis is down, the limiter lets requests through.
+If Redis is down, the limiter lets requests through. The counts are settings
+(`RATE_LIMIT_*`, §9); the e2e config raises the sign-up and refresh ones, because
+every spec calls from one IP.
 
 **Where.** `common/rate-limit/rate-limiter.service.ts`, `identity/controllers/*`.
 
@@ -408,6 +417,9 @@ defaults.
 | `SESSION_ENDING_NOTICE_MINUTES` | 10 | The TIME_LEFT notice comes this long before the end |
 | `PIN_ENCRYPTION_KEY` | derived from `JWT_ACCESS_SECRET` | Seals the PIN so the app can show it again (16+ characters) |
 | `BUSINESS_TIMEZONE` | `Africa/Tunis` | Pass time windows are read in it |
+| `RATE_LIMIT_LOGIN_FAILURES` | 10 | Wrong passwords per IP + username in 15 minutes, then 429 |
+| `RATE_LIMIT_REFRESHES_PER_MINUTE` | 60 | `POST /auth/refresh` per IP |
+| `RATE_LIMIT_SIGNUPS_PER_HOUR` | 30 | `POST /users` per IP |
 
 `SESSION_PIN_TTL_S` is no longer used: the PIN's validity comes from the
 booking.
@@ -416,10 +428,18 @@ booking.
 
 ## 10. Tests
 
-- **Unit** (`npm test`): 318 pass. They cover each item above, mostly in
+- **Unit** (`npm test`): 321 pass. They cover each item above, mostly in
   `*.service.spec.ts` next to the code.
-- **e2e** (`npm run test:int`, inside the backend container): updated for
-  every changed contract, but **not run yet**. They need the migrations in §0.
+- **e2e** (`npm run test:int`, inside the backend container): **106 pass**
+  (2026-10-01, twice in a row, on a fresh database with all 19 migrations).
+  They need the migrations in §0. Fixed along the way:
+  - the e2e config raises the sign-up and refresh limits (`RATE_LIMIT_*`):
+    the specs create far more than 30 gamers from one IP;
+  - test station tokens last 90 days, so the backend sends no
+    `station_credential` unless a test asks; `realtime` checks the renewal with
+    a one-hour token;
+  - `commands` uses install targets the seed can't have, and its station-catalog
+    case starts from a branch with no games offered.
   - Every gamer sign-up sends `branchId`; `auth` checks the refusals.
   - `session-billing` covers:
     - the PIN at booking, its window, and New PIN;
@@ -432,7 +452,6 @@ booking.
 
 ## 11. Known limits
 
-- The e2e specs haven't run against a database with these migrations yet.
 - A gamer can't end their own session from the PC (#6, skipped).
 - The dashboard socket keeps the token it connected with until it reconnects
   (#19, skipped).

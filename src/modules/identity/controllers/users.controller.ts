@@ -1,8 +1,10 @@
 import { Body, Controller, Get, HttpCode, Param, Patch, Post, Query } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 
 import { ClientIp } from '../../../common/decorators/client-ip.decorator.js';
 import { CurrentUser } from '../../../common/decorators/current-user.decorator.js';
 import { RateLimiter } from '../../../common/rate-limit/rate-limiter.service.js';
+import { authRateLimits, type AuthRateLimits } from '../../../common/rate-limit/rate-limits.js';
 import { Public } from '../../../common/decorators/public.decorator.js';
 import { RequireScope } from '../../../common/decorators/require-scope.decorator.js';
 import { ZodValidationPipe } from '../../../common/pipes/zod-validation.pipe.js';
@@ -28,20 +30,22 @@ import {
 } from '../schemas/users.schemas.js';
 import { UsersService } from '../services/users.service.js';
 
-/** Sign-ups per IP: enough for a venue's shared Wi-Fi, not for a script. */
-const SIGNUPS = { limit: 30, windowS: 60 * 60 };
-
 @Controller()
 export class UsersController {
+  private readonly limits: AuthRateLimits;
+
   constructor(
     private readonly users: UsersService,
     private readonly limiter: RateLimiter,
-  ) {}
+    config: ConfigService,
+  ) {
+    this.limits = authRateLimits((key) => config.get(key));
+  }
 
   @Public()
   @Post('users')
   async createGamer(@ClientIp() ip: string, @Body(new ZodValidationPipe(createGamerSchema)) dto: CreateGamerDto) {
-    await this.limiter.consume(`signup:${ip}`, SIGNUPS);
+    await this.limiter.consume(`signup:${ip}`, this.limits.signups);
     return this.users.createGamer(dto);
   }
 

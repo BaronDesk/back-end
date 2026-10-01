@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { hash } from '@node-rs/argon2';
+import { JwtService } from '@nestjs/jwt';
 import { Test, TestingModule } from '@nestjs/testing';
 import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
 import { io as ioClient } from 'socket.io-client';
@@ -308,6 +309,21 @@ describe('realtime gateways (e2e)', () => {
     const serialNumber = `GHOST-${randomUUID()}`;
     expect(await upgradeStatus(null)).toBe(401);
     expect(await prisma.machine.count({ where: { serialNumber } })).toBe(0);
+  });
+
+  it('renews a station token that expires within 30 days: station_credential right after handshake_ack', async () => {
+    const serialNumber = `STATION-${randomUUID()}`;
+    const machine = await createMachine(serialNumber);
+    const agent = await openAgent(mintStationToken(app, machine, {}, 3600)); // one hour left
+    agent.socket.send(makeFrame(envelope('handshake', 1, { serialNumber })));
+
+    expect((await agent.next()).type).toBe('handshake_ack');
+    const renewal = await agent.next();
+    expect(renewal).toMatchObject({ type: 'station_credential', payload: { stationToken: expect.any(String) } });
+    const claims = app.get(JwtService, { strict: false }).decode((renewal.payload as { stationToken: string }).stationToken);
+    expect(claims).toMatchObject({ sub: machine.id, type: 'station', serialNumber, branchId, ver: 1 });
+    expect(claims.exp * 1000 - Date.now()).toBeGreaterThan(30 * 24 * 60 * 60_000);
+    agent.socket.close();
   });
 
   it('rejects a dashboard connection with no token', async () => {

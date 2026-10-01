@@ -297,8 +297,8 @@ Entry types must match the direction of the money (a mismatch is a 400):
     - `INSUFFICIENT_FUNDS`, shortfall settlement
   - `test/plans.e2e-spec.ts`: prices in millimes, one pass at a time.
   - `test/wallet.e2e-spec.ts`: employee permissions, wrong-way entry types.
-- **e2e, updated again on 2026-10-01** for the flow fixes (still not run: they need the 2026-09-30 and
-  2026-10-01 migrations applied first):
+- **e2e, updated again on 2026-10-01** for the flow fixes; all 106 pass on a database with every
+  migration (`FLOW_FIXES.md` §10):
   - every gamer sign-up sends its home `branchId`; `auth` checks a sign-up without one, or with an unknown
     one, is refused;
   - `session-billing`:

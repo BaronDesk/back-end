@@ -56,6 +56,10 @@ export const envSchema = z.object({
   SESSION_RUNOUT_MARGIN_S: z.coerce.number().int().nonnegative().default(30),
   // The station and the gamer's app get a TIME_LEFT notice this long before a booking ends.
   SESSION_ENDING_NOTICE_MINUTES: z.coerce.number().int().min(1).default(10),
+  // Rate limits of the public auth routes (counts; the windows are fixed).
+  RATE_LIMIT_LOGIN_FAILURES: z.coerce.number().int().min(1).default(10), // per IP + username, 15 min
+  RATE_LIMIT_REFRESHES_PER_MINUTE: z.coerce.number().int().min(1).default(60), // per IP
+  RATE_LIMIT_SIGNUPS_PER_HOUR: z.coerce.number().int().min(1).default(30), // per IP
 });
 
 export type EnvConfig = z.infer<typeof envSchema>;

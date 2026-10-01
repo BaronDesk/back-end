@@ -447,11 +447,14 @@ describe('station commands (e2e)', () => {
 
     it('stores installed_games and lists them for "add to catalog", matched against the catalog', async () => {
       const agent = await connectAgent();
-      const known = await createGame({ launchType: 'steam', target: '730' });
+      // Targets no seeded catalog game uses (the seed has Steam 730 and Epic Fortnite).
+      const steamApp = String(1_000_000_000 + Math.floor(Math.random() * 1_000_000_000));
+      const epicApp = `Unlisted-${randomUUID().slice(0, 8)}`;
+      const known = await createGame({ launchType: 'steam', target: steamApp });
       agent.send('installed_games', {
         games: [
-          { launchType: 'steam', target: '730', name: 'Counter-Strike 2', processName: 'cs2.exe', inCatalog: true },
-          { launchType: 'epic', target: 'Fortnite', name: 'Fortnite', inCatalog: false },
+          { launchType: 'steam', target: steamApp, name: 'Counter-Strike 2', processName: 'cs2.exe', inCatalog: true },
+          { launchType: 'epic', target: epicApp, name: 'Fortnite', inCatalog: false },
           { launchType: 'steam', target: 'not-an-app-id', name: 'Broken', inCatalog: false }, // skipped, not the list
         ],
       });
@@ -459,14 +462,14 @@ describe('station commands (e2e)', () => {
         (await app.inject({ method: 'GET', url: `/api/v1/games/installed?stationId=${agent.machine.id}`, headers: auth() })).json();
       await vi.waitFor(async () => expect(await installed()).toHaveLength(2));
       const list = await installed();
-      expect(list.find((g: { target: string }) => g.target === '730')).toMatchObject({
+      expect(list.find((g: { target: string }) => g.target === steamApp)).toMatchObject({
         launchType: 'steam',
         name: 'Counter-Strike 2',
         processName: 'cs2.exe',
         stations: [{ id: agent.machine.id }],
         catalogGame: { id: known.id },
       });
-      expect(list.find((g: { target: string }) => g.target === 'Fortnite')).toMatchObject({ launchType: 'epic', catalogGame: null });
+      expect(list.find((g: { target: string }) => g.target === epicApp)).toMatchObject({ launchType: 'epic', catalogGame: null });
 
       // The next report replaces the list.
       agent.send('installed_games', { games: [] });
@@ -504,6 +507,8 @@ describe('station commands (e2e)', () => {
     });
 
     it('serves GET /stations/me/games to the agent by its bearer token, resolved for that machine', async () => {
+      // Earlier cases leave games offered to this spec's branch: start from none, so a new station has an empty catalog.
+      await prisma.gameBranch.deleteMany({ where: { branchId } });
       const agent = await connectAgent();
       expect((await fetchCatalog({})).statusCode).toBe(401);
       expect((await fetchCatalog({ authorization: 'Bearer nobody' })).statusCode).toBe(401);
