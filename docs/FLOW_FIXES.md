@@ -49,8 +49,10 @@ generated client in `src/generated/prisma/runtime/` was written empty. Run
 - Staff join their branch room; HQ joins `branch:all`.
 - A gamer joins only `user:<userId>`. Staff with no branch join nothing.
 - New `publishToUser(userId, event, payload)`.
-- `session_runout_warning` and `session_notice` go to the gamer's room only.
-  Session-billing looks up the gamer's user id.
+- `session_notice` goes to the gamer's room only (session-billing looks up the
+  gamer's user id). `session_runout_warning` stays a staff event, sent to the
+  station's branch; the gamer gets the same warning as `session_notice`
+  `LOW_BALANCE`.
 
 **Where.** `ops/dashboard.gateway.ts`, `session-billing/services/sessions.service.ts`.
 
@@ -378,9 +380,9 @@ time), `unsupported_method`.
 **Dashboard socket (`/dashboard-io`).**
 - To the branch room (and HQ): `station_status`, `telemetry_update`,
   `command_update`, `alert`, `alert_resolved`, `catalog_status`,
-  `peripheral_status` (new).
-- To the gamer's `user:<id>` room: `session_runout_warning`, `session_notice`
-  (new). `session_update` is defined but not sent yet.
+  `session_runout_warning`, `peripheral_status` (new).
+- To the gamer's `user:<id>` room: `session_notice` (new). `session_update` is
+  defined but not sent yet.
 
 **Agent socket (`/agent-ws`).**
 - New from the backend:

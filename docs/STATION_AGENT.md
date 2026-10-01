@@ -377,8 +377,8 @@ socket.io on path `/dashboard-io`. Authenticate with a **user** access token in
 - A gamer joins only `user:<userId>` (`publishToUser`).
 
 Branch events: `station_status`, `catalog_status`, `telemetry_update`, `alert`,
-`alert_resolved`, `command_update`, `peripheral_status`.
-Gamer events: `session_runout_warning`, `session_notice`.
+`alert_resolved`, `command_update`, `session_runout_warning`, `peripheral_status`.
+Gamer events: `session_notice` (the gamer's low-balance warning is its `LOW_BALANCE`).
 
 Staff REST for stations: `GET /api/v1/stations` (the Postgres rows merged with the
 Redis presence cache, scoped to the caller's branch), `GET /api/v1/stations/:id` (with

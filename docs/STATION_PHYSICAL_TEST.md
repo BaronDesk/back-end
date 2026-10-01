@@ -551,5 +551,5 @@ Billing variants (each needs a new reservation and session):
   branch (it goes back to PENDING for approval).
 - In dev on Docker Desktop, `ip` shows the Docker gateway, not the PC.
 - The stand-in agent enrolls but does not connect to `/agent-ws`: it stays OFFLINE.
-- A gamer's dashboard socket gets only its own events (`session_runout_warning`,
-  `session_notice`); see `FLOW_FIXES.md` A1.
+- A gamer's dashboard socket gets only its own events (`session_notice`); see
+  `FLOW_FIXES.md` A1.
