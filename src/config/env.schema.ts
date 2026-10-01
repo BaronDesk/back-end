@@ -51,6 +51,11 @@ export const envSchema = z.object({
   SESSION_SWEEP_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
   // Runout timer: how long before the calculated lock time the WARN job fires.
   SESSION_RUNOUT_WARNING_LEAD_S: z.coerce.number().int().nonnegative().default(300),
+  // Runout timer: the station is locked this long before the money runs out,
+  // to cover the delay between the LOCK and the station actually locking.
+  SESSION_RUNOUT_MARGIN_S: z.coerce.number().int().nonnegative().default(30),
+  // The station and the gamer's app get a TIME_LEFT notice this long before a booking ends.
+  SESSION_ENDING_NOTICE_MINUTES: z.coerce.number().int().min(1).default(10),
 });
 
 export type EnvConfig = z.infer<typeof envSchema>;

@@ -110,7 +110,7 @@ minimum (the `@RequireScope` of its route). Numbers never change between profile
 | | 2 | whoami `GET /auth/me` | self |
 | | 3 | refresh tokens `POST /auth/refresh` | self |
 | | 4 | logout `POST /auth/logout` | self |
-| | 5 | register a gamer `POST /users` | public |
+| | 5 | register a gamer `POST /users` (asks the home `branchId`) | public |
 | | 6 | create EMPLOYEE / MANAGER `POST /employees` | admin |
 | | 7 | change role `PATCH /users/:id/role` | admin |
 | | 8 | get a user `GET /users/:id` | self |
@@ -218,7 +218,7 @@ Every refusal of `/enrollment/request` is a **200** with
 | 2.8 | Give the agent a token cut by 1 character | `REJECTED`, `INVALID_ENROLLMENT_TOKEN` (or `INVALID_REQUEST` if under 20 characters) | |
 | 2.9 | Mint with `ttlMinutes 1`, wait 2 minutes, give it to the agent | `REJECTED`, `INVALID_ENROLLMENT_TOKEN` | |
 | 2.10 | Enroll, then `17` reject instead of approve | Agent's next poll: `REJECTED`, `ENROLLMENT_REJECTED`. Machine `DEACTIVATED` | |
-| 2.11 | `18` revoke an ENROLLED station, restart the agent | Close 1008 `station not enrolled`. Station stays OFFLINE | |
+| 2.11 | `18` revoke an ENROLLED station while its agent is connected | The socket closes at once with 1008 `station not enrolled`; a running session is settled. Station stays OFFLINE | |
 | 2.12 | `19` rotate the credential of an ENROLLED station, give the rotation token to the agent | Agent redeems with a new key: `ENROLLED` with a new station token. Note whether the old station token still connects | |
 
 If the agent holds a station token for a machine that no longer exists (for example
@@ -387,7 +387,7 @@ Log in with several identities first (`l`): `hq-admin`, `manager.manar`,
 | 8.3 | As `manager.manar`: `63` for the other branch's id | 403 | |
 | 8.4 | As `manager.manar`: `64` for its own branch | 2xx | |
 | 8.5 | Observer as hq, then as `manager.manar` (`s`, `o`, `o`) | hq: events of every branch. manager: its branch only | |
-| 8.6 | Observer as `gamer.wood` | Should be refused. **Known to fail today**: a gamer has no branch and joins `branch:all` (§15) | |
+| 8.6 | Observer as `gamer.wood` | Connects, but joins only its own `user:<id>` room: no station, alert or command events | |
 | 8.7 | `r` with no token: `GET /api/v1/stations` | 401 | |
 | 8.8 | `r` with the stand-in token: `GET /stations/me/games` | 200. With the active user token: 401 | |
 
@@ -466,10 +466,14 @@ At most one ACTIVE membership per gamer.
 How it fits together:
 
 ```text
-gamer:  POST /reservations/walk-in {machineId, durationMinutes}  -> reservation (starts now)
-staff:  POST /sessions {reservationId}                            -> session PENDING, rate fixed, PIN (shown once)
+gamer:  POST /reservations/walk-in {machineId, durationMinutes}  -> reservation (starts now) + checkIn.pin,
+        session PENDING, rate fixed. The wallet must cover the whole time (else INSUFFICIENT_FUNDS)
+gamer:  POST /reservations {machineId, startTime, endTime}        -> same, but the PIN works only from startTime;
+        nobody logs in within 30 minutes -> NO_SHOW, the PC is free again
+gamer:  GET /reservations                                          -> each booking shows its unused PIN
+staff:  POST /sessions {reservationId}                            -> fallback: a new PIN once the old one is dead
 PC:     gamer types the PIN on the lock screen -> agent login_request
-        backend checks the PIN -> login_result accepted -> session UNLOCK
+        backend checks the PIN and the balance (5 minutes of play) -> login_result accepted -> session UNLOCK
         heartbeat locked=false with sessionId -> session ACTIVE, metering starts,
         run-out timer scheduled from the wallet balance and the rate
 backend: warn job   -> [session_runout_warning] (SESSION_RUNOUT_WARNING_LEAD_S before lock, default 300 s)
@@ -483,25 +487,27 @@ wallet balance, observer on as staff. Identities: `hq-admin` and `gamer.wood`.
 
 | # | Action | Expected | On PC | P/F |
 |---|---|---|---|---|
-| 13.1 | As the gamer: `61` walk-in on the station, `60` minutes | 201, reservation remembered | - | |
-| 13.2 | `59` | The reservation | - | |
-| 13.3 | `s` to staff: `38` create session | 201, `PENDING`, `rateCentsPerMinute`, **PIN** printed | Still locked | |
-| 13.4 | `38` again | 409 `SESSION_ALREADY_STARTED` | - | |
-| 13.5 | `38` with a random uuid | 404 `RESERVATION_NOT_FOUND` | - | |
-| 13.6 | Agent stopped: `38` on a new reservation | 409 `STATION_OFFLINE` | - | |
+| 13.1 | As the gamer: `61` walk-in on the station, `60` minutes | 201, reservation remembered, **`checkIn.pin`** printed | Still locked | |
+| 13.2 | `59` | The reservation, with `pin { pin, validFrom, validUntil }` | - | |
+| 13.3 | `s` to staff: `38` create session on it | 409 `SESSION_ALREADY_STARTED`: the walk-in already holds its PIN | - | |
+| 13.4 | `38` with a random uuid | 404 `RESERVATION_NOT_FOUND` | - | |
+| 13.5 | Agent stopped: `61` walk-in | 409 `MACHINE_UNAVAILABLE` (Play now needs the PC on) | - | |
+| 13.6 | `32` UNLOCK on the station before any login | 409 `NO_SESSION_TO_UNLOCK` | Stays locked | |
 | 13.7 | Type a wrong PIN on the PC | Backend log `login_request ... rejected (invalid_pin)`. Session stays `PENDING` | Refused | |
 | 13.8 | Type the right PIN | `[station_status] locked=false sessionId=<id>`. `39`: `ACTIVE` | Desktop unlocked | |
 | 13.9 | Lock (`32`), then type the same PIN again (single use) | Refused (`no_pending_session` or `pin_used` in the log) | Stays locked | |
-| 13.10 | Balance low (for example `46` debit down to about 5 minutes of play) before 13.3, then play | `[session_runout_warning] {sessionId, machineId}` about `SESSION_RUNOUT_WARNING_LEAD_S` before the lock | - | |
+| 13.10 | After 13.8: `46` debit down to about 5 minutes of play (the money the session already used can't be debited) | `[session_runout_warning] {sessionId, machineId}` about `SESSION_RUNOUT_WARNING_LEAD_S` before the lock | - | |
 | 13.11 | After the warning: `45` credit | Timers rescheduled: the lock comes later than planned. A new warning follows later | - | |
 | 13.12 | Let the balance run out | System `[command_update] LOCK ACKED`, `locked=true`, `39`: `PAUSED`, `lockedAt` set | Lock screen | |
 | 13.13 | `32` LOCK during an ACTIVE session, wait 1 minute, `39` | `PAUSED`, `meteredSeconds` unchanged while locked | Lock screen | |
-| 13.14 | `32` UNLOCK, wait 1 minute | `ACTIVE` again | Desktop unlocked | |
+| 13.14 | `32` UNLOCK, wait 1 minute | Resumes the station's own session: `ACTIVE` again. After a run-out lock (13.12) it is 409 `INSUFFICIENT_FUNDS` until a top-up | Desktop unlocked | |
 | 13.15 | `40` end session `staff_end` | `[command_update] END_SESSION ACKED`, `39`: `COMPLETED`, `settledAt`, `billingBreakdown` | Lock screen | |
 | 13.16 | `44` ledger | `PAYMENT -totalCents` with the session id | - | |
 | 13.17 | `40` again | 409 `SESSION_NOT_OPEN` | - | |
 | 13.18 | As the gamer: `60` book ahead: type `startTime` about 5 minutes from now and `endTime` 1 hour later (ISO with offset, the console prints the current UTC time), then `62` cancel it | 201, then 2xx. `59` shows the new status | - | |
 | 13.19 | `60` with a start time in the past | 400 `INVALID_RESERVATION_TIME` | - | |
+| 13.19b | `60` book ahead starting in about 2 minutes; type its PIN (from the answer or `59`) at once, then again after the start | First `no_pending_session` in the log, then unlocked | Locked, then desktop | |
+| 13.19c | Book ahead starting now, never type the PIN, wait 30 minutes (or set `NO_SHOW_GRACE_MINUTES=1`) | `59`: `NO_SHOW`; `61` walk-in on the same PC works | - | |
 
 Check the numbers: `totalCents = round(meteredSeconds / 60 * rateCentsPerMinute)`.
 
@@ -511,9 +517,9 @@ Billing variants (each needs a new reservation and session):
 |---|---|---|---|
 | 13.20 | Gamer with an ACTIVE 50% membership | Rate halved, `appliedMembershipId` set | |
 | 13.21 | Plan changed to 25% after purchase | Still 50% (snapshot) | |
-| 13.22 | Wallet `0`, play 1 minute, end | `COMPLETED`, `debitFailed: true`, no PAYMENT | |
+| 13.22 | Wallet `0`: `61` walk-in | 409 `INSUFFICIENT_FUNDS`: nothing is booked | |
 | 13.23 | End the session from the PC side | Settlement with reason `agent_reported` | |
-| 13.24 | Start, never type the PIN, `40` end | `COMPLETED`, `meteredSeconds 0`, no ledger entry | |
+| 13.24 | Walk-in, never type the PIN, `62` cancel | `CANCELLED`, the PIN stops working, no ledger entry. (`40` end gets 409 `NO_ACTIVE_SESSION`: the station runs no session) | |
 
 ---
 
@@ -528,7 +534,7 @@ Billing variants (each needs a new reservation and session):
 7. `45`: credit `10000` to the gamer.
 8. `24`, `28`: create `notepad` and attach it to the real station. `[catalog_status]` `notepad installed=true`.
 9. `32` LOCK: PC locked.
-10. `s` (gamer): `61` walk-in 60 minutes. `s` (admin): `38` create session, note the PIN.
+10. `s` (gamer): `61` walk-in 60 minutes: note `checkIn.pin` (6 DT, so the 10 DT credit covers it).
 11. Type the PIN on the PC: desktop unlocks. `39`: `ACTIVE`.
 12. `32` LAUNCH_GAME `notepad`: Notepad opens.
 13. Wait 2 minutes. `40` end session. `39`: `COMPLETED`, `totalCents` about 200.
@@ -541,13 +547,9 @@ Billing variants (each needs a new reservation and session):
 
 - SHUTDOWN is a stub on the agent: the PC stays on.
 - `runningGameId` only updates on reconnect (`state_report`).
-- Revoking a station does not close its open socket; the next reconnect is refused.
-- No REST route undoes a revoke: the machine must enroll again.
+- No REST route undoes a revoke: the machine enrolls again with a fresh token for its
+  branch (it goes back to PENDING for approval).
 - In dev on Docker Desktop, `ip` shows the Docker gateway, not the PC.
-- Starting or ending a session does not change the reservation's status.
-- Subscription benefit windows are not applied to the session rate; only the
-  membership discount is.
 - The stand-in agent enrolls but does not connect to `/agent-ws`: it stays OFFLINE.
-- **Security gap, to fix (8.6):** `/dashboard-io` accepts any user token and puts a
-  user without `branchId` in `branch:all`. A GAMER has no branch, so it receives
-  every branch's events. The gateway should refuse scopes below staff.
+- A gamer's dashboard socket gets only its own events (`session_runout_warning`,
+  `session_notice`); see `FLOW_FIXES.md` A1.

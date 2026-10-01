@@ -4,6 +4,7 @@ This document highlights the architecture used, each piece's role, and outliens 
 ## Table of content
 * [Tech Stack & Structure](#tech-stack-and-structure)
 * [Usage & Diagnostics](#usage-and-diagnostics)
+* [Feature notes](#feature-notes)
 
 ## Tech Stack and Structure
 * Node 24
@@ -242,3 +243,18 @@ wget -qO- http://backend:3000/health
 nc -z postgres 5432 && echo "pg reachable"
 getent hosts postgres redis backend
 ```
+
+## Feature notes
+Read the note of a module before changing it. Each one gives the problem, what changed and where.
+
+|note|covers|
+|:---|:---|
+|[docs/STATION_AGENT.md](docs/STATION_AGENT.md)|Station tokens, the `/agent-ws` protocol, presence, remote commands, game catalog, telemetry, the `/dashboard-io` feed|
+|[docs/ENROLLMENT_HANDOFF.md](docs/ENROLLMENT_HANDOFF.md)|Enrolling a PC: tokens, approval, revoke, rotation|
+|[docs/GAME_CATALOG_FIXES.md](docs/GAME_CATALOG_FIXES.md)|Game catalog fixes (installed games, exclusions)|
+|[docs/BOOKING_AND_BILLING_FIXES.md](docs/BOOKING_AND_BILLING_FIXES.md)|Bookings, check-in, billing, wallet and plans (2026-09-30)|
+|[docs/FLOW_FIXES.md](docs/FLOW_FIXES.md)|The full flow review (2026-10-01): security, billing, stations, branches, desk tools. **Lists the migrations and settings to apply**|
+|[docs/STATION_PHYSICAL_TEST.md](docs/STATION_PHYSICAL_TEST.md)|Testing with a real PC|
+
+> [!IMPORTANT]
+> After pulling the flow fixes, apply the migrations (`npm run db:deploy`) and regenerate the client (`npm run db:generate`). See `docs/FLOW_FIXES.md` §0.

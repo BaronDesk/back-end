@@ -5,6 +5,11 @@ check-in, billing, wallet and plan flows. Each section gives the problem, what
 changed and where. Read it before touching `reservations`, `session-billing`,
 `wallet`, `membership` or `subscriptions`.
 
+> **Later changes:** `FLOW_FIXES.md` (2026-10-01) changes several rules here. The PIN now
+> comes with the booking and works from its start; the balance is checked at booking and at
+> login; a no-show comes 30 minutes after the start; and gamers have a home branch. Where the
+> two notes differ, `FLOW_FIXES.md` wins.
+
 ---
 
 ## 0. Before you run it

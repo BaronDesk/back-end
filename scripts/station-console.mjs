@@ -283,7 +283,9 @@ async function logout() {
 async function registerGamer() {
   const username = await ask('username', `gamer-${Date.now().toString(36)}`);
   const password = await ask('password', 'gamer-pass-123');
-  const res = await http('POST', '/users', { body: { username, password }, token: null });
+  // The gamer's home branch: the booking page lists its stations (GET /branches lists them).
+  const branchId = await askBranch();
+  const res = await http('POST', '/users', { body: { username, password, branchId }, token: null });
   if (res.ok) {
     remember({ userId: res.data.id });
     if (await confirm(`log in as ${username} now?`)) await login(username, password);

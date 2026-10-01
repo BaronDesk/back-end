@@ -227,6 +227,9 @@ only sees and approves stations of their own branch.
 
 ## 5. Things the current code leaves to enrollment
 
+> **Status 2026-10-01:** items 1, 2 and 4 are done (`FLOW_FIXES.md` §3, C1–C4). Item 3 is still
+> open.
+
 1. **Close the live socket on revoke.** Setting `enrollmentStatus` to DEACTIVATED today
    only blocks the **next** connect. Suggested hook, following the existing
    `statusChanges` pattern (ops subscribes to station, never the reverse):
@@ -234,10 +237,15 @@ only sees and approves stations of their own branch.
      `stationRevoked`).
    - `AgentGateway` subscribes and calls `registry.get(serial)?.close(1008, 'station not enrolled')`.
    - Presence then marks it OFFLINE through the normal close path.
+   - **Done (C1):** reject and revoke close the socket with 1008; revoke also settles the
+     station's open session and cancels its bookings ahead.
 2. **Token rotation.** Nothing renews a station token before `exp`. The agent re-reads
    its credential on every connect, so a future renewal endpoint (for example
    `POST /stations/me/token`, station-authenticated, returns a fresh JWT) needs no agent
    restart. Needs agreement with the agent side. Until then, choose a TTL long enough.
+   - **Done (C2, C3):** tokens carry `ver` (= `Machine.credentialVersion`); redeeming a
+     rotation token bumps it, so the old token dies. On handshake, a token within 30 days
+     of `exp` is renewed with `station_credential { stationToken }`, which the agent saves.
 3. **Branch move or serial change.** Either one invalidates the station's token
    (admission rejects it as a mismatch). A "move station" feature must mint and deliver
    a new token, or the station must re-enroll.
@@ -245,6 +253,8 @@ only sees and approves stations of their own branch.
    pair. Decide what happens when `serialNumber` already exists: recommended is to refuse
    unless an admin has DEACTIVATED (or deleted) the old row first, then reuse the row and
    replace `agent_public_key`.
+   - **Done (C4):** a fresh enrollment token for the same branch resets a DEACTIVATED
+     machine to PENDING with the new key and name; an admin approves it again.
 
 ---
 

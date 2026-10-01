@@ -9,7 +9,11 @@ agent running on each gaming PC ("station"):
 - remote commands (LOCK, UNLOCK, SHUTDOWN, LAUNCH_GAME, END_SESSION, CATALOG_UPDATE)
 - the per-station game catalog
 - telemetry and hardware alerts
-- the `/dashboard-io` live feed for staff dashboards
+- the `/dashboard-io` live feed for staff dashboards (and the gamer's own events)
+
+Updated on 2026-10-01 for the flow fixes (token version and renewal, PIN at booking,
+`session_notice`, `station_credential`, peripherals, staff UNLOCK). The full list is in
+`FLOW_FIXES.md`.
 
 Enrollment itself (how a station gets its MACHINE row and its station JWT) is
 not built yet. See [ENROLLMENT_HANDOFF.md](ENROLLMENT_HANDOFF.md) for the
@@ -57,6 +61,7 @@ on both the WebSocket upgrade and station-facing REST calls.
 | `serialNumber` | string | `Machine.serialNumber` |
 | `branchId` | uuid | `Machine.branchId` |
 | `exp` | number | Required. A token without expiry is rejected |
+| `ver` | number | Credential version; must equal `Machine.credentialVersion`. Missing = 1 |
 
 - Signed **HS256** with `JWT_ACCESS_SECRET`, the same key as user access tokens.
 - `StationTokenService.verify` checks signature and expiry through identity's
@@ -66,6 +71,11 @@ on both the WebSocket upgrade and station-facing REST calls.
   token has no `type: "station"` and is rejected as a station token.
 - The identity always comes from the token. The handshake `serialNumber` is only
   compared against it, never trusted on its own.
+- **Rotation:** redeeming a rotation token (`POST /machines/:id/rotate-token`) bumps
+  `credentialVersion`, so the old token stops working.
+- **Renewal:** on handshake, a token that expires within 30 days is replaced: the
+  backend sends `station_credential { stationToken }` (same version). The agent saves
+  it and uses it from the next reconnect.
 
 ### 2.2 The admission rule
 
@@ -76,6 +86,8 @@ the MACHINE row fresh and requires all of the following:
 1. The row with `id = sub` exists. Else `UnknownStationError`.
 2. `enrollmentStatus = ENROLLED`. Else `StationNotEnrolledError`.
 3. The row's `serialNumber` and `branchId` still equal the token's. Else
+   `StationIdentityMismatchError`.
+4. The token's `ver` equals the row's `credentialVersion`. Else
    `StationIdentityMismatchError`.
 
 There is **no fallback**: no serial-only identification, no `x-station-serial`
@@ -97,8 +109,10 @@ Consequences worth knowing:
 
 - Moving a machine to another branch, or changing its serial, invalidates its
   current token. The station needs a new one.
-- Setting `enrollmentStatus` to anything other than ENROLLED blocks the station on
-  its **next** connect or REST call. An already-open socket is not closed (see §9).
+- Rejecting or revoking a station closes its open socket at once (1008). Revoke also
+  settles any open session on it and cancels its bookings ahead.
+- A rejected or revoked PC can enroll again with a fresh enrollment token for the same
+  branch: it goes back to PENDING (new key and name) and waits for approval.
 
 ### 2.3 Station-facing REST
 
@@ -149,7 +163,7 @@ Every frame, in both directions, is a JSON envelope:
 |---|---|---|
 | `handshake` | `{ serialNumber, agentVersion?, osVersion?, machineName? }` | Admission, ONLINE, `handshake_ack` |
 | `heartbeat` | `{ locked, sessionId? }` | Bumps `lastSeen`, updates lock/session. Always answered with `heartbeat_ack` carrying a renewed lease (§3.6) |
-| `state_report` | `{ locked?, sessionId?, runningGameId?, leaseExpiresAt? }` | Updates lock / session / running game. Sent on (re)connect. A reported session is reconciled (§3.6) |
+| `state_report` | `{ locked?, sessionId?, runningGameId?, leaseExpiresAt?, peripherals? }` | Updates lock / session / running game. Sent on (re)connect. A reported session is reconciled; with no `sessionId`, a session still open on the PC is settled (§3.6) |
 | `login_request` | `{ method: "pin", credential }` | The lock screen relays the PIN; the agent validates nothing. Answered with `login_result`. A malformed frame is logged and dropped |
 | `telemetry` | `{ samples: [{ metric, value, sampledAt? }] }` | Ingested, cached, pushed to dashboards. No ack |
 | `alert` | `{ category, type, severity, detail, occurredAt }` | Stored as a `TelemetryAlert`, repeats folded into the open alert. No ack |
@@ -157,6 +171,8 @@ Every frame, in both directions, is a JSON envelope:
 | `command_ack` | `{ commandId }` | Command → `ACKED` |
 | `command_nack` | `{ commandId, code, reason? }` | Command → `FAILED` or `NACKED` (§5.3) |
 | `catalog_status` | `{ games: [{ gameId, installed, reason? }] }` | Stored per station, pushed to dashboards |
+| `installed_games` | `{ games: [{ launchType: steam \| epic, target, name, processName? }] }` | Stored per station (`station_installed_games`) for the staff's "installed here" list. Bad entries are skipped one by one |
+| `peripheral_status` | `{ peripherals: [{ deviceId, name?, vendorProductId?, connected, changedAt? }] }` | The full list, on every change. Stored on the machine, pushed to the branch as `peripheral_status`. `state_report.peripherals` is handled the same way |
 
 ### 3.4 Server to agent
 
@@ -164,7 +180,9 @@ Every frame, in both directions, is a JSON envelope:
 |---|---|
 | `handshake_ack` | `{}` |
 | `heartbeat_ack` | `{ leaseSeconds, serverTime }`: never null (§3.6) |
-| `login_result` | `{ requestId, accepted, reason? }`: `requestId` is the `login_request` envelope id. `reason`: `invalid_pin`, `pin_expired`, `pin_used`, `too_many_attempts`, `no_pending_session`, `unsupported_method`, `unavailable` |
+| `login_result` | `{ requestId, accepted, reason? }`: `requestId` is the `login_request` envelope id. `reason`: `invalid_pin`, `pin_expired`, `pin_used`, `too_many_attempts`, `no_pending_session` (no booking has started on this PC), `insufficient_funds` (below the minimum play time), `unsupported_method`, `unavailable` |
+| `session_notice` | `{ sessionId, kind: LOW_BALANCE \| TIME_LEFT \| CLEAR, endsAt, message: null }`: the corner box. LOW_BALANCE when the runout warning fires, TIME_LEFT `SESSION_ENDING_NOTICE_MINUTES` before the end, CLEAR after a top-up or an extend. `endsAt` is when the station locks |
+| `station_credential` | `{ stationToken }`: a renewed station token (§2.1) |
 | `LOCK`, `UNLOCK`, `SHUTDOWN`, `LAUNCH_GAME`, `END_SESSION`, `CATALOG_UPDATE` | Command payload (§5) |
 
 ### 3.5 Close codes
@@ -180,13 +198,17 @@ Every frame, in both directions, is a JSON envelope:
 
 ### 3.6 Login, lease and reconnect
 
-1. `POST /sessions` creates a `PENDING` session for a `CONFIRMED` reservation on an ONLINE
-   station and returns a 6-digit PIN once. Only its argon2 hash is stored. The PIN expires
-   after `SESSION_PIN_TTL_S` (never past the reservation end), is single-use, and is burned
-   after `SESSION_PIN_MAX_ATTEMPTS` wrong entries. Nothing is sent to the station.
+1. Every booking and walk-in gets a `PENDING` session with a 6-digit PIN when it is made; the
+   gamer's app shows it. The argon2 hash does the login check; a sealed copy (`pin_cipher`)
+   lets the app show it again. The PIN works on that PC only, from the booking's start until
+   the no-show deadline (`NO_SHOW_GRACE_MINUTES` after the start, never past the end). It is
+   single-use and burned after `SESSION_PIN_MAX_ATTEMPTS` wrong entries. Nothing is sent to
+   the station. (`POST /sessions` stays as the desk's way to issue one.)
 2. The gamer types the PIN; the agent sends `login_request`. The backend checks it against the
-   station's PENDING session and answers `login_result`. Only after an accepted result does it
-   send `UNLOCK { sessionId, leaseSeconds, serverTime }` through the command pipeline.
+   PENDING session of the booking that has started on this PC, checks the balance covers
+   `SESSION_MIN_PLAY_MINUTES`, and answers `login_result`. An accepted login closes any other
+   session still open on the PC. Only then does it send
+   `UNLOCK { sessionId, leaseSeconds, serverTime }` through the command pipeline.
 3. The agent re-locks when its lease lapses. Every `heartbeat_ack` renews it:
    `leaseSeconds` = the shorter of the remaining reservation window and `SESSION_LEASE_CAP_S`
    for a logged-in, open session of this station; `0` otherwise. If a renewal cannot be
@@ -195,9 +217,12 @@ Every frame, in both directions, is a JSON envelope:
    `locked=false`, never from the UNLOCK ack.
 5. `state_report` with a `sessionId`: an open in-window session gets a fresh UNLOCK + lease; a
    session past its window is settled and ended (`END_SESSION`); any other is ended.
-6. A sweep (`SESSION_SWEEP_INTERVAL_MS`) cancels PENDING sessions past their window (reservation
-   to `NO_SHOW`) and settles open sessions past their window. Settlement moves the reservation
-   to `COMPLETED`.
+6. A sweep (`SESSION_SWEEP_INTERVAL_MS`) marks a booking `NO_SHOW` once its PIN reaches the
+   no-show deadline unused (its session is cancelled and the PC is free again), and settles
+   open sessions past their window. It sends `END_SESSION` only if the station still runs that
+   very session. Settlement moves the reservation to `COMPLETED`.
+7. A station going OFFLINE pauses its ACTIVE session at its last heartbeat (`lockReason
+   'offline'`); it resumes when the station reports itself unlocked again.
 
 ---
 
@@ -252,8 +277,8 @@ Body:
 | type | Payload on the wire | Notes |
 |---|---|---|
 | `LOCK` | `{}` | |
-| `UNLOCK` | `{}` over REST; `{ sessionId, leaseSeconds, serverTime }` from the backend | REST takes only the empty admin form. The session form is backend-issued after an accepted `login_result` or on reconnect (§3.6). It never carries a PIN |
-| `SHUTDOWN` | `{}` | The agent's power-off is currently a stub that only logs |
+| `UNLOCK` | `{}` over REST; `{ sessionId, leaseSeconds, serverTime }` on the wire | A staff UNLOCK resumes the station's own open session: the backend fills in its session and lease. It never carries a PIN |
+| `SHUTDOWN` | `{}` | A session on the station is settled up to now first. The agent's power-off is currently a stub that only logs |
 | `LAUNCH_GAME` | `{ gameId }` | The catalog's wire `gameId`. The agent launches from its synced catalog; no path goes on the wire |
 | `END_SESSION` | `{ reason? }` | The agent stops the tracked game, ends the session and locks. No separate stop command |
 | `CATALOG_UPDATE` | `{}` | The agent re-pulls `GET /stations/me/games`. Also sent automatically (§6) |
@@ -269,6 +294,8 @@ A rejected request creates no COMMAND row.
 | 409 `STATION_NOT_IN_SESSION` | LAUNCH_GAME while locked or without a session |
 | 404 `GAME_NOT_FOUND`; 409 `GAME_DISABLED`, `GAME_NOT_ASSIGNED`, `GAME_STATUS_UNKNOWN` (no `catalog_status` yet), `GAME_NOT_INSTALLED` | LAUNCH_GAME catalog checks |
 | 409 `NO_ACTIVE_SESSION` | END_SESSION without a session |
+| 409 `NO_SESSION_TO_UNLOCK` | UNLOCK on a station with no open session of its own |
+| 409 `INSUFFICIENT_FUNDS` | UNLOCK of a session locked because the money ran out, while the wallet still can't cover the minimum play time |
 | 400 `SIMULATION_DISABLED` | `simulate` used in production |
 
 ### 5.3 Lifecycle
@@ -334,7 +361,7 @@ Staff REST (`api/v1`): `GET games` (self+), `POST games`, `PATCH games/:id`,
   `TELEMETRY_HISTORY_INTERVAL_MS` (kept `TELEMETRY_HISTORY_RETENTION_HOURS`).
 - Crossing `CPU_TEMP_THRESHOLD_C` (85) or `GPU_TEMP_THRESHOLD_C` (90) raises a
   hardware alert. The agent also raises its own alerts (`alert` frame).
-- REST: `GET /api/v1/stations/:id/telemetry`, `GET /api/v1/alerts`,
+- REST: `GET /api/v1/stations/:id/telemetry`, `GET /api/v1/stations/:id/telemetry/history`, `GET /api/v1/alerts`,
   `POST /api/v1/alerts/:id/resolve` (staff+).
 - Dashboard events: `telemetry_update`, `alert`, `alert_resolved`.
 
@@ -343,14 +370,21 @@ Staff REST (`api/v1`): `GET games` (self+), `POST games`, `PATCH games/:id`,
 ## 8. Dashboard feed (`/dashboard-io`)
 
 socket.io on path `/dashboard-io`. Authenticate with a **user** access token in
-`auth.token` (or the `token` query). A user with a branch joins `branch:<branchId>`;
-an HQ user (no branch) joins `branch:all` and sees every branch.
+`auth.token` (or the `token` query).
 
-Events: `station_status`, `catalog_status`, `telemetry_update`, `alert`,
-`alert_resolved`, `command_update`.
+- Staff with a branch join `branch:<branchId>`; HQ (no branch) joins `branch:all` and
+  sees every branch. Staff with no branch join nothing.
+- A gamer joins only `user:<userId>` (`publishToUser`).
+
+Branch events: `station_status`, `catalog_status`, `telemetry_update`, `alert`,
+`alert_resolved`, `command_update`, `peripheral_status`.
+Gamer events: `session_runout_warning`, `session_notice`.
 
 Staff REST for stations: `GET /api/v1/stations` (the Postgres rows merged with the
-Redis presence cache, scoped to the caller's branch) and `GET /api/v1/stations/:id`.
+Redis presence cache, scoped to the caller's branch), `GET /api/v1/stations/:id` (with
+`peripherals` and `peripheralsReportedAt`), `PATCH /api/v1/stations/:id { name }`
+(manager and up: a rename sticks, the agent's own name only fills an empty one) and
+`GET /api/v1/stations/:id/telemetry/history?hours=` (1 to 48).
 
 ---
 
@@ -358,8 +392,7 @@ Redis presence cache, scoped to the caller's branch) and `GET /api/v1/stations/:
 
 | Limitation | Impact |
 |---|---|
-| Deactivating a station does not close its live socket | It stays connected until it reconnects. Enrollment should close it (see the handoff doc) |
-| No token revocation list | `enrollmentStatus` is the only revocation. Use it |
+| No token revocation list | `enrollmentStatus` and `credentialVersion` are the revocation. Use them |
 | `AgentRegistry` is in memory | One backend instance only. A second instance splits agents across two registries |
 | Docker Desktop NATs inbound traffic | In dev, the IP column shows Docker's gateway (`172.x`, `192.168.65.x`), not the PC |
 | Agent SHUTDOWN is a stub | The command acks but the PC stays on |
@@ -382,10 +415,17 @@ Redis presence cache, scoped to the caller's branch) and `GET /api/v1/stations/:
 | `CPU_TEMP_THRESHOLD_C` / `GPU_TEMP_THRESHOLD_C` | 85 / 90 | Hardware alert thresholds |
 | `TELEMETRY_CACHE_TTL_S` | 30 | Redis TTL of live telemetry |
 | `TELEMETRY_HISTORY_INTERVAL_MS` / `TELEMETRY_HISTORY_RETENTION_HOURS` | 60000 / 48 | Telemetry history |
+| `NO_SHOW_GRACE_MINUTES` | 30 | The PIN's deadline after the booking's start; then NO_SHOW |
+| `SESSION_MIN_PLAY_MINUTES` | 5 | A login needs the balance for this much play |
+| `SESSION_PIN_MAX_ATTEMPTS` | 5 | Wrong PINs before it is burned |
+| `SESSION_LEASE_CAP_S` | 180 | Longest lease per heartbeat_ack |
+| `SESSION_ENDING_NOTICE_MINUTES` | 10 | TIME_LEFT notice before the end |
 
 Migrations for this part: `20260924120000_machine_presence`,
 `20260926120000_telemetry_alerts`, `20260926180000_station_commands`,
-`20260926200000_games_catalog`, `20260927120000_station_game_catalog`.
+`20260926200000_games_catalog`, `20260927120000_station_game_catalog`, and from the flow
+fixes `20260930220000_station_credentials_and_peripherals` and
+`20261001090000_session_pin_cipher` (all of them: `FLOW_FIXES.md` §0).
 
 ---
 
