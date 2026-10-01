@@ -176,18 +176,14 @@ describe('station commands (e2e)', () => {
   });
 
   it('records INVALID_PAYLOAD as FAILED with the reason, without retrying', async () => {
-    // Like the current agent: UNLOCK without a sessionId is rejected.
-    const agent = await connectAgent((frame) =>
-      (frame.payload as { sessionId?: string } | undefined)?.sessionId
-        ? 'ack'
-        : { code: 'INVALID_PAYLOAD', reason: 'sessionId is required.' },
-    );
-    const { commandId } = (await issue(agent.machine.id, { type: 'UNLOCK' })).json();
+    // A staff UNLOCK never leaves without a session (NO_SESSION_TO_UNLOCK), so the agent refuses a LOCK here.
+    const agent = await connectAgent(() => ({ code: 'INVALID_PAYLOAD', reason: 'payload is malformed.' }));
+    const { commandId } = (await issue(agent.machine.id, { type: 'LOCK' })).json();
     await vi.waitFor(async () =>
       expect(await status(commandId)).toMatchObject({
         status: 'FAILED',
         nackCode: 'INVALID_PAYLOAD',
-        nackReason: 'sessionId is required.',
+        nackReason: 'payload is malformed.',
       }),
     );
     // Past the ack timeout + backoff: a retry would have shown up by now.
@@ -226,9 +222,20 @@ describe('station commands (e2e)', () => {
     agent.socket.close();
   });
 
+  it('refuses a staff UNLOCK when nobody plays on the station: the gamer unlocks it with their PIN', async () => {
+    const agent = await connectAgent();
+    const res = await issue(agent.machine.id, { type: 'UNLOCK' });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().code).toBe('NO_SESSION_TO_UNLOCK');
+    await new Promise((r) => setTimeout(r, 200));
+    expect(agent.commands).toHaveLength(0);
+    expect(await prisma.command.count({ where: { machineId: agent.machine.id } })).toBe(0);
+    agent.socket.close();
+  });
+
   it('retries a timed-out command with the same commandId and a fresh seq', async () => {
     const agent = await connectAgent((_frame, n) => (n === 1 ? 'silent' : 'ack'));
-    const { commandId } = (await issue(agent.machine.id, { type: 'UNLOCK' })).json();
+    const { commandId } = (await issue(agent.machine.id, { type: 'LOCK' })).json();
     await vi.waitFor(async () => expect(await status(commandId)).toMatchObject({ status: 'ACKED', attempts: 2 }), {
       timeout: 5_000,
     });

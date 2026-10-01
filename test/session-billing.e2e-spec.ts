@@ -446,6 +446,43 @@ describe('session billing (e2e)', () => {
     walkInAgent.socket.close();
   });
 
+  it('refuses a booking or a walk-in the wallet cannot cover, counting the bookings already made', async () => {
+    // Branch prices: walk-in 6 DT/h (100 millimes/min), booking 9 DT/h (150 millimes/min). Wallet: 5 DT.
+    const gamer = await createGamer(5_000);
+    const machine = await createMachine();
+    const agent = await connectAgent(machine);
+    const inMinutes = (m: number) => new Date(Date.now() + m * 60_000).toISOString();
+    const book = (from: number, to: number) =>
+      app.inject({
+        method: 'POST',
+        url: '/reservations',
+        headers: as(gamer.token),
+        payload: { machineId: machine.id, startTime: inMinutes(from), endTime: inMinutes(to) },
+      });
+
+    const hour = await book(60, 120); // 9 DT > 5 DT
+    expect(hour.statusCode).toBe(409);
+    expect(hour.json().code).toBe('INSUFFICIENT_FUNDS');
+
+    const half = await book(60, 90); // 4.5 DT: fits
+    expect(half.statusCode).toBe(201);
+
+    const another = await book(180, 210); // 4.5 DT more, with only 0.5 DT left after the first booking
+    expect(another.statusCode).toBe(409);
+    expect(another.json().code).toBe('INSUFFICIENT_FUNDS');
+
+    const walkIn = await app.inject({
+      method: 'POST',
+      url: '/reservations/walk-in',
+      headers: as(gamer.token),
+      payload: { machineId: machine.id, durationMinutes: 15 }, // 1.5 DT > 0.5 DT left
+    });
+    expect(walkIn.statusCode).toBe(409);
+    expect(walkIn.json().code).toBe('INSUFFICIENT_FUNDS');
+    expect(await prisma.reservation.count({ where: { gamerProfileId: gamer.profileId } })).toBe(1);
+    agent.socket.close();
+  });
+
   it('refuses to start a session from a CANCELLED reservation', async () => {
     const gamer = await createGamer();
     const machine = await createMachine();
