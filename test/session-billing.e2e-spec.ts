@@ -11,7 +11,7 @@ import { PrismaService } from '../src/infra/prisma/prisma.service.js';
 import { REDIS } from '../src/infra/redis/redis.module.js';
 import { makeFrame } from '../src/infra/realtime/frame.js';
 import type { OutboundEnvelope } from '../src/infra/realtime/envelope.js';
-import { SYSTEM_ACTOR_ID } from '../src/modules/ops/services/commands.service.js';
+import { CommandsService, SYSTEM_ACTOR_ID } from '../src/modules/ops/services/commands.service.js';
 import { SessionsService } from '../src/modules/session-billing/services/sessions.service.js';
 import { mintStationToken } from './station-token.js';
 
@@ -193,7 +193,7 @@ describe('session billing (e2e)', () => {
     await app.close();
   });
 
-  it('starts a PENDING session at the payg rate, returns the PIN once, stores only its hash, and sends nothing', async () => {
+  it('starts a PENDING session at the payg rate: hashed and sealed PIN, never in clear, and nothing sent', async () => {
     const gamer = await createGamer();
     const machine = await createMachine();
     const reservation = await createConfirmedReservation(gamer.profileId, machine.id);
@@ -208,6 +208,11 @@ describe('session billing (e2e)', () => {
     const row = await prisma.session.findUniqueOrThrow({ where: { id: body.id } });
     expect(row.pinHash).toMatch(/^\$argon2id\$/);
     expect(row.pinHash).not.toContain(body.pin);
+    // A sealed copy lets the gamer's app show the PIN again; it is never the PIN in clear.
+    expect(row.pinCipher).toBeTruthy();
+    expect(row.pinCipher).not.toContain(body.pin);
+    // Valid until the no-show deadline: 30 minutes after the start, never past the end.
+    expect(row.pinExpiresAt!.getTime()).toBe(reservation.startTime.getTime() + 30 * 60_000);
     expect(row.pinExpiresAt!.getTime()).toBeLessThanOrEqual(reservation.endTime.getTime());
     expect((await get(body.id)).json()).not.toHaveProperty('pin');
 
@@ -343,15 +348,18 @@ describe('session billing (e2e)', () => {
     agent.socket.close();
   });
 
-  it('refuses a PIN when the balance does not cover the minimum play time', async () => {
+  it('refuses the login, not the PIN, when the balance no longer covers the minimum play time', async () => {
     const gamer = await createGamer(0);
     const machine = await createMachine();
     const reservation = await createConfirmedReservation(gamer.profileId, machine.id);
     const agent = await connectAgent(machine);
 
     const res = await start(reservation.id);
-    expect(res.statusCode).toBe(409);
-    expect(res.json().code).toBe('INSUFFICIENT_FUNDS');
+    expect(res.statusCode).toBe(201);
+    expect(await typePin(agent, res.json().pin)).toMatchObject({ accepted: false, reason: 'insufficient_funds' });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(agent.commands).toHaveLength(0);
+    expect((await get(res.json().id)).json().status).toBe('PENDING');
     agent.socket.close();
   });
 
@@ -400,30 +408,57 @@ describe('session billing (e2e)', () => {
     agent.socket.close();
   });
 
-  it('the gamer gets the PIN for their booking and their walk-in; the session, not the booking, makes it ACTIVE', async () => {
+  it('a booking comes with its PIN, shown on the booking, usable only from its start; New PIN replaces it', async () => {
     const gamer = await createGamer();
     await creditWallet(gamer.profileId, 100_000);
-
-    const bookedMachine = await createMachine();
-    const bookedAgent = await connectAgent(bookedMachine);
+    const machine = await createMachine();
+    const agent = await connectAgent(machine);
     const booking = await app.inject({
       method: 'POST',
       url: '/reservations',
       headers: as(gamer.token),
       payload: {
-        machineId: bookedMachine.id,
+        machineId: machine.id,
         startTime: new Date(Date.now() + 60_000).toISOString(),
         endTime: new Date(Date.now() + 61 * 60_000).toISOString(),
       },
     });
     expect(booking.statusCode).toBe(201);
-    expect(booking.json().status).toBe('CONFIRMED');
-    const checkIn = await app.inject({ method: 'POST', url: `/reservations/${booking.json().id}/check-in`, headers: as(gamer.token) });
-    expect(checkIn.statusCode).toBe(201);
-    await logIn(bookedAgent, checkIn.json().sessionId, checkIn.json().pin);
-    expect(await reservationStatus(booking.json().id)).toBe('ACTIVE');
-    bookedAgent.socket.close();
+    const { id: reservationId, status, checkIn } = booking.json();
+    expect(status).toBe('CONFIRMED');
+    expect(checkIn).toMatchObject({ reservationId, sessionId: expect.any(String), pin: expect.stringMatching(/^\d{6}$/) });
 
+    // The app shows it on the booking, valid from the start until the no-show deadline.
+    const mine = (await app.inject({ method: 'GET', url: '/reservations', headers: as(gamer.token) })).json();
+    expect(mine.find((r: { id: string }) => r.id === reservationId).pin).toEqual({
+      pin: checkIn.pin,
+      validFrom: booking.json().startTime,
+      validUntil: new Date(Date.parse(booking.json().startTime) + 30 * 60_000).toISOString(),
+    });
+
+    // Before the start the PC has no session waiting for a login.
+    expect(await typePin(agent, checkIn.pin)).toMatchObject({ accepted: false, reason: 'no_pending_session' });
+
+    // New PIN: replaces the unused one.
+    const renewed = await app.inject({ method: 'POST', url: `/reservations/${reservationId}/check-in`, headers: as(gamer.token) });
+    expect(renewed.statusCode).toBe(201);
+    expect(await prisma.session.count({ where: { reservationId, status: 'PENDING' } })).toBe(1);
+
+    // The booking's time comes (moved, not waited for): only the new PIN opens the PC.
+    const startedAt = new Date(Date.now() - 1_000);
+    await prisma.reservation.update({ where: { id: reservationId }, data: { startTime: startedAt } });
+    await prisma.session.update({ where: { id: renewed.json().sessionId }, data: { startTime: startedAt } });
+    if (renewed.json().pin !== checkIn.pin) {
+      expect(await typePin(agent, checkIn.pin)).toMatchObject({ accepted: false, reason: 'invalid_pin' });
+    }
+    await logIn(agent, renewed.json().sessionId, renewed.json().pin);
+    expect(await reservationStatus(reservationId)).toBe('ACTIVE');
+    agent.socket.close();
+  });
+
+  it('a walk-in comes with a PIN that works at once; the session, not the booking, makes it ACTIVE', async () => {
+    const gamer = await createGamer();
+    await creditWallet(gamer.profileId, 100_000);
     const walkInMachine = await createMachine();
     const walkInAgent = await connectAgent(walkInMachine);
     const walkIn = await app.inject({
@@ -506,15 +541,16 @@ describe('session billing (e2e)', () => {
     agent.socket.close();
   });
 
-  it('409s starting a session on a station that is not online', async () => {
+  it('issues the PIN while the station is offline: it is typed when the gamer gets there', async () => {
     const gamer = await createGamer();
     const machine = await createMachine(); // no agent connected
     const reservation = await createConfirmedReservation(gamer.profileId, machine.id);
 
     const res = await start(reservation.id);
-    expect(res.statusCode).toBe(409);
-    expect(res.json().code).toBe('STATION_OFFLINE');
-    expect(await prisma.session.count({ where: { reservationId: reservation.id } })).toBe(0);
+    expect(res.statusCode).toBe(201);
+    expect(res.json().status).toBe('PENDING');
+    expect(await prisma.session.count({ where: { reservationId: reservation.id } })).toBe(1);
+    expect(await prisma.command.count({ where: { machineId: machine.id } })).toBe(0);
   });
 
   it('state_report on reconnect re-grants an open in-window session, and ends one that closed meanwhile', async () => {
@@ -557,6 +593,105 @@ describe('session billing (e2e)', () => {
 
     expect(await reservationStatus(reservation.id)).toBe('NO_SHOW');
     expect(await prisma.session.findUniqueOrThrow({ where: { id: session.id } })).toMatchObject({ status: 'CANCELLED', pinHash: null });
+  });
+
+  it('marks a booking NO_SHOW 30 minutes after its start without a login, and frees the PC', async () => {
+    const gamer = await createGamer();
+    const machine = await createMachine();
+    const agent = await connectAgent(machine);
+    const now = Date.now();
+
+    // Started 31 minutes ago, ends in 29: nobody typed the PIN by the deadline.
+    const late = await createConfirmedReservation(gamer.profileId, machine.id, {
+      startTime: new Date(now - 31 * 60_000),
+      endTime: new Date(now + 29 * 60_000),
+      isWalkIn: false,
+    });
+    const lateSession = await prisma.session.create({
+      data: {
+        reservationId: late.id,
+        startTime: late.startTime,
+        endTime: late.endTime,
+        rateCentsPerMinute: 150,
+        pinHash: 'x',
+        pinExpiresAt: new Date(late.startTime.getTime() + 30 * 60_000),
+      },
+    });
+    // Started 10 minutes ago on another PC: still inside its 30 minutes.
+    const otherMachine = await createMachine();
+    const onTime = await createConfirmedReservation(gamer.profileId, otherMachine.id, { startTime: new Date(now - 10 * 60_000) });
+    const { id: onTimeSessionId } = (await start(onTime.id)).json();
+
+    await app.get(SessionsService).sweep();
+
+    expect(await reservationStatus(late.id)).toBe('NO_SHOW');
+    expect(await prisma.session.findUniqueOrThrow({ where: { id: lateSession.id } })).toMatchObject({ status: 'CANCELLED', pinHash: null });
+    expect(await reservationStatus(onTime.id)).toBe('CONFIRMED');
+    expect((await get(onTimeSessionId)).json().status).toBe('PENDING');
+
+    // The rest of the missed slot is free: someone else plays now.
+    const other = await createGamer();
+    const walkIn = await app.inject({
+      method: 'POST',
+      url: '/reservations/walk-in',
+      headers: as(other.token),
+      payload: { machineId: machine.id, durationMinutes: 15 },
+    });
+    expect(walkIn.statusCode).toBe(201);
+    agent.socket.close();
+  });
+
+  it('a system END_SESSION reaches the station only for the session it runs', async () => {
+    const gamer = await createGamer();
+    const machine = await createMachine();
+    const reservation = await createConfirmedReservation(gamer.profileId, machine.id);
+    const agent = await connectAgent(machine);
+    const sessionId = await startAndLogIn(agent, reservation.id);
+    const commands = app.get(CommandsService);
+
+    expect(await commands.issueSystemEndSession(machine.id, 'test', randomUUID())).toBe(false);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(agent.commands.some((c) => c.type === 'END_SESSION')).toBe(false);
+
+    expect(await commands.issueSystemEndSession(machine.id, 'test', sessionId)).toBe(true);
+    await vi.waitFor(() => expect(agent.commands.some((c) => c.type === 'END_SESSION')).toBe(true));
+    expect(agent.commands.find((c) => c.type === 'END_SESSION')).toMatchObject({ payload: { reason: 'test' } });
+    agent.socket.close();
+  });
+
+  it("a staff UNLOCK resumes the station's own session; after a runout lock it needs the money first", async () => {
+    const issueUnlock = (machineId: string) =>
+      app.inject({ method: 'POST', url: `/api/v1/stations/${machineId}/commands`, headers: as(staffToken), payload: { type: 'UNLOCK' } });
+
+    // Locked by staff (no money reason): Unlock resumes the same session.
+    const gamer = await createGamer();
+    const machine = await createMachine();
+    const agent = await connectAgent(machine);
+    const sessionId = await startAndLogIn(agent, (await createConfirmedReservation(gamer.profileId, machine.id)).id);
+    agent.send('heartbeat', { locked: true, sessionId });
+    await vi.waitFor(async () => expect((await get(sessionId)).json().status).toBe('PAUSED'));
+
+    const resumed = await issueUnlock(machine.id);
+    expect(resumed.statusCode).toBe(202);
+    await vi.waitFor(() => expect(agent.commands.filter((c) => c.type === 'UNLOCK')).toHaveLength(2));
+    expect(agent.commands.filter((c) => c.type === 'UNLOCK')[1]).toMatchObject({
+      payload: { sessionId, leaseSeconds: expect.any(Number), serverTime: expect.any(String) },
+    });
+    agent.socket.close();
+
+    // Locked because the money ran out, and the wallet still can't cover 5 minutes (500 millimes): refused.
+    const broke = await createGamer();
+    const brokeMachine = await createMachine();
+    const brokeAgent = await connectAgent(brokeMachine);
+    const brokeSession = await startAndLogIn(brokeAgent, (await createConfirmedReservation(broke.profileId, brokeMachine.id)).id);
+    await app.get(SessionsService).lockForRunout(brokeSession);
+    const all = await walletBalance(broke.profileId);
+    await app.inject({ method: 'POST', url: `/wallets/${broke.profileId}/debit`, headers: as(adminToken), payload: { amount: all - 100 } });
+
+    const refused = await issueUnlock(brokeMachine.id);
+    expect(refused.statusCode).toBe(409);
+    expect(refused.json().code).toBe('INSUFFICIENT_FUNDS');
+    brokeAgent.socket.close();
   });
 
   it('404s for an unknown reservation and 409s a reservation that is not CONFIRMED', async () => {

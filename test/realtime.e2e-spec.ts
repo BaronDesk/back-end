@@ -23,6 +23,7 @@ describe('realtime gateways (e2e)', () => {
   let accessToken: string;
 
   const username = `dash-${randomUUID()}`;
+  const gamerUsername = `dash-gamer-${randomUUID()}`;
   const password = 'super-secret-1';
 
   beforeAll(async () => {
@@ -56,7 +57,7 @@ describe('realtime gateways (e2e)', () => {
   }, 30_000);
 
   afterAll(async () => {
-    await prisma.user.deleteMany({ where: { username } });
+    await prisma.user.deleteMany({ where: { username: { in: [username, gamerUsername] } } });
     const machines = await prisma.machine.findMany({ where: { branchId } });
     if (machines.length) await app.get<Redis>(REDIS).del(...machines.map((m) => `node:${m.serialNumber}`));
     await prisma.branch.delete({ where: { id: branchId } }).catch(() => undefined);
@@ -340,6 +341,35 @@ describe('realtime gateways (e2e)', () => {
     gateway.publishToBranch(branchId, 'station_status', { ok: true });
 
     await expect(received).resolves.toEqual({ ok: true });
+    client.close();
+  });
+
+  it("a gamer's socket gets only that gamer's events, never a branch's or another gamer's", async () => {
+    await app.inject({ method: 'POST', url: '/users', payload: { username: gamerUsername, password, branchId } });
+    const login = await app.inject({ method: 'POST', url: '/auth/login', payload: { username: gamerUsername, password } });
+    const gamer = await prisma.user.findUniqueOrThrow({ where: { username: gamerUsername } });
+    const client = ioClient(baseUrl, {
+      path: '/dashboard-io',
+      reconnection: false,
+      forceNew: true,
+      auth: { token: login.json().accessToken },
+    });
+    await new Promise<void>((resolve, reject) => {
+      client.on('connect', () => resolve());
+      client.on('connect_error', reject);
+    });
+    const received: { event: string; payload: unknown }[] = [];
+    client.onAny((event: string, payload: unknown) => received.push({ event, payload }));
+
+    const gateway = app.get(DashboardGateway);
+    gateway.publishToBranch(branchId, 'station_status', { branch: true });
+    gateway.publishToBranch(null, 'alert', { hq: true });
+    gateway.publishToUser(randomUUID(), 'session_notice', { someoneElse: true });
+    gateway.publishToUser(gamer.id, 'session_notice', { mine: true });
+
+    await vi.waitFor(() => expect(received).toContainEqual({ event: 'session_notice', payload: { mine: true } }));
+    await new Promise((r) => setTimeout(r, 200));
+    expect(received).toEqual([{ event: 'session_notice', payload: { mine: true } }]);
     client.close();
   });
 });
