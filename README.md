@@ -185,7 +185,6 @@ Station enrollment (how a PC gets its machine row and station token) is not buil
 * One backend instance only (in-memory agent registry).
 * No station-token revocation list: `enrollmentStatus` and `credentialVersion` on the machine are the revocation.
 * On Docker Desktop (Windows / macOS) inbound traffic is NATed, so the station IP shown in dev is Docker's gateway, not the PC.
-* The agent's SHUTDOWN command is a stub: it acks, the PC stays on.
 
 ## Troubleshooting
 
