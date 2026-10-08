@@ -44,7 +44,7 @@ describe('MembershipService.purchase', () => {
       debit: vi.fn().mockResolvedValue({ id: 'entry-1' }),
       credit: vi.fn().mockResolvedValue({ id: 'entry-2' }),
     };
-    service = new MembershipService(repository as any, wallet as any);
+    service = new MembershipService(repository as any, wallet as any, { record: vi.fn() } as any);
   });
 
   it('debits the price through WalletService with a namespaced key, then creates the membership', async () => {
@@ -182,7 +182,7 @@ describe('MembershipService.getActiveDiscountForGamer / getBookingAdvanceDays', 
 
   beforeEach(() => {
     repository = { findActiveForGamer: vi.fn(), expireLapsed: vi.fn().mockResolvedValue({ count: 0 }) };
-    service = new MembershipService(repository as any, {} as any);
+    service = new MembershipService(repository as any, {} as any, { record: vi.fn() } as any);
   });
 
   it('returns null when the gamer has no active membership', async () => {

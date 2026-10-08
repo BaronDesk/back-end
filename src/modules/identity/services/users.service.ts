@@ -5,6 +5,7 @@ import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
 import { Prisma, type UserRole } from '../../../generated/prisma/index.js';
 import { RefreshTokenRepository } from '../repository/refresh-token.repository.js';
 import { UsersRepository } from '../repository/users.repository.js';
+import { AuditLogService } from '../../../common/audit/audit-log.service.js';
 import type { CreateEmployeeDto, CreateGamerDto, ListUsersQuery, UpdateRoleDto } from '../schemas/users.schemas.js';
 import { toPublicUser } from '../util/public-user.js';
 import { PasswordService } from './password.service.js';
@@ -25,6 +26,7 @@ export class UsersService {
     private readonly usersRepo: UsersRepository,
     private readonly passwords: PasswordService,
     private readonly refreshTokens: RefreshTokenRepository,
+    private readonly audit: AuditLogService,
   ) {}
 
   /** Sign-up: every gamer picks the branch they play at. */
@@ -87,6 +89,7 @@ export class UsersService {
     }
     await this.usersRepo.setPasswordHash(targetId, await this.passwords.hash(newPassword));
     await this.refreshTokens.revokeAllForUser(targetId);
+     await this.audit.record(caller.sub, 'UPDATE', `user:${targetId}`, { metadata: { event: 'PASSWORD_RESET' } });
     return { id: targetId, reset: true };
   }
 
@@ -117,6 +120,9 @@ export class UsersService {
     }
     const user = await this.usersRepo.setStatus(targetId, status);
     if (status !== 'ACTIVE') await this.refreshTokens.revokeAllForUser(targetId);
+    await this.audit.record(caller.sub, 'UPDATE', `user:${targetId}`, {
+      metadata: { event: status === 'ACTIVE' ? 'USER_REACTIVATED' : 'USER_SUSPENDED' },
+    });
     return toPublicUser(user);
   }
 
@@ -148,6 +154,9 @@ export class UsersService {
     });
 
     const user = await this.usersRepo.updateRole(targetId, dto.role, dto.branchId);
+    await this.audit.record(caller.sub, 'UPDATE', `user:${targetId}`, {
+      metadata: { event: 'ROLE_CHANGED', to: dto.role, branchId: dto.branchId ?? null },
+    });
     return toPublicUser(user);
   }
 

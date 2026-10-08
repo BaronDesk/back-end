@@ -25,6 +25,7 @@ import { GamesService, type CatalogChange } from '../../games/services/games.ser
 import { PresenceService, type StationRef } from '../../station/services/presence.service.js';
 import { DashboardGateway } from '../dashboard.gateway.js';
 import { CommandsRepository } from '../repository/commands.repository.js';
+import { AuditLogService } from '../../../common/audit/audit-log.service.js';
 import {
   NACK_CODES,
   type CommandJobData,
@@ -116,6 +117,7 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
     private readonly config: ConfigService,
     private readonly games: GamesService,
     private readonly sessions: StationSessionPort,
+    private readonly audit: AuditLogService,
   ) {
     this.simulationsAllowed = config.get('NODE_ENV') !== 'production';
   }
@@ -172,6 +174,10 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
     } else if (body.type === 'SHUTDOWN') {
       // The gamer stops playing now: settle before the PC goes dark (its session end arrives later, already closed).
       await this.sessions.current?.closeForShutdown(station);
+      await this.audit.record(caller.sub, 'UPDATE', `machine:${station.machineId}`, {
+        branchId: station.branchId,
+        metadata: { event: 'STATION_SHUTDOWN' },
+      });
     }
 
     // Labels the session.ended event, which fires only once the agent reports

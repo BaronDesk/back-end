@@ -89,8 +89,9 @@ describe('CommandsService', () => {
       tracker,
       queue as any,
       config({ NODE_ENV: 'development', COMMAND_MAX_ATTEMPTS: 2 }),
-                                  games as any,
+      games as any,
       port as any,
+      { record: vi.fn() } as any,
     );
   });
 

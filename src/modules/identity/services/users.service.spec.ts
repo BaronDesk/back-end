@@ -44,7 +44,7 @@ describe('UsersService', () => {
       verify: vi.fn(),
     };
     refreshTokens = { revokeAllForUser: vi.fn(async () => ({ count: 2 })) };
-    service = new UsersService(repo as any, passwords as any, refreshTokens as any);
+    service = new UsersService(repo as any, passwords as any, refreshTokens as any, { record: vi.fn() } as any);
   });
 
   describe('role changes', () => {

@@ -45,11 +45,12 @@ export class MembershipController {
   @RequireScope('admin')
   @Patch('membership-plans/:id')
   updatePlan(
+    @CurrentUser() caller: AccessTokenPayload,
     @Param('id', new ZodValidationPipe(idParamSchema)) id: string,
     @Body(new ZodValidationPipe(updateMembershipPlanSchema))
     dto: UpdateMembershipPlanDto,
   ) {
-    return this.memberships.updatePlan(id, dto);
+     return this.memberships.updatePlan(caller, id, dto);
   }
 
   @RequireScope('admin')

@@ -2,6 +2,8 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 
 import { PresenceService } from '../station/services/presence.service.js';
 import { BranchesRepository } from './branches.repository.js';
+import { AuditLogService } from '../../common/audit/audit-log.service.js';
+import type { AccessTokenPayload } from '../../common/types/jwt-payload.js';
 
 /** How far ahead the station list shows bookings (what a gamer can book is limited separately). */
 const LOOKAHEAD_MS = 7 * 24 * 60 * 60_000;
@@ -21,6 +23,7 @@ export class BranchesService {
   constructor(
     private readonly repo: BranchesRepository,
     private readonly presence: PresenceService,
+    private readonly audit: AuditLogService,
   ) {}
 
   async list() {
@@ -31,9 +34,14 @@ export class BranchesService {
     return toBranchDto(await this.repo.create(data));
   }
 
-  async update(id: string, data: { name?: string; location?: string }) {
+  async update(caller: AccessTokenPayload, id: string, data: { name?: string; location?: string }) {
     if (!(await this.repo.findById(id))) throw notFound();
-    return toBranchDto(await this.repo.update(id, data));
+    const updated = await this.repo.update(id, data);
+    await this.audit.record(caller.sub, 'UPDATE', `branch:${id}`, {
+      branchId: id,
+      metadata: { event: 'BRANCH_UPDATED', fields: Object.keys(data) },
+    });
+    return toBranchDto(updated);
   }
 
   /**

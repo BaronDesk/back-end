@@ -161,6 +161,7 @@ model Branch {
   gameBranches      GameBranch[]
   enrollmentTokens  EnrollmentToken[]
   gamers            GamerProfile[]
+  auditLogs         AuditLog[]
 
   @@index([name])
   @@map("branches")
@@ -701,14 +702,17 @@ model Subscription {
 model AuditLog {
   id        String      @id @default(uuid()) @db.Uuid
   userId    String      @map("user_id") @db.Uuid
+  branchId  String?     @map("branch_id") @db.Uuid
   action    AuditAction
   target    String
   metadata  Json?       @default("{}")
   timestamp DateTime    @default(now()) @db.Timestamptz
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  branch Branch? @relation(fields: [branchId], references: [id], onDelete: SetNull)
 
   @@index([userId])
+  @@index([branchId])
   @@index([action])
   @@index([target])
   @@index([timestamp])

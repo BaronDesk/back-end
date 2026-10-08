@@ -12,6 +12,7 @@ import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
 import { dinarsToMillimes } from '../../../common/utils/money.js';
 import { WalletService } from '../../wallet/services/wallet.service.js';
 import { MembershipRepository } from '../repository/membership.repository.js';
+import { AuditLogService } from '../../../common/audit/audit-log.service.js';
 import type {
   CreateMembershipPlanDto,
   PurchaseMembershipDto,
@@ -47,6 +48,7 @@ export class MembershipService {
   constructor(
     private readonly memberships: MembershipRepository,
     private readonly wallet: WalletService,
+    private readonly audit: AuditLogService,
   ) {}
 
   listPlans() {
@@ -70,9 +72,13 @@ export class MembershipService {
     }
   }
 
-  async updatePlan(id: string, dto: UpdateMembershipPlanDto) {
+  async updatePlan(caller: AccessTokenPayload, id: string, dto: UpdateMembershipPlanDto) {
     try {
-      return await this.memberships.updatePlan(id, dto);
+      const updated = await this.memberships.updatePlan(id, dto);
+      await this.audit.record(caller.sub, 'UPDATE', `membership-plan:${id}`, {
+        metadata: { event: 'PLAN_UPDATED', fields: Object.keys(dto) },
+       });
+      return updated;
     } catch (error) {
       this.translatePlanError(error);
     }

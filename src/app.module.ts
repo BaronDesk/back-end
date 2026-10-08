@@ -23,12 +23,14 @@ import { SubscriptionsModule } from './modules/subscriptions/subscriptions.modul
 import { SessionBillingModule } from './modules/session-billing/session-billing.module.js';
 import { ReservationsModule } from './modules/reservations/reservations.module.js';
 import { BranchesModule } from './modules/branches/branches.module.js';
+import { AuditLogModule } from './common/audit/audit-log.module.js';
 
 
 @Module({
   imports: [
     AppConfigModule,
     PrismaModule,
+    AuditLogModule,
     RedisModule,
     QueueModule,
     IdentityModule,

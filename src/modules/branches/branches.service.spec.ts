@@ -22,7 +22,7 @@ describe('BranchesService.stations', () => {
       ]),
     };
     const presence = { isOnline: vi.fn((serial: string) => serial === 'MNR-01') };
-    const service = new BranchesService(repo as any, presence as any);
+    const service = new BranchesService(repo as any, presence as any, { record: vi.fn() } as any);
 
     const [busy, free] = await service.stations('b1', NOW);
     expect(busy).toMatchObject({ id: 'm1', name: 'PC-01', online: true, busyNow: true, busyUntil: at(90).toISOString() });
@@ -31,7 +31,7 @@ describe('BranchesService.stations', () => {
   });
 
   it('404s an unknown branch', async () => {
-    const service = new BranchesService({ findById: vi.fn(async () => null) } as any, {} as any);
+    const service = new BranchesService({ findById: vi.fn(async () => null) } as any, {} as any, { record: vi.fn() } as any);
     await expect(service.stations('nope')).rejects.toMatchObject({ response: { code: 'BRANCH_NOT_FOUND' } });
   });
 });

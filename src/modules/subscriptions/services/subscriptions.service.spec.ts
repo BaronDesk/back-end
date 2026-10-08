@@ -22,7 +22,7 @@ describe('SubscriptionsService.getWindowDiscountForGamer', () => {
         { id: 'legacy', benefitsSnapshot: { type: 'free_hours', hours: 15 } },
       ]),
     };
-    service = new SubscriptionsService(repository as any, {} as any, config as any);
+     service = new SubscriptionsService(repository as any, {} as any, config as any, { record: vi.fn() } as any);
   });
 
   // Africa/Tunis is UTC+1 all year.
@@ -74,7 +74,7 @@ describe('SubscriptionsService.purchase', () => {
       debit: vi.fn().mockResolvedValue({ id: 'entry-1' }),
       credit: vi.fn().mockResolvedValue({ id: 'entry-2' }),
     };
-    service = new SubscriptionsService(repository as any, wallet as any, config as any);
+    service = new SubscriptionsService(repository as any, wallet as any, config as any, { record: vi.fn() } as any);
   });
 
   it('debits the price through WalletService with a namespaced key, then creates the subscription', async () => {

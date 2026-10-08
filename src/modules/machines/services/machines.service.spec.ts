@@ -38,7 +38,7 @@ describe('MachinesService', () => {
     repo = { findById: vi.fn(), list: vi.fn(), updateStatus: vi.fn() };
     agents = { disconnectStation: vi.fn() };
     sessions = { retireMachine: vi.fn(async () => undefined) };
-    service = new MachinesService(repo as any, agents as any, sessions as any);
+    service = new MachinesService(repo as any, agents as any, sessions as any, { record: vi.fn() } as any);
   });
 
   describe('list', () => {

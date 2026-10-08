@@ -6,6 +6,7 @@ import { SessionsService } from '../../session-billing/services/sessions.service
 import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
 import type { MachineEnrollmentStatus } from '../../../generated/prisma/index.js';
 import { MachinesRepository } from '../repository/machines.repository.js';
+import { AuditLogService } from '../../../common/audit/audit-log.service.js';
 import type { ListMachinesQueryDto } from '../schemas/machines.schemas.js';
 import { toPublicMachine, type MachineRecord } from '../util/public-machine.js';
 
@@ -16,6 +17,7 @@ export class MachinesService {
     private readonly machines: MachinesRepository,
     private readonly agents: AgentGateway,
     private readonly sessions: SessionsService,
+    private readonly audit: AuditLogService,
   ) {}
 
   async list(caller: AccessTokenPayload, query: ListMachinesQueryDto) {
@@ -66,6 +68,10 @@ export class MachinesService {
     const updated = await this.machines.updateStatus(id, 'DEACTIVATED');
     this.agents.disconnectStation(machine.serialNumber, 'station revoked');
     await this.sessions.retireMachine(machine.id);
+    await this.audit.record(caller.sub, 'UPDATE', `machine:${id}`, {
+      branchId: machine.branchId,
+      metadata: { event: 'STATION_REVOKED', serialNumber: machine.serialNumber },
+    });
     return toPublicMachine(updated);
   }
 
