@@ -7,6 +7,9 @@
 * Games (6):            cs2, valorant, dota2, lol, fortnite, fc25
 * Membership plans (3): Standard (free/0%), Pro (15dt/mo, 10%), Elite (30dt/mo, 20%)
 * Subscription plans:   The Night Owl (25dt/mo), The Weekend Warrior (40dt/mo)
+* Ranks (7):           Wood 0 XP, Bronze 500, Silver 1500, Gold 4000, Diamond 8000, Master 15000, GrandMaster 25000
+* Badges:              tiers, passes and ranks get the Graphic-Charter badge (prisma/seed-assets/badges)
+*                      written to UPLOAD_DIR, unless they already have one (an admin's choice is kept)
 *
 * Staff:  2 managers, 4 employees (1 per branch pair) — login: password123
 * Gamers: 10 total, one per XP tier (Wood → Grandmaster) — login: password123
@@ -32,10 +35,14 @@
 
 
 import 'dotenv/config';
+import { access, readFile } from 'node:fs/promises';
+import path from 'node:path';
+
 import { PrismaPg } from '@prisma/adapter-pg';
 import { hash } from '@node-rs/argon2';
 
 import { PrismaClient, type TransactionType } from '../src/generated/prisma/index.js';
+import { fileOf, writeImage } from '../src/modules/uploads/util/image-files.js';
 
 // @node-rs/argon2's Algorithm is an ambient `const enum`, which isolatedModules
 // forbids referencing directly. 2 is Algorithm.Argon2id (also the library default).
@@ -64,6 +71,21 @@ function addDays(date: Date, days: number): Date {
 
 async function hashPassword(plain: string): Promise<string> {
   return hash(plain, { algorithm: ARGON2ID });
+}
+
+// Same folder as the backend (UploadsModule): /app/uploads in Docker, the `uploads` volume.
+const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR ?? 'uploads');
+const BADGES = path.join(import.meta.dirname, 'seed-assets', 'badges');
+
+/**
+ * Gives a row its Graphic-Charter badge, unless it has a badge whose file is
+ * there (set by an earlier run, or by an admin since). Returns whether it wrote one.
+ */
+async function seedBadge(folder: string, name: string, current: string | null, save: (badgeUrl: string) => Promise<unknown>) {
+  const file = current ? fileOf(UPLOAD_DIR, current) : null;
+  if (current && (!file || (await access(file).then(() => true, () => false)))) return false;
+  await save(await writeImage(UPLOAD_DIR, await readFile(path.join(BADGES, folder, `${name}.webp`)), 'image'));
+  return true;
 }
 
 interface LedgerPlan {
@@ -172,6 +194,37 @@ async function main() {
     });
   }
   console.log(`seeded ${Object.keys(subscriptionPlans).length} subscription plan(s)`);
+
+  // --- Ranks (XP tiers) ---
+  const rankSeeds = [
+    { name: 'Wood', minXp: 0 },
+    { name: 'Bronze', minXp: 500 },
+    { name: 'Silver', minXp: 1500 },
+    { name: 'Gold', minXp: 4000 },
+    { name: 'Diamond', minXp: 8000 },
+    { name: 'Master', minXp: 15000 },
+    { name: 'GrandMaster', minXp: 25000 },
+  ];
+  const ranks = [];
+  for (const seed of rankSeeds) {
+    ranks.push(await prisma.rank.upsert({ where: { name: seed.name }, update: {}, create: seed }));
+  }
+  console.log(`seeded ${ranks.length} rank(s)`);
+
+  // --- Badges (files in UPLOAD_DIR, links in the rows) ---
+  let badges = 0;
+  for (const plan of Object.values(membershipPlans)) {
+    const current = (await prisma.membershipPlan.findUniqueOrThrow({ where: { id: plan.id } })).badgeUrl;
+    if (await seedBadge('membership-plans', plan.name, current, (badgeUrl) => prisma.membershipPlan.update({ where: { id: plan.id }, data: { badgeUrl } }))) badges++;
+  }
+  for (const plan of Object.values(subscriptionPlans)) {
+    const current = (await prisma.subscriptionPlan.findUniqueOrThrow({ where: { id: plan.id } })).badgeUrl;
+    if (await seedBadge('subscription-plans', plan.name.replaceAll(' ', '-'), current, (badgeUrl) => prisma.subscriptionPlan.update({ where: { id: plan.id }, data: { badgeUrl } }))) badges++;
+  }
+  for (const rank of ranks) {
+    if (await seedBadge('ranks', rank.name, rank.badgeUrl, (badgeUrl) => prisma.rank.update({ where: { id: rank.id }, data: { badgeUrl } }))) badges++;
+  }
+  console.log(`seeded ${badges} badge(s) into ${UPLOAD_DIR}`);
 
   // --- Games catalog ---
   const gameSeeds = [

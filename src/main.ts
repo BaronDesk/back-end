@@ -10,6 +10,7 @@ import { SwaggerModule } from '@nestjs/swagger';
 
 import { AppModule } from './app.module.js';
 import { buildOpenApiDocument } from './common/swagger/build-document.js';
+import { registerUploads } from './modules/uploads/uploads.setup.js';
 
 async function bootstrap() {
   const app = await NestFactory.create<NestFastifyApplication>(
@@ -21,6 +22,9 @@ async function bootstrap() {
   // Without this, SIGTERM kills the process before Prisma disconnects
   // cleanly on every `docker compose restart`.
   app.enableShutdownHooks();
+
+  // Image uploads (multipart) and GET /uploads/... for the stored files.
+  await registerUploads(app);
 
   if (process.env.NODE_ENV !== 'production') {
     SwaggerModule.setup('docs', app, buildOpenApiDocument(app), { jsonDocumentUrl: 'docs-json' });

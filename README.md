@@ -44,8 +44,8 @@ npm run docker:down        # stop; the database and Redis data stay
 |:---|:---|:---|
 | `postgres` | postgres:16-alpine | database (volume `pgdata`) |
 | `redis` | redis:7-alpine | BullMQ broker, append-only file (volume `redisdata`) |
-| `migrate` | cstam-backend | runs `prisma migrate deploy` once, then exits |
-| `backend` | cstam-backend | REST API, Swagger, WebSocket gateways, queue worker, port 3000 |
+| `migrate` | cstam-backend | runs `prisma migrate deploy` once, then exits (the seed runs here too) |
+| `backend` | cstam-backend | REST API, Swagger, WebSocket gateways, queue worker, port 3000; uploaded images (volume `uploads`) |
 | `reverse-proxy` | caddy:2-alpine | TLS on `:443` (internal CA) in front of the backend |
 
 Boot order: `postgres` and `redis` become healthy, `migrate` applies the migrations and exits, `backend` starts, then `reverse-proxy` starts once `backend` is healthy.
@@ -104,12 +104,13 @@ Optional (defaults shown):
 | `CPU_TEMP_THRESHOLD_C`, `GPU_TEMP_THRESHOLD_C` | 85, 90 | hardware alert thresholds |
 | `TELEMETRY_CACHE_TTL_S` | 30 | Redis TTL of live telemetry |
 | `TELEMETRY_HISTORY_INTERVAL_MS`, `TELEMETRY_HISTORY_RETENTION_HOURS` | 60000, 48 | telemetry history |
+| `UPLOAD_DIR` | `uploads` | folder of the uploaded images (`/app/uploads` in Docker, the `uploads` volume) |
 
 Docker Compose reads `.env` when it creates a container. After editing it, run `npm run docker:up`.
 
 ## Seed data
 
-`npm run db:seed` fills the database (safe to run again). It creates 2 branches with machines and pricing, 6 games, membership and subscription plans, 2 managers, 4 employees and 10 gamers (one per XP tier), plus reservations and sessions in every status. All seeded accounts use the password `password123`. Usernames include `gamer.gold`, `gamer.silver`, `gamer.newbie`; see the header of [prisma/seed.ts](prisma/seed.ts) for the full list.
+`npm run db:seed` fills the database (safe to run again). It creates 2 branches with machines and pricing, 6 games, membership and subscription plans, the 7 ranks (Wood → GrandMaster), the Graphic-Charter badges of the tiers, passes and ranks (from `prisma/seed-assets/badges`, written to `UPLOAD_DIR`; a badge already set is kept), 2 managers, 4 employees and 10 gamers (one per XP tier), plus reservations and sessions in every status. All seeded accounts use the password `password123`. Usernames include `gamer.gold`, `gamer.silver`, `gamer.newbie`; see the header of [prisma/seed.ts](prisma/seed.ts) for the full list.
 
 ## Without Docker
 
@@ -157,7 +158,7 @@ npm run start:dev          # watch mode; or: npm run build && npm run start:prod
 | `docker-compose*.yml` or `.env` | `npm run docker:up` |
 | `Caddyfile` | `npm run caddy:reload` |
 
-To wipe local data and start clean: `npm run dc -- down -v`, then `npm run docker:dev`. This drops `pgdata`, `redisdata` and `caddy_data` (the pinned certificate changes too).
+To wipe local data and start clean: `npm run dc -- down -v`, then `npm run docker:dev`. This drops `pgdata`, `redisdata`, `uploads` and `caddy_data` (the pinned certificate changes too).
 
 ## Production
 
@@ -171,6 +172,22 @@ docker compose up -d --build     # base file only: target `runtime`, NODE_ENV=pr
 * Stopping `backend` is graceful (20 s) so BullMQ finishes in-flight jobs and Prisma disconnects.
 * Run only one backend instance: the agent registry is in memory.
 
+## Images
+
+Badges (membership tiers, passes, ranks), game images and gamer avatars are files in `UPLOAD_DIR`; the database keeps only their links (`badgeUrl`, `iconUrl`, `avatarUrl`). Back up the `uploads` volume together with `pgdata`.
+
+| route | who | what |
+|:---|:---|:---|
+| `POST /uploads/images` | manager+ | multipart, one `file` (PNG, JPEG or WebP, at most 2 MB). Answers `{ url }`: save it as the `badgeUrl` of a tier, pass or rank, or the `iconUrl` of a game |
+| `PUT /users/me/avatar` / `DELETE` | the gamer | their own profile picture (multipart `file`), cropped to 256×256 |
+| `GET /ranks`, `POST`, `PATCH /ranks/:id`, `DELETE` | gamers read, manager+ edit | ranks: `name`, `minXp`, `badgeUrl` |
+| `GET /uploads/<folder>/<id>.webp` | public | the stored file, cached for a year |
+
+* Every picture is checked by its content, re-encoded as WebP (transparency kept, metadata such as a photo's GPS position dropped) and given a random name. Badges and game images fit in 512×512; avatars are 256×256.
+* A `badgeUrl` / `iconUrl` must be a link from `POST /uploads/images` (`/uploads/images/<id>.webp`) or `null`; any other link is refused (400).
+* When a row's image changes or the row is deleted, the old file is deleted once no other row uses it. A picture uploaded but never saved on a row stays on disk.
+* The files sit behind one class (`ImagesService`), so S3 or MinIO could replace the disk later.
+
 ## Realtime endpoints
 
 | path | protocol | who |
@@ -183,6 +200,7 @@ Station enrollment (how a PC gets its machine row and station token) is not buil
 ## Known limits
 
 * One backend instance only (in-memory agent registry).
+* Uploaded images live on the backend's disk (the `uploads` volume): a second instance would not see them.
 * No station-token revocation list: `enrollmentStatus` and `credentialVersion` on the machine are the revocation.
 * On Docker Desktop (Windows / macOS) inbound traffic is NATed, so the station IP shown in dev is Docker's gateway, not the PC.
 

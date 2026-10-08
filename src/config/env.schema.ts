@@ -60,6 +60,9 @@ export const envSchema = z.object({
   RATE_LIMIT_LOGIN_FAILURES: z.coerce.number().int().min(1).default(10), // per IP + username, 15 min
   RATE_LIMIT_REFRESHES_PER_MINUTE: z.coerce.number().int().min(1).default(60), // per IP
   RATE_LIMIT_SIGNUPS_PER_HOUR: z.coerce.number().int().min(1).default(30), // per IP
+  // Uploaded images (badges, game images, avatars), served under /uploads/.
+  // Relative paths are read from the working directory (/app/uploads in Docker, a volume).
+  UPLOAD_DIR: z.string().min(1).default('uploads'),
 });
 
 export type EnvConfig = z.infer<typeof envSchema>;

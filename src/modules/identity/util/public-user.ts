@@ -5,7 +5,7 @@ export interface UserWithProfiles {
   accountStatus: string;
   createdAt: Date;
   employeeProfile?: { managedBranchId: string | null } | null;
-  gamerProfile?: { id: string; homeBranchId: string | null } | null;
+  gamerProfile?: { id: string; homeBranchId: string | null; avatarUrl?: string | null } | null;
 }
 
 export function toPublicUser(user: UserWithProfiles) {
@@ -20,6 +20,8 @@ export function toPublicUser(user: UserWithProfiles) {
     gamerProfileId: user.gamerProfile?.id ?? null,
     /** The branch a gamer plays at: the booking page lists its stations. */
     homeBranchId: user.gamerProfile?.homeBranchId ?? null,
+    /** A gamer's profile picture (/uploads/avatars/<id>.webp), or null. */
+    avatarUrl: user.gamerProfile?.avatarUrl ?? null,
     createdAt: user.createdAt,
   };
 }

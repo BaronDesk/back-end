@@ -18,6 +18,82 @@
         "description": "Public, no token needed."
       }
     },
+    "/uploads/images": {
+      "post": {
+        "operationId": "UploadsController_uploadImage",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "file"
+                ],
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "PNG, JPEG or WebP, at most 2 MB"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Stored; save this link as a badgeUrl or iconUrl",
+            "content": {
+              "application/json": {
+                "example": {
+                  "url": "/uploads/images/9b3e5f71-2c8d-4a06-b4e9-5d1a7c0f2e68.webp"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid access token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "error": "Unauthorized",
+                  "code": "UNAUTHORIZED"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller scope is too low for this endpoint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "error": "Forbidden",
+                  "code": "FORBIDDEN"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Uploads"
+        ],
+        "summary": "Upload image",
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "description": "Needs a bearer token. Minimum scope: **admin** (admin)."
+      }
+    },
     "/auth/login": {
       "post": {
         "operationId": "AuthController_login",
@@ -354,6 +430,7 @@
                   "branchId": null,
                   "gamerProfileId": "5b9e2d14-6f83-4c1a-8e27-d0a4b7c93f56",
                   "homeBranchId": "1c7a9e30-52bd-4f68-a3e1-7b0d4c8f2a95",
+                  "avatarUrl": null,
                   "createdAt": "2026-05-20T09:30:00.000Z"
                 }
               }
@@ -403,6 +480,7 @@
                   "branchId": null,
                   "gamerProfileId": "5b9e2d14-6f83-4c1a-8e27-d0a4b7c93f56",
                   "homeBranchId": "1c7a9e30-52bd-4f68-a3e1-7b0d4c8f2a95",
+                  "avatarUrl": null,
                   "createdAt": "2026-05-20T09:30:00.000Z"
                 }
               }
@@ -971,6 +1049,124 @@
             }
           }
         }
+      }
+    },
+    "/users/me/avatar": {
+      "put": {
+        "operationId": "UsersController_setAvatar",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "file"
+                ],
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "PNG, JPEG or WebP, at most 2 MB"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The gamer, with the new picture",
+            "content": {
+              "application/json": {
+                "example": {
+                  "id": "8d1f6a52-3c0b-4a77-b5de-91e0c2f47a10",
+                  "username": "gamer01",
+                  "role": "GAMER",
+                  "accountStatus": "ACTIVE",
+                  "branchId": null,
+                  "gamerProfileId": "5b9e2d14-6f83-4c1a-8e27-d0a4b7c93f56",
+                  "homeBranchId": "1c7a9e30-52bd-4f68-a3e1-7b0d4c8f2a95",
+                  "avatarUrl": "/uploads/avatars/6d2a8e14-73fb-4c95-a0d8-1e4b9f5c3a27.webp",
+                  "createdAt": "2026-05-20T09:30:00.000Z"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid access token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "error": "Unauthorized",
+                  "code": "UNAUTHORIZED"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Users"
+        ],
+        "summary": "Set avatar",
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "description": "Needs a bearer token. Minimum scope: **self** (any signed-in user)."
+      },
+      "delete": {
+        "operationId": "UsersController_removeAvatar",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "example": {
+                  "id": "8d1f6a52-3c0b-4a77-b5de-91e0c2f47a10",
+                  "username": "gamer01",
+                  "role": "GAMER",
+                  "accountStatus": "ACTIVE",
+                  "branchId": null,
+                  "gamerProfileId": "5b9e2d14-6f83-4c1a-8e27-d0a4b7c93f56",
+                  "homeBranchId": "1c7a9e30-52bd-4f68-a3e1-7b0d4c8f2a95",
+                  "avatarUrl": null,
+                  "createdAt": "2026-05-20T09:30:00.000Z"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid access token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "error": "Unauthorized",
+                  "code": "UNAUTHORIZED"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Users"
+        ],
+        "summary": "Remove avatar",
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "description": "Needs a bearer token. Minimum scope: **self** (any signed-in user)."
       }
     },
     "/users/{id}/password": {
@@ -2306,7 +2502,8 @@
                       "SHUTDOWN",
                       "LAUNCH_GAME",
                       "END_SESSION",
-                      "CATALOG_UPDATE"
+                      "CATALOG_UPDATE",
+                      "POLICY_UPDATE"
                     ]
                   },
                   "payload": {
@@ -2903,8 +3100,7 @@
                   "iconUrl": {
                     "nullable": true,
                     "type": "string",
-                    "maxLength": 2048,
-                    "format": "uri"
+                    "pattern": "^\\/uploads\\/images\\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.webp$"
                   },
                   "enabled": {
                     "default": true,
@@ -3067,8 +3263,7 @@
                   "iconUrl": {
                     "nullable": true,
                     "type": "string",
-                    "maxLength": 2048,
-                    "format": "uri"
+                    "pattern": "^\\/uploads\\/images\\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.webp$"
                   },
                   "enabled": {
                     "type": "boolean"
@@ -4582,6 +4777,11 @@
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 365
+                  },
+                  "badgeUrl": {
+                    "nullable": true,
+                    "type": "string",
+                    "pattern": "^\\/uploads\\/images\\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.webp$"
                   }
                 },
                 "required": [
@@ -4713,6 +4913,11 @@
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 365
+                  },
+                  "badgeUrl": {
+                    "nullable": true,
+                    "type": "string",
+                    "pattern": "^\\/uploads\\/images\\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.webp$"
                   }
                 }
               },
@@ -5698,6 +5903,11 @@
                       "windows"
                     ],
                     "additionalProperties": false
+                  },
+                  "badgeUrl": {
+                    "nullable": true,
+                    "type": "string",
+                    "pattern": "^\\/uploads\\/images\\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.webp$"
                   }
                 },
                 "required": [
@@ -5876,6 +6086,11 @@
                       "windows"
                     ],
                     "additionalProperties": false
+                  },
+                  "badgeUrl": {
+                    "nullable": true,
+                    "type": "string",
+                    "pattern": "^\\/uploads\\/images\\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.webp$"
                   }
                 }
               },
@@ -7169,6 +7384,383 @@
         "description": "Needs a bearer token. Minimum scope: **self** (any signed-in user)."
       }
     },
+    "/ranks": {
+      "get": {
+        "operationId": "RanksController_list",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "example": [
+                  {
+                    "id": "f1a7c3e9-5b2d-4806-9e4f-a3c1d7b5e290",
+                    "name": "Wood",
+                    "minXp": 0,
+                    "badgeUrl": "/uploads/images/9b3e5f71-2c8d-4a06-b4e9-5d1a7c0f2e68.webp",
+                    "createdAt": "2026-05-20T09:30:00.000Z",
+                    "updatedAt": "2026-05-20T09:30:00.000Z"
+                  },
+                  {
+                    "id": "f1a7c3e9-5b2d-4806-9e4f-a3c1d7b5e290",
+                    "name": "Gold",
+                    "minXp": 4000,
+                    "badgeUrl": "/uploads/images/9b3e5f71-2c8d-4a06-b4e9-5d1a7c0f2e68.webp",
+                    "createdAt": "2026-05-20T09:30:00.000Z",
+                    "updatedAt": "2026-05-20T09:30:00.000Z"
+                  }
+                ]
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid access token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "error": "Unauthorized",
+                  "code": "UNAUTHORIZED"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Ranks"
+        ],
+        "summary": "List (ranks)",
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "description": "Needs a bearer token. Minimum scope: **self** (any signed-in user)."
+      },
+      "post": {
+        "operationId": "RanksController_create",
+        "parameters": [],
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "example": {
+                  "id": "f1a7c3e9-5b2d-4806-9e4f-a3c1d7b5e290",
+                  "name": "Gold",
+                  "minXp": 4000,
+                  "badgeUrl": "/uploads/images/9b3e5f71-2c8d-4a06-b4e9-5d1a7c0f2e68.webp",
+                  "createdAt": "2026-05-20T09:30:00.000Z",
+                  "updatedAt": "2026-05-20T09:30:00.000Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Request failed validation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "error": "request failed validation",
+                  "code": "VALIDATION_ERROR",
+                  "issues": [
+                    {
+                      "path": "machineId",
+                      "message": "Invalid UUID"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid access token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "error": "Unauthorized",
+                  "code": "UNAUTHORIZED"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller scope is too low for this endpoint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "error": "Forbidden",
+                  "code": "FORBIDDEN"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Ranks"
+        ],
+        "summary": "Create (ranks)",
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "description": "Needs a bearer token. Minimum scope: **admin** (admin).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 50
+                  },
+                  "minXp": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100000000
+                  },
+                  "badgeUrl": {
+                    "nullable": true,
+                    "type": "string",
+                    "pattern": "^\\/uploads\\/images\\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.webp$"
+                  }
+                },
+                "required": [
+                  "name",
+                  "minXp"
+                ]
+              },
+              "example": {
+                "name": "string",
+                "minXp": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ranks/{id}": {
+      "patch": {
+        "operationId": "RanksController_update",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "example": "3f2b8c1e-7a4d-4e5b-9c61-0d2f8a9b1c34"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "example": {
+                  "id": "f1a7c3e9-5b2d-4806-9e4f-a3c1d7b5e290",
+                  "name": "Gold",
+                  "minXp": 4000,
+                  "badgeUrl": "/uploads/images/9b3e5f71-2c8d-4a06-b4e9-5d1a7c0f2e68.webp",
+                  "createdAt": "2026-05-20T09:30:00.000Z",
+                  "updatedAt": "2026-05-20T09:30:00.000Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Request failed validation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "error": "request failed validation",
+                  "code": "VALIDATION_ERROR",
+                  "issues": [
+                    {
+                      "path": "machineId",
+                      "message": "Invalid UUID"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid access token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "error": "Unauthorized",
+                  "code": "UNAUTHORIZED"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller scope is too low for this endpoint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "error": "Forbidden",
+                  "code": "FORBIDDEN"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Ranks"
+        ],
+        "summary": "Update (ranks)",
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "description": "Needs a bearer token. Minimum scope: **admin** (admin).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 50
+                  },
+                  "minXp": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100000000
+                  },
+                  "badgeUrl": {
+                    "nullable": true,
+                    "type": "string",
+                    "pattern": "^\\/uploads\\/images\\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.webp$"
+                  }
+                }
+              },
+              "example": {}
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "RanksController_remove",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "example": "3f2b8c1e-7a4d-4e5b-9c61-0d2f8a9b1c34"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "example": {
+                  "id": "f1a7c3e9-5b2d-4806-9e4f-a3c1d7b5e290",
+                  "deleted": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Request failed validation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "error": "request failed validation",
+                  "code": "VALIDATION_ERROR",
+                  "issues": [
+                    {
+                      "path": "machineId",
+                      "message": "Invalid UUID"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid access token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "error": "Unauthorized",
+                  "code": "UNAUTHORIZED"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller scope is too low for this endpoint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "error": "Forbidden",
+                  "code": "FORBIDDEN"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Ranks"
+        ],
+        "summary": "Remove (ranks)",
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "description": "Needs a bearer token. Minimum scope: **admin** (admin)."
+      }
+    },
     "/health": {
       "get": {
         "operationId": "HealthController_check",
@@ -7228,6 +7820,9 @@
       "name": "Pricing"
     },
     {
+      "name": "Ranks"
+    },
+    {
       "name": "Reservations"
     },
     {
@@ -7247,6 +7842,9 @@
     },
     {
       "name": "Telemetry"
+    },
+    {
+      "name": "Uploads"
     },
     {
       "name": "Users"

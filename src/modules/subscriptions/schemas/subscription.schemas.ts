@@ -1,5 +1,7 @@
 import { z } from 'zod';
 
+import { uploadedImageUrlSchema } from '../../uploads/schemas/image-url.schema.js';
+
 const timeSchema = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/);
 const benefitWindowSchema = z.object({
   daysOfWeek: z.array(z.number().int().min(0).max(6)).min(1).max(7),
@@ -18,6 +20,8 @@ export const createSubscriptionPlanSchema = z.object({
   price: z.number().finite().min(0).max(99_999_999.99),
   durationDays: z.number().int().positive().max(3650),
   benefits: benefitsSchema.strict(),
+  /** From POST /uploads/images; null removes it. */
+  badgeUrl: uploadedImageUrlSchema.optional(),
 });
 export type CreateSubscriptionPlanDto = z.infer<
   typeof createSubscriptionPlanSchema

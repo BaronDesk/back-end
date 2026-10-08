@@ -6,6 +6,7 @@ import { Prisma, type UserRole } from '../../../generated/prisma/index.js';
 import { RefreshTokenRepository } from '../repository/refresh-token.repository.js';
 import { UsersRepository } from '../repository/users.repository.js';
 import { AuditLogService } from '../../../common/audit/audit-log.service.js';
+import { ImagesService } from '../../uploads/services/images.service.js';
 import type { CreateEmployeeDto, CreateGamerDto, ListUsersQuery, UpdateRoleDto } from '../schemas/users.schemas.js';
 import { toPublicUser } from '../util/public-user.js';
 import { PasswordService } from './password.service.js';
@@ -27,6 +28,7 @@ export class UsersService {
     private readonly passwords: PasswordService,
     private readonly refreshTokens: RefreshTokenRepository,
     private readonly audit: AuditLogService,
+    private readonly images: ImagesService,
   ) {}
 
   /** Sign-up: every gamer picks the branch they play at. */
@@ -47,6 +49,36 @@ export class UsersService {
     }
     await this.assertBranchExists(branchId);
     return toPublicUser(await this.usersRepo.setHomeBranch(caller.sub, branchId));
+  }
+
+  /** A gamer's profile picture: stored as a 256×256 WebP, the previous one deleted. */
+  async setAvatar(caller: AccessTokenPayload, picture: Buffer) {
+    const before = await this.requireGamer(caller);
+    const url = await this.images.save(picture, 'avatar');
+    try {
+      const user = await this.usersRepo.setAvatar(caller.sub, url);
+      await this.images.release(before);
+      return toPublicUser(user);
+    } catch (error) {
+      await this.images.release(url);
+      throw error;
+    }
+  }
+
+  async removeAvatar(caller: AccessTokenPayload) {
+    const before = await this.requireGamer(caller);
+    const user = await this.usersRepo.setAvatar(caller.sub, null);
+    await this.images.release(before);
+    return toPublicUser(user);
+  }
+
+  /** The caller's current avatar link; 403 NOT_A_GAMER for staff (only gamers have a profile picture). */
+  private async requireGamer(caller: AccessTokenPayload): Promise<string | null> {
+    const user = await this.usersRepo.findById(caller.sub);
+    if (!user?.gamerProfile) {
+      throw new ForbiddenException({ code: 'NOT_A_GAMER', error: 'only gamers have a profile picture' });
+    }
+    return user.gamerProfile.avatarUrl;
   }
 
   /**

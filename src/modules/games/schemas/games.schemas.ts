@@ -1,5 +1,7 @@
 import { z } from 'zod';
 
+import { uploadedImageUrlSchema } from '../../uploads/schemas/image-url.schema.js';
+
 /**
  * Limits mirror the agent's GameCatalogValidator: an entry the agent would
  * reject is refused here instead of being served and reported back as
@@ -48,7 +50,8 @@ export const createGameSchema = z.object({
   name: z.string().trim().min(1).max(MAX_NAME).regex(NO_CONTROL_CHARS),
   ...launchFields,
   launchType: launchFields.launchType.default('exe'),
-  iconUrl: z.string().url().max(2048).nullable().optional(),
+  /** From POST /uploads/images; null removes it. */
+  iconUrl: uploadedImageUrlSchema.optional(),
   enabled: z.boolean().default(true),
   sortOrder: z.number().int().default(0),
 });
@@ -59,7 +62,7 @@ export const updateGameSchema = z
     gameId: wireGameIdSchema,
     name: z.string().trim().min(1).max(MAX_NAME).regex(NO_CONTROL_CHARS),
     ...launchFields,
-    iconUrl: z.string().url().max(2048).nullable(),
+    iconUrl: uploadedImageUrlSchema,
     enabled: z.boolean(),
     sortOrder: z.number().int(),
   })

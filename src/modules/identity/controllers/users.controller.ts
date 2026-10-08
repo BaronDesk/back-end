@@ -1,5 +1,7 @@
-import { Body, Controller, Get, HttpCode, Param, Patch, Post, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Put, Query, Req } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { ApiBody, ApiConsumes } from '@nestjs/swagger';
+import type { FastifyRequest } from 'fastify';
 
 import { ClientIp } from '../../../common/decorators/client-ip.decorator.js';
 import { CurrentUser } from '../../../common/decorators/current-user.decorator.js';
@@ -28,6 +30,8 @@ import {
   type UpdateRoleDto,
   type UpdateStatusDto,
 } from '../schemas/users.schemas.js';
+import { IMAGE_UPLOAD_BODY } from '../../uploads/controllers/uploads.controller.js';
+import { readUpload } from '../../uploads/util/read-upload.js';
 import { UsersService } from '../services/users.service.js';
 
 @Controller()
@@ -93,6 +97,21 @@ export class UsersController {
     @Body(new ZodValidationPipe(homeBranchSchema)) dto: HomeBranchDto,
   ) {
     return this.users.setHomeBranch(caller, dto.branchId);
+  }
+
+  /** A gamer's profile picture (PNG, JPEG or WebP, at most 2 MB), cropped to a 256×256 square. */
+  @RequireScope('self')
+  @Put('users/me/avatar')
+  @ApiConsumes('multipart/form-data')
+  @ApiBody(IMAGE_UPLOAD_BODY)
+  async setAvatar(@CurrentUser() caller: AccessTokenPayload, @Req() req: FastifyRequest) {
+    return this.users.setAvatar(caller, await readUpload(req));
+  }
+
+  @RequireScope('self')
+  @Delete('users/me/avatar')
+  removeAvatar(@CurrentUser() caller: AccessTokenPayload) {
+    return this.users.removeAvatar(caller);
   }
 
   /** New password for someone who lost theirs: HQ anyone, a manager their branch's employees and gamers. */

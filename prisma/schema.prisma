@@ -246,6 +246,8 @@ model GamerProfile {
   level  Int    @default(1) 
   // The branch the gamer plays at: the booking page lists its stations. Changeable in settings.
   homeBranchId String? @map("home_branch_id") @db.Uuid
+  // /uploads/avatars/<uuid>.webp, set by PUT /users/me/avatar. The file lives in UPLOAD_DIR.
+  avatarUrl String? @map("avatar_url")
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
 
@@ -620,6 +622,8 @@ model MembershipPlan {
   durationDays       Int     @map("duration_days")
   discountPercent    Decimal @map("discount_percent") @db.Decimal(5, 2)
   bookingAdvanceDays Int     @map("booking_advance_days") @default(7)
+  // /uploads/images/<uuid>.webp (POST /uploads/images). The file lives in UPLOAD_DIR.
+  badgeUrl           String? @map("badge_url")
   createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz
   updatedAt          DateTime @updatedAt @map("updated_at") @db.Timestamptz
 
@@ -664,6 +668,8 @@ model SubscriptionPlan {
   price        Decimal @db.Decimal(10, 2)
   durationDays Int     @map("duration_days")
   benefits     Json    @default("{}")
+  // /uploads/images/<uuid>.webp (POST /uploads/images). The file lives in UPLOAD_DIR.
+  badgeUrl     String? @map("badge_url")
   createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
   updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz
 
@@ -695,6 +701,22 @@ model Subscription {
   @@index([endDate])
   @@unique([gamerProfileId, idempotencyKey])
   @@map("subscriptions")
+}
+
+// --- Gamer ranks ---
+
+// Wood, Bronze, … GrandMaster, editable by admins. A gamer's rank is the
+// highest one whose minXp is at or below GamerProfile.xp (computed, not stored).
+model Rank {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String   @unique
+  minXp     Int      @unique @map("min_xp")
+  // /uploads/images/<uuid>.webp (POST /uploads/images). The file lives in UPLOAD_DIR.
+  badgeUrl  String?  @map("badge_url")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@map("ranks")
 }
 
 // --- Audit & Logging ---

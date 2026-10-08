@@ -23,8 +23,13 @@ const publicUser = {
   branchId: null,
   gamerProfileId: GAMER_ID,
   homeBranchId: BRANCH_ID,
+  avatarUrl: null,
   createdAt: '2026-05-20T09:30:00.000Z',
 };
+
+const BADGE_URL = '/uploads/images/9b3e5f71-2c8d-4a06-b4e9-5d1a7c0f2e68.webp';
+const AVATAR_URL = '/uploads/avatars/6d2a8e14-73fb-4c95-a0d8-1e4b9f5c3a27.webp';
+const rank = { id: 'f1a7c3e9-5b2d-4806-9e4f-a3c1d7b5e290', name: 'Gold', minXp: 4000, badgeUrl: BADGE_URL, createdAt: '2026-05-20T09:30:00.000Z', updatedAt: '2026-05-20T09:30:00.000Z' };
 
 const reservation = {
   id: RESERVATION_ID,
@@ -69,6 +74,14 @@ export const RESPONSE_EXAMPLES: Record<string, ResponseExample> = {
   AuthController_me: { body: publicUser },
 
   UsersController_createGamer: { description: 'Gamer account created', body: publicUser },
+  UsersController_setAvatar: { description: 'The gamer, with the new picture', body: { ...publicUser, avatarUrl: AVATAR_URL } },
+  UsersController_removeAvatar: { body: publicUser },
+
+  UploadsController_uploadImage: { description: 'Stored; save this link as a badgeUrl or iconUrl', body: { url: BADGE_URL } },
+  RanksController_list: { body: [{ ...rank, name: 'Wood', minXp: 0 }, rank] },
+  RanksController_create: { body: rank },
+  RanksController_update: { body: rank },
+  RanksController_remove: { body: { id: rank.id, deleted: true } },
 
   ReservationsController_list: { body: [{ ...reservation, pin: null }] },
   ReservationsController_create: {

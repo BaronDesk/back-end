@@ -13,6 +13,7 @@ import { dinarsToMillimes } from '../../../common/utils/money.js';
 import { WalletService } from '../../wallet/services/wallet.service.js';
 import { MembershipRepository } from '../repository/membership.repository.js';
 import { AuditLogService } from '../../../common/audit/audit-log.service.js';
+import { ImagesService } from '../../uploads/services/images.service.js';
 import type {
   CreateMembershipPlanDto,
   PurchaseMembershipDto,
@@ -49,6 +50,7 @@ export class MembershipService {
     private readonly memberships: MembershipRepository,
     private readonly wallet: WalletService,
     private readonly audit: AuditLogService,
+    private readonly images: ImagesService,
   ) {}
 
   listPlans() {
@@ -74,10 +76,12 @@ export class MembershipService {
 
   async updatePlan(caller: AccessTokenPayload, id: string, dto: UpdateMembershipPlanDto) {
     try {
+      const before = await this.memberships.findPlan(id);
       const updated = await this.memberships.updatePlan(id, dto);
       await this.audit.record(caller.sub, 'UPDATE', `membership-plan:${id}`, {
         metadata: { event: 'PLAN_UPDATED', fields: Object.keys(dto) },
        });
+      await this.images.release(before?.badgeUrl);
       return updated;
     } catch (error) {
       this.translatePlanError(error);
@@ -86,7 +90,9 @@ export class MembershipService {
 
   async deletePlan(id: string) {
     try {
-      return await this.memberships.deletePlan(id);
+      const deleted = await this.memberships.deletePlan(id);
+      await this.images.release(deleted.badgeUrl);
+      return deleted;
     } catch (error) {
       this.translatePlanError(error);
     }

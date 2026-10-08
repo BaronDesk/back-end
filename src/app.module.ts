@@ -24,6 +24,8 @@ import { SessionBillingModule } from './modules/session-billing/session-billing.
 import { ReservationsModule } from './modules/reservations/reservations.module.js';
 import { BranchesModule } from './modules/branches/branches.module.js';
 import { AuditLogModule } from './common/audit/audit-log.module.js';
+import { UploadsModule } from './modules/uploads/uploads.module.js';
+import { RanksModule } from './modules/ranks/ranks.module.js';
 
 
 @Module({
@@ -31,6 +33,7 @@ import { AuditLogModule } from './common/audit/audit-log.module.js';
     AppConfigModule,
     PrismaModule,
     AuditLogModule,
+    UploadsModule,
     RedisModule,
     QueueModule,
     IdentityModule,
@@ -44,6 +47,7 @@ import { AuditLogModule } from './common/audit/audit-log.module.js';
     SubscriptionsModule,
     ReservationsModule,
     BranchesModule,
+    RanksModule,
     SessionBillingModule,
     HealthModule,
   ],

@@ -11,6 +11,7 @@ import { Prisma } from '../../../generated/prisma/index.js';
 
 import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
 import { dinarsToMillimes } from '../../../common/utils/money.js';
+import { ImagesService } from '../../uploads/services/images.service.js';
 import { WalletService } from '../../wallet/services/wallet.service.js';
 import { SubscriptionsRepository } from '../repository/subscriptions.repository.js';
 import {
@@ -33,6 +34,7 @@ export class SubscriptionsService {
     private readonly subscriptions: SubscriptionsRepository,
     private readonly wallet: WalletService,
     config: ConfigService,
+    private readonly images: ImagesService,
   ) {
     this.timeZone = config.get<string>('BUSINESS_TIMEZONE') ?? 'Africa/Tunis';
   }
@@ -51,7 +53,10 @@ export class SubscriptionsService {
 
   async updatePlan(id: string, dto: UpdateSubscriptionPlanDto) {
     try {
-      return await this.subscriptions.updatePlan(id, dto);
+      const before = await this.subscriptions.findPlan(id);
+      const updated = await this.subscriptions.updatePlan(id, dto);
+      await this.images.release(before?.badgeUrl);
+      return updated;
     } catch (error) {
       this.translatePlanError(error);
     }
@@ -59,7 +64,9 @@ export class SubscriptionsService {
 
   async deletePlan(id: string) {
     try {
-      return await this.subscriptions.deletePlan(id);
+      const deleted = await this.subscriptions.deletePlan(id);
+      await this.images.release(deleted.badgeUrl);
+      return deleted;
     } catch (error) {
       this.translatePlanError(error);
     }

@@ -1,3 +1,6 @@
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+
 import { defineConfig } from 'vitest/config';
 import swc from 'unplugin-swc';
 
@@ -28,6 +31,8 @@ export default defineConfig({
       // sign-up limit (30 an hour, counted in Redis across runs) would refuse them.
       RATE_LIMIT_SIGNUPS_PER_HOUR: '100000',
       RATE_LIMIT_REFRESHES_PER_MINUTE: '100000',
+      // Uploaded test images go to a temp folder, not to the dev server's uploads.
+      UPLOAD_DIR: path.join(tmpdir(), 'cstam-e2e-uploads'),
     },
   },
   plugins: [swc.vite()],
