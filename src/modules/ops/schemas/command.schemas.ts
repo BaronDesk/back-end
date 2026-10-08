@@ -2,7 +2,7 @@ import { z } from 'zod';
 
 import { AGENT_COMMANDS } from '../../../infra/realtime/constants.js';
 
-/** The commands staff can issue. POLICY_UPDATE comes later. */
+/** The commands staff can issue. */
 export const STATION_COMMAND_TYPES = [
   AGENT_COMMANDS.LOCK,
   AGENT_COMMANDS.UNLOCK,
@@ -10,6 +10,7 @@ export const STATION_COMMAND_TYPES = [
   AGENT_COMMANDS.LAUNCH_GAME,
   AGENT_COMMANDS.END_SESSION,
   AGENT_COMMANDS.CATALOG_UPDATE,
+  AGENT_COMMANDS.POLICY_UPDATE,
 ] as const;
 export type StationCommandType = (typeof STATION_COMMAND_TYPES)[number];
 
@@ -124,3 +125,13 @@ export interface CommandJobData {
   payload?: CommandPayload;
   simulate?: CommandSimulation;
 }
+
+export const policyUpdatePayloadSchema = z.object({
+  alertThresholds: z.object({
+    cpuTempC: z.number().positive().optional(),
+    gpuTempC: z.number().positive().optional()
+  }).optional(),
+  telemetryCadenceSeconds: z.number().int().positive().optional(),
+  usbDebounceMs: z.number().int().positive().optional(),
+}).strict();
+export type PolicyUpdatePayload = z.infer<typeof policyUpdatePayloadSchema>;

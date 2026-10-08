@@ -95,6 +95,7 @@ enum CommandType {
   LAUNCH_GAME
   END_SESSION
   CATALOG_UPDATE
+  POLICY_UPDATE
 }
 
 // How the agent starts a catalog entry (GameLaunchTypes on the agent). The
@@ -150,6 +151,7 @@ model Branch {
   location String
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  stationPolicy Json? @map("station_policy")
 
   pricing           Pricing[]
   employeeProfiles  EmployeeProfile[]
@@ -318,6 +320,7 @@ model Machine {
   peripheralsReportedAt DateTime?          @map("peripherals_reported_at") @db.Timestamptz
   createdAt        DateTime                @default(now()) @map("created_at") @db.Timestamptz
   updatedAt        DateTime                @updatedAt @map("updated_at") @db.Timestamptz
+  policy           Json?
 
   branch          Branch           @relation(fields: [branchId], references: [id], onDelete: Cascade)
   machineGames    MachineGame[]
