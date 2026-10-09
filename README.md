@@ -110,7 +110,7 @@ Docker Compose reads `.env` when it creates a container. After editing it, run `
 
 ## Seed data
 
-`npm run db:seed` fills the database (safe to run again). It creates 2 branches with machines and pricing, 6 games, membership and subscription plans, the 7 ranks (Wood → GrandMaster), the Graphic-Charter badges of the tiers, passes and ranks (from `prisma/seed-assets/badges`, written to `UPLOAD_DIR`; a badge already set is kept), 2 managers, 4 employees and 10 gamers (one per XP tier), plus reservations and sessions in every status. All seeded accounts use the password `password123`. Usernames include `gamer.gold`, `gamer.silver`, `gamer.newbie`; see the header of [prisma/seed.ts](prisma/seed.ts) for the full list.
+`npm run db:seed` fills the database (safe to run again). It creates the price list (4000 coins/h walk-in and booked), 2 branches with machines, 6 games, membership and subscription plans, the 7 ranks (Wood → GrandMaster), the Graphic-Charter badges of the tiers, passes and ranks (from `prisma/seed-assets/badges`, written to `UPLOAD_DIR`; a badge already set is kept), 2 managers, 4 employees and 10 gamers (one per XP tier), plus reservations and sessions in every status. All seeded accounts use the password `password123`. Usernames include `gamer.gold`, `gamer.silver`, `gamer.newbie`; see the header of [prisma/seed.ts](prisma/seed.ts) for the full list.
 
 ## Without Docker
 
@@ -171,6 +171,20 @@ docker compose up -d --build     # base file only: target `runtime`, NODE_ENV=pr
 * The base compose file also runs a `cloudflared` quick tunnel to Caddy's plain `:80` listener. Remove that service if you do not use it.
 * Stopping `backend` is graceful (20 s) so BullMQ finishes in-flight jobs and Prisma disconnects.
 * Run only one backend instance: the agent registry is in memory.
+
+## Money
+
+The platform counts in **coins**, whole numbers, so it works in any country: each deployment decides what a coin is worth (in Tunisia 1000 coins = 1 DT). Wallets, the ledger, plan prices and session bills are all coins.
+
+| route | who | what |
+|:---|:---|:---|
+| `GET /pricing` | anyone signed in | `{ paygRate, bookingRate, updatedAt }`, coins per hour, the same in every branch |
+| `PUT /pricing` | HQ admin | sets both rates (audited) |
+
+* `paygRate` is Play now (walk-in), `bookingRate` a booking made ahead. A membership tier's discount or a pass's time window discount takes the better of the two (they don't stack).
+* Play is billed after the fact, by the second at the hourly rate: 4000 coins/h is 1000 coins for 15 minutes and exactly 4000 for an hour. Bookings and walk-ins can be any number of minutes (handy for testing).
+* A booking or walk-in is refused when the wallet can't cover it on top of what is already promised; the station locks when the money runs out, and a top-up unlocks it.
+* Plan prices (`price` of tiers and passes) are coins too, taken from the wallet when bought.
 
 ## Images
 

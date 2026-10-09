@@ -21,7 +21,7 @@ describe('MembershipService.purchase', () => {
   };
   const plan = {
     id: 'plan-1',
-    price: new Prisma.Decimal('12.50'),
+    price: 12500,
     durationDays: 30,
     discountPercent: new Prisma.Decimal('10'),
   };
@@ -84,7 +84,7 @@ describe('MembershipService.purchase', () => {
     repository.findActiveForGamer.mockResolvedValue({
       id: 'membership-0',
       endDate: new Date(Date.now() + 10 * 86_400_000),
-      membershipPlan: { price: new Prisma.Decimal('12.50'), durationDays: 30 },
+      membershipPlan: { price: 12500, durationDays: 30 },
     });
 
     await expect(service.purchase(caller, 'plan-1', {})).rejects.toMatchObject({
@@ -99,11 +99,11 @@ describe('MembershipService.purchase', () => {
     repository.findActiveForGamer.mockResolvedValue({
       id: 'membership-0',
       endDate,
-      membershipPlan: { price: new Prisma.Decimal('10'), durationDays: 30 },
+      membershipPlan: { price: 10000, durationDays: 30 },
     });
     repository.setStatus = vi.fn().mockResolvedValue({});
     await service.purchase(caller, 'plan-1', { idempotencyKey: 'up-1' });
-    // 12.50 DT new, 15 of 30 days left of a 10 DT tier = 5 DT credit.
+    // 12500 coins new, 15 of 30 days left of a 10000-coin tier = 5000 coins credit.
     expect(wallet.debit).toHaveBeenCalledWith('gamer-1', expect.objectContaining({ amount: 7500 }));
     expect(repository.setStatus).toHaveBeenCalledWith('membership-0', 'CANCELLED');
     expect(repository.create).toHaveBeenCalled();
@@ -167,7 +167,7 @@ describe('MembershipService.purchase', () => {
   });
 
   it('skips the wallet entirely for a free plan', async () => {
-    repository.findPlan.mockResolvedValue({ ...plan, price: new Prisma.Decimal(0) });
+    repository.findPlan.mockResolvedValue({ ...plan, price: 0 });
 
     await service.purchase(caller, 'plan-1', {});
 

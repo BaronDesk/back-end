@@ -2,14 +2,15 @@ import { z } from 'zod';
 
 import { uploadedImageUrlSchema } from '../../uploads/schemas/image-url.schema.js';
 
-const moneySchema = z.number().finite().min(0).max(99_999_999.99);
+/** Whole coins. */
+const coinsSchema = z.number().int().min(0).max(2_000_000_000);
 
 export const idParamSchema = z.string().uuid();
 export const planIdParamSchema = z.string().uuid();
 
 export const createMembershipPlanSchema = z.object({
   name: z.string().trim().min(1).max(100),
-  price: moneySchema,
+  price: coinsSchema,
   durationDays: z.number().int().positive().max(3650),
   discountPercent: z.number().min(0).max(100),
   bookingAdvanceDays: z.number().int().min(0).max(365).default(7),

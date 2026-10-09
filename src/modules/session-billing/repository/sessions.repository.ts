@@ -14,7 +14,7 @@ export interface CreateSessionInput {
   appliedMembershipId: string | null;
   startTime: Date;
   endTime: Date;
-  rateCentsPerMinute: number;
+  rateCoinsPerHour: number;
   pinHash: string;
   /** The PIN sealed by PinVault, so the gamer's app can show it again. */
   pinCipher: string;

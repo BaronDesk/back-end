@@ -1,45 +1,29 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 
-import { assertScope } from '../../../common/utils/assert-scope.js';
-import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
-import { Prisma } from '../../../generated/prisma/index.js';
 import { PricingRepository } from '../repository/pricing.repository.js';
 import type { UpsertPricingDto } from '../schemas/pricing.schemas.js';
 import { toPublicPricing } from '../util/public-pricing.js';
+
+const notSet = () => new NotFoundException({ code: 'PRICING_NOT_SET', error: 'no pricing configured yet' });
 
 @Injectable()
 export class PricingService {
   constructor(private readonly pricing: PricingRepository) {}
 
-  async getForBranch(branchId: string, caller: AccessTokenPayload) {
-    assertScope(caller, { branchId });
-
-    const row = await this.pricing.findByBranchId(branchId);
-    if (!row) {
-      throw new NotFoundException({ code: 'PRICING_NOT_SET', error: 'no pricing configured for this branch' });
-    }
+  async get() {
+    const row = await this.pricing.find();
+    if (!row) throw notSet();
     return toPublicPricing(row);
   }
 
-  async upsertForBranch(branchId: string, dto: UpsertPricingDto, caller: AccessTokenPayload) {
-    assertScope(caller, { branchId });
-
-    try {
-      const row = await this.pricing.upsertForBranch({ branchId, ...dto });
-      return toPublicPricing(row);
-    } catch (err) {
-      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2003') {
-        throw new NotFoundException({ code: 'BRANCH_NOT_FOUND', error: 'branch not found' });
-      }
-      throw err;
-    }
+  async upsert(dto: UpsertPricingDto) {
+    return toPublicPricing(await this.pricing.upsert(dto));
   }
 
-  /** Internal, caller-free accessor for other modules that already resolved their own scope (e.g. session-billing pricing a session). */
-  async getRatesForBranch(branchId: string) {
-    const row = await this.pricing.findByBranchId(branchId);
-    if (!row) throw new NotFoundException({ code: 'PRICING_NOT_SET', error: 'no pricing configured for this branch' });
+  /** The rates alone, for session-billing pricing a session. */
+  async getRates() {
+    const row = await this.pricing.find();
+    if (!row) throw notSet();
     return { paygRate: row.paygRate, bookingRate: row.bookingRate };
   }
-
 }

@@ -36,7 +36,7 @@ describe('WalletService', () => {
     repo.postEntry.mockResolvedValue(entry);
     const debited = vi.fn();
     service.debited.subscribe(debited);
-    service.setReserveProvider(async () => 4500); // the session in progress used 4.5 DT of the 5 DT
+    service.setReserveProvider(async () => 4500); // the session in progress used 4500 of the 5000 coins
 
     await expect(service.debit('gamer-1', { amount: 1000 })).rejects.toMatchObject({ response: { code: 'INSUFFICIENT_FUNDS' } });
     expect(repo.postEntry).not.toHaveBeenCalled();

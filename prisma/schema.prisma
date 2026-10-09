@@ -153,7 +153,6 @@ model Branch {
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
   stationPolicy Json? @map("station_policy")
 
-  pricing           Pricing[]
   employeeProfiles  EmployeeProfile[]
   machines          Machine[]
   telemetryAlerts   TelemetryAlert[]
@@ -167,17 +166,18 @@ model Branch {
   @@map("branches")
 }
 
+// --- Money ---
+// The platform's money is coins: every money column is whole coins (Int).
+// What a coin is worth is the deployment's business (in Tunisia 1000 coins = 1 DT).
+
+// The play prices of every branch, in coins per hour: a single row (id 1).
 model Pricing {
-  id           String   @id @default(uuid()) @db.Uuid
-  branchId     String   @map("branch_id") @db.Uuid
+  id           Int      @id @default(1)
   paygRate     Int      @map("payg_rate")
   bookingRate  Int      @map("booking_rate")
   createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
   updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz
 
-  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
-
-  @@index([branchId])
   @@map("pricing")
 }
 
@@ -581,11 +581,11 @@ model Session {
   lockReason          String?       @map("lock_reason")
   meteringStartedAt   DateTime?     @map("metering_started_at") @db.Timestamptz
   meteredSeconds      Int           @default(0) @map("metered_seconds")
-  rateCentsPerMinute  Int?          @map("rate_cents_per_minute")
+  rateCoinsPerHour    Int?          @map("rate_coins_per_hour")
   // Time already costed at an earlier rate, folded in when an extension's rate switch comes due.
-  accruedCents        Int           @default(0) @map("accrued_cents")
-  // An extension at another rate: from rateSwitchAt (the old end) the session bills nextRateCentsPerMinute.
-  nextRateCentsPerMinute Int?       @map("next_rate_cents_per_minute")
+  accruedCoins        Int           @default(0) @map("accrued_coins")
+  // An extension at another rate: from rateSwitchAt (the old end) the session bills nextRateCoinsPerHour.
+  nextRateCoinsPerHour Int?         @map("next_rate_coins_per_hour")
   rateSwitchAt        DateTime?     @map("rate_switch_at") @db.Timestamptz
   // When the "time left" notice for the current end went out (reset by an extension).
   endingNoticeSentAt  DateTime?     @map("ending_notice_sent_at") @db.Timestamptz
@@ -618,7 +618,8 @@ model Session {
 model MembershipPlan {
   id                 String  @id @default(uuid()) @db.Uuid
   name               String  @unique
-  price              Decimal @db.Decimal(10, 2)
+  // coins
+  price              Int
   durationDays       Int     @map("duration_days")
   discountPercent    Decimal @map("discount_percent") @db.Decimal(5, 2)
   bookingAdvanceDays Int     @map("booking_advance_days") @default(7)
@@ -665,7 +666,8 @@ model Membership {
 model SubscriptionPlan {
   id           String  @id @default(uuid()) @db.Uuid
   name         String  @unique
-  price        Decimal @db.Decimal(10, 2)
+  // coins
+  price        Int
   durationDays Int     @map("duration_days")
   benefits     Json    @default("{}")
   // /uploads/images/<uuid>.webp (POST /uploads/images). The file lives in UPLOAD_DIR.

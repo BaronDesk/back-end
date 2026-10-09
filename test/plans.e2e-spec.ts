@@ -61,7 +61,7 @@ describe('membership + subscription purchase (e2e)', () => {
       method: 'POST',
       url: '/membership-plans',
       headers: as(adminToken),
-      payload: { name: `gold-${suffix}`, price: 10, durationDays: 30, discountPercent: 15 },
+      payload: { name: `gold-${suffix}`, price: 10_000, durationDays: 30, discountPercent: 15 },
     });
     expect(membershipPlan.statusCode).toBe(201);
     membershipPlanId = membershipPlan.json().id;
@@ -70,7 +70,7 @@ describe('membership + subscription purchase (e2e)', () => {
       method: 'POST',
       url: '/subscription-plans',
       headers: as(adminToken),
-      payload: { name: `nights-${suffix}`, price: 5, durationDays: 7, benefits: { windows: [] } },
+      payload: { name: `nights-${suffix}`, price: 5_000, durationDays: 7, benefits: { windows: [] } },
     });
     expect(subscriptionPlan.statusCode).toBe(201);
     subscriptionPlanId = subscriptionPlan.json().id;
@@ -79,7 +79,7 @@ describe('membership + subscription purchase (e2e)', () => {
       method: 'POST',
       url: `/wallets/${gamerProfileId}/credit`,
       headers: as(adminToken),
-      payload: { amount: 50_000 }, // 50 DT
+      payload: { amount: 50_000 }, // coins
     });
   }, 30_000);
 
@@ -104,7 +104,7 @@ describe('membership + subscription purchase (e2e)', () => {
 
     const first = await purchase();
     expect(first.statusCode).toBe(201);
-    expect(await balance()).toBe(40_000); // a 10 DT plan costs 10 000 millimes
+    expect(await balance()).toBe(40_000); // a 10 000-coin plan
 
     const replay = await purchase();
     expect(replay.statusCode).toBe(201);
@@ -167,7 +167,7 @@ describe('membership + subscription purchase (e2e)', () => {
       method: 'POST',
       url: '/subscription-plans',
       headers: as(adminToken),
-      payload: { name: `weekends-${suffix}`, price: 5, durationDays: 7, benefits: { windows: [] } },
+      payload: { name: `weekends-${suffix}`, price: 5_000, durationDays: 7, benefits: { windows: [] } },
     });
     otherSubscriptionPlanId = other.json().id;
 

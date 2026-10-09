@@ -22,7 +22,7 @@ Trying a request:
 Conventions:
 
 * Errors always have the shape `{ error, code, issues? }`.
-* Money is an integer in the smallest unit (millimes: 1 dt = 1000).
+* Money is whole coins, the platform's own unit (in Tunisia 1000 coins = 1 DT). Play prices are coins per hour, the same in every branch (`GET /pricing`).
 * Auth is a JWT bearer token (security scheme `bearer`).
 
 ## 2. Static docs (no backend needed)

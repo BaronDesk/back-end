@@ -33,10 +33,10 @@ function reservation(overrides: Record<string, unknown> = {}) {
 function sessionRow(overrides: Record<string, unknown> = {}) {
   return {
     id: 's1', reservationId: 'res-1', appliedMembershipId: null, status: 'PENDING',
-    rateCentsPerMinute: 100, meteredSeconds: 0, meteringStartedAt: null, lockedAt: null,
+    rateCoinsPerHour: 6000, meteredSeconds: 0, meteringStartedAt: null, lockedAt: null,
     settledAt: null, billingBreakdown: null, createdAt: new Date(),
     pinHash: null, pinExpiresAt: null, pinUsedAt: null, pinAttempts: 0,
-    accruedCents: 0, nextRateCentsPerMinute: null, rateSwitchAt: null, endingNoticeSentAt: null, lockReason: null,
+    accruedCoins: 0, nextRateCoinsPerHour: null, rateSwitchAt: null, endingNoticeSentAt: null, lockReason: null,
     ...window(),
     reservation: { gamerProfileId: 'g1', machineId: 'm1', isWalkIn: true, machine: { id: 'm1', branchId: 'b1', serialNumber: 'SN-1' } },
     ...overrides,
@@ -52,7 +52,7 @@ describe('SessionsService', () => {
   let presence: Record<string, any>;
   let agents: { sendControl: ReturnType<typeof vi.fn> };
   let dashboard: { publishToBranch: ReturnType<typeof vi.fn>; publishToUser: ReturnType<typeof vi.fn> };
-  let pricing: { getRatesForBranch: ReturnType<typeof vi.fn> };
+  let pricing: { getRates: ReturnType<typeof vi.fn> };
   let membership: { getActiveDiscountForGamer: ReturnType<typeof vi.fn> };
   let subscriptions: { getWindowDiscountForGamer: ReturnType<typeof vi.fn> };
   let wallet: Record<string, any>;
@@ -105,7 +105,7 @@ describe('SessionsService', () => {
     };
     agents = { sendControl: vi.fn(() => true) };
     dashboard = { publishToBranch: vi.fn(), publishToUser: vi.fn() };
-    pricing = { getRatesForBranch: vi.fn(async () => ({ paygRate: 6000, bookingRate: 9000 })) }; // 6000c/hr = 100c/min
+    pricing = { getRates: vi.fn(async () => ({ paygRate: 6000, bookingRate: 9000 })) }; // coins per hour: 100/min walk-in, 150/min booked
     membership = { getActiveDiscountForGamer: vi.fn(async () => null) };
     subscriptions = { getWindowDiscountForGamer: vi.fn(async () => null) };
     wallet = {
@@ -147,7 +147,7 @@ describe('SessionsService', () => {
       expect(result.pin).toMatch(/^\d{6}$/);
 
       const data = repo.create.mock.calls[0][0];
-      expect(data).toMatchObject({ reservationId: 'res-1', rateCentsPerMinute: 100, appliedMembershipId: null });
+      expect(data).toMatchObject({ reservationId: 'res-1', rateCoinsPerHour: 6000, appliedMembershipId: null });
       expect(data.pinHash).toMatch(/^\$argon2id\$/);
       expect(data.pinHash).not.toContain(result.pin);
       expect(JSON.stringify(result)).not.toContain(data.pinHash);
@@ -171,8 +171,8 @@ describe('SessionsService', () => {
     it('applies the active membership discount to the rate', async () => {
       membership.getActiveDiscountForGamer.mockResolvedValueOnce({ membershipId: 'ms1', discountPercent: 10 });
       await service.start(caller(), 'res-1');
-      // 6000c/hr * 0.9 = 5400c/hr = 90c/min
-      expect(repo.create.mock.calls[0][0]).toMatchObject({ rateCentsPerMinute: 90, appliedMembershipId: 'ms1' });
+      // 6000 coins/h, 10% off
+      expect(repo.create.mock.calls[0][0]).toMatchObject({ rateCoinsPerHour: 5400, appliedMembershipId: 'ms1' });
     });
 
     it('404s for a missing reservation, and rejects a cross-branch caller', async () => {
@@ -435,7 +435,7 @@ describe('SessionsService', () => {
     it('settles on session end, moving the reservation to COMPLETED', async () => {
       presence.sessionEnded.next({ sessionId: 's1', endedAt: new Date().toISOString() });
       await flush();
-      // 5 minutes active at 100c/min = 500c
+      // 5 minutes active at 6000 coins/h = 500 coins
       expect(wallet.debitUpTo).toHaveBeenCalledWith('g1', expect.objectContaining({ amount: 500, sessionId: 's1' }));
       expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED', meteredSeconds: 300 }));
     });
@@ -496,19 +496,19 @@ describe('SessionsService', () => {
     it('bills a booking made ahead at the booking rate, Play now at the walk-in rate', async () => {
       repo.findReservationForStart.mockResolvedValueOnce(reservation({ isWalkIn: false }));
       await service.start(caller(), 'res-1');
-      expect(repo.create.mock.calls[0][0].rateCentsPerMinute).toBe(150); // 9000/hr booking rate
+      expect(repo.create.mock.calls[0][0].rateCoinsPerHour).toBe(9000); // the booking rate
     });
 
     it('applies the better of the membership and pass discounts, without stacking them', async () => {
       membership.getActiveDiscountForGamer.mockResolvedValue({ membershipId: 'ms1', discountPercent: 10 });
       subscriptions.getWindowDiscountForGamer.mockResolvedValueOnce({ subscriptionId: 'sub1', discountPercent: 100 });
       await service.start(caller(), 'res-1');
-      expect(repo.create.mock.calls[0][0]).toMatchObject({ rateCentsPerMinute: 0, appliedMembershipId: null });
+      expect(repo.create.mock.calls[0][0]).toMatchObject({ rateCoinsPerHour: 0, appliedMembershipId: null });
 
       subscriptions.getWindowDiscountForGamer.mockResolvedValueOnce({ subscriptionId: 'sub1', discountPercent: 5 });
       repo.findOpenForReservation.mockResolvedValueOnce(sessionRow({ id: 'old', pinExpiresAt: new Date(Date.now() - 1000) }));
       await service.start(caller(), 'res-1');
-      expect(repo.create.mock.calls[1][0]).toMatchObject({ rateCentsPerMinute: 90, appliedMembershipId: 'ms1' });
+      expect(repo.create.mock.calls[1][0]).toMatchObject({ rateCoinsPerHour: 5400, appliedMembershipId: 'ms1' });
     });
 
     it('refuses the login, keeping the PIN, when the wallet no longer covers the minimum play time', async () => {
@@ -553,7 +553,7 @@ describe('SessionsService', () => {
       wallet.debitUpTo.mockResolvedValueOnce(320);
       presence.sessionEnded.next({ sessionId: 's1', endedAt: new Date().toISOString() });
       await vi.waitFor(() => expect(repo.complete).toHaveBeenCalled());
-      expect(repo.complete.mock.calls[0][2].billingBreakdown).toMatchObject({ totalCents: 500, chargedCents: 320, shortfallCents: 180 });
+      expect(repo.complete.mock.calls[0][2].billingBreakdown).toMatchObject({ totalCoins: 500, chargedCoins: 320, shortfallCoins: 180 });
     });
 
     it('resumes a session locked for funds once a top-up covers the minimum play time', async () => {
@@ -629,11 +629,11 @@ describe('SessionsService', () => {
         { id: 'r9', startTime: start, endTime: new Date(start.getTime() + HOUR), isWalkIn: false, machine: { branchId: 'b1' } },
       ]);
       await expect(
-        service.assertAffordable({ gamerProfileId: 'g1', branchId: 'b1', isWalkIn: true, start: new Date(), minutes: 30 }),
+        service.assertAffordable({ gamerProfileId: 'g1', isWalkIn: true, start: new Date(), minutes: 30 }),
       ).rejects.toMatchObject({ response: { code: 'INSUFFICIENT_FUNDS' } });
       await expect(
-        service.assertAffordable({ gamerProfileId: 'g1', branchId: 'b1', isWalkIn: true, start: new Date(), minutes: 10 }),
-      ).resolves.toMatchObject({ totalCents: 1000 });
+        service.assertAffordable({ gamerProfileId: 'g1', isWalkIn: true, start: new Date(), minutes: 10 }),
+      ).resolves.toMatchObject({ totalCoins: 1000 });
     });
   });
 
@@ -689,7 +689,7 @@ describe('SessionsService', () => {
 
   describe('extend', () => {
     const runningBooking = (overrides: Record<string, unknown> = {}) =>
-      sessionRow({ status: 'ACTIVE', pinUsedAt: new Date(), meteringStartedAt: new Date(), rateCentsPerMinute: 150, ...overrides });
+      sessionRow({ status: 'ACTIVE', pinUsedAt: new Date(), meteringStartedAt: new Date(), rateCoinsPerHour: 9000, ...overrides });
 
     beforeEach(() => {
       repo.findActiveForReservation.mockResolvedValue({ id: 's1' });
@@ -700,8 +700,8 @@ describe('SessionsService', () => {
       const result = await service.extend('g1', 'res-1', 30);
       const input = repo.extendIfFree.mock.calls[0][0];
       expect(input.to.getTime() - input.from.getTime()).toBe(30 * 60_000);
-      expect(input.session).toMatchObject({ nextRateCentsPerMinute: 100, rateSwitchAt: input.from, endingNoticeSentAt: null });
-      expect(result).toMatchObject({ costCents: 3000 });
+      expect(input.session).toMatchObject({ nextRateCoinsPerHour: 6000, rateSwitchAt: input.from, endingNoticeSentAt: null });
+      expect(result).toMatchObject({ costCoins: 3000 });
       expect(agents.sendControl).toHaveBeenCalledWith('SN-1', 'session_notice', expect.objectContaining({ kind: 'CLEAR' }));
     });
 
@@ -735,7 +735,7 @@ describe('SessionsService', () => {
         reservation: { id: 'res-1', machine: { id: 'm1', name: 'PC-01', serialNumber: 'SN-1', branchId: 'b1' } },
       }));
       const current = await service.currentForGamer('user-g1');
-      expect(current).toMatchObject({ sessionId: 's1', station: { name: 'PC-01' }, playedSeconds: 600, costSoFarCents: 1000, balanceAfterCents: 99_000 });
+      expect(current).toMatchObject({ sessionId: 's1', station: { name: 'PC-01' }, playedSeconds: 600, costSoFarCoins: 1000, balanceAfterCoins: 99_000 });
 
       repo.findCurrentForGamer.mockResolvedValueOnce(null);
       await expect(service.currentForGamer('user-g1')).resolves.toBeNull();
@@ -749,7 +749,7 @@ describe('SessionsService', () => {
         },
       ]);
       const [row] = await service.list(caller(), { limit: 50 });
-      expect(row).toMatchObject({ id: 's1', gamerUsername: 'ali', station: { name: 'PC-01' }, costSoFarCents: 100 });
+      expect(row).toMatchObject({ id: 's1', gamerUsername: 'ali', station: { name: 'PC-01' }, costSoFarCoins: 100 });
       expect(repo.list).toHaveBeenCalledWith(expect.objectContaining({ branchId: 'b1' }));
     });
   });

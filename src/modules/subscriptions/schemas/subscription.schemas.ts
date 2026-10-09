@@ -17,7 +17,8 @@ export const benefitsSchema = z.object({ windows: z.array(benefitWindowSchema).m
 export const idParamSchema = z.string().uuid();
 export const createSubscriptionPlanSchema = z.object({
   name: z.string().trim().min(1).max(100),
-  price: z.number().finite().min(0).max(99_999_999.99),
+  /** Whole coins. */
+  price: z.number().int().min(0).max(2_000_000_000),
   durationDays: z.number().int().positive().max(3650),
   benefits: benefitsSchema.strict(),
   /** From POST /uploads/images; null removes it. */

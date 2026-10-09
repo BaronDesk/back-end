@@ -10,7 +10,6 @@ import { ConfigService } from '@nestjs/config';
 import { Prisma } from '../../../generated/prisma/index.js';
 
 import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
-import { dinarsToMillimes } from '../../../common/utils/money.js';
 import { ImagesService } from '../../uploads/services/images.service.js';
 import { WalletService } from '../../wallet/services/wallet.service.js';
 import { SubscriptionsRepository } from '../repository/subscriptions.repository.js';
@@ -131,7 +130,7 @@ export class SubscriptionsService {
       throw new ConflictException({ code: 'SUBSCRIPTION_ALREADY_ACTIVE', error: 'gamer already has this pass' });
     }
 
-    const price = dinarsToMillimes(plan.price);
+    const price = plan.price;
     const ledgerKey = `subscription:${key ?? randomUUID()}`;
     if (price > 0) {
       await this.wallet.debit(gamerProfileId, {

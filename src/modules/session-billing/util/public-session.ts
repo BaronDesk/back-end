@@ -3,7 +3,7 @@ export interface SessionRecord {
   reservationId: string;
   appliedMembershipId: string | null;
   status: string;
-  rateCentsPerMinute: number | null;
+  rateCoinsPerHour: number | null;
   meteredSeconds: number;
   startTime: Date;
   endTime: Date;
@@ -19,7 +19,7 @@ export function toSessionDto(session: SessionRecord) {
     reservationId: session.reservationId,
     appliedMembershipId: session.appliedMembershipId,
     status: session.status,
-    rateCentsPerMinute: session.rateCentsPerMinute,
+    rateCoinsPerHour: session.rateCoinsPerHour,
     meteredSeconds: session.meteredSeconds,
     startTime: session.startTime,
     endTime: session.endTime,

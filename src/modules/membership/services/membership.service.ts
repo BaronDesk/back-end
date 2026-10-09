@@ -9,7 +9,6 @@ import {
 import { Prisma } from '../../../generated/prisma/index.js';
 
 import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
-import { dinarsToMillimes } from '../../../common/utils/money.js';
 import { WalletService } from '../../wallet/services/wallet.service.js';
 import { MembershipRepository } from '../repository/membership.repository.js';
 import { AuditLogService } from '../../../common/audit/audit-log.service.js';
@@ -26,14 +25,14 @@ const isUniqueViolation = (error: unknown) =>
 const startOfUtcDay = (date: Date) =>
   new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
 
-/** What is left of a membership's price, in millimes, by whole days remaining. */
+/** What is left of a membership's price, in coins, by whole days remaining. */
 function remainingValue(
-  membership: { endDate: Date; membershipPlan: { price: Prisma.Decimal; durationDays: number } },
+  membership: { endDate: Date; membershipPlan: { price: number; durationDays: number } },
   now: Date,
 ): number {
   const daysLeft = Math.max(Math.ceil((membership.endDate.getTime() - startOfUtcDay(now).getTime()) / 86_400_000), 0);
   const days = Math.max(membership.membershipPlan.durationDays, 1);
-  return Math.floor((dinarsToMillimes(membership.membershipPlan.price) * Math.min(daysLeft, days)) / days);
+  return Math.floor((membership.membershipPlan.price * Math.min(daysLeft, days)) / days);
 }
 
 const alreadyActive = () =>
@@ -137,13 +136,13 @@ export class MembershipService {
     await this.memberships.expireLapsed(gamerProfileId, startOfUtcDay(now));
     const current = await this.memberships.findActiveForGamer(gamerProfileId);
     // Only a dearer tier replaces the active one (an upgrade); the same or a cheaper tier waits for it to end.
-    if (current && Number(plan.price) <= Number(current.membershipPlan.price)) {
+    if (current && plan.price <= current.membershipPlan.price) {
       throw alreadyActive();
     }
 
     // An upgrade pays the new price minus what is left of the old one (by days).
     const credit = current ? remainingValue(current, now) : 0;
-    const price = Math.max(dinarsToMillimes(plan.price) - credit, 0);
+    const price = Math.max(plan.price - credit, 0);
     const ledgerKey = `membership:${key ?? randomUUID()}`;
     if (price > 0) {
       await this.wallet.debit(gamerProfileId, {

@@ -4,10 +4,12 @@ import { BaseRepository } from '../../../common/repository/base.repository.js';
 import { PrismaService } from '../../../infra/prisma/prisma.service.js';
 
 export interface UpsertPricingInput {
-  branchId: string;
   paygRate: number;
   bookingRate: number;
 }
+
+/** The pricing table holds a single row (id 1): the price list of every branch. */
+const PRICING_ID = 1;
 
 @Injectable()
 export class PricingRepository extends BaseRepository {
@@ -15,23 +17,15 @@ export class PricingRepository extends BaseRepository {
     super(prisma);
   }
 
-  findByBranchId(branchId: string) {
-    return this.prisma.pricing.findFirst({
-      where: { branchId },
-      orderBy: { updatedAt: 'desc' },
-    });
+  find() {
+    return this.prisma.pricing.findUnique({ where: { id: PRICING_ID } });
   }
 
-  async upsertForBranch(input: UpsertPricingInput) {
-    return this.prisma.$transaction(async (tx) => {
-      const existing = await tx.pricing.findFirst({ where: { branchId: input.branchId } });
-
-      const data = { paygRate: input.paygRate, bookingRate: input.bookingRate };
-
-      if (existing) {
-        return tx.pricing.update({ where: { id: existing.id }, data });
-      }
-      return tx.pricing.create({ data: { branchId: input.branchId, ...data } });
+  upsert(input: UpsertPricingInput) {
+    return this.prisma.pricing.upsert({
+      where: { id: PRICING_ID },
+      update: input,
+      create: { id: PRICING_ID, ...input },
     });
   }
 }

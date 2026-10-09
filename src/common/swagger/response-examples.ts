@@ -60,11 +60,13 @@ const walletEntry = {
   createdAt: '2026-05-31T11:45:00.000Z',
 };
 
+const pricing = { paygRate: 4000, bookingRate: 4000, updatedAt: '2026-05-31T11:45:00.000Z' };
+
 /**
  * Hand-written success bodies for the demo flow, keyed by `Controller_method`.
  * The request side comes from the Zod schemas automatically; responses are
  * plain objects returned by services, so they need an example here.
- * Amounts are in millimes/cents as stored (integers).
+ * Money is whole coins (1000 coins = 1 DT in Tunisia); rates are coins per hour.
  */
 export const RESPONSE_EXAMPLES: Record<string, ResponseExample> = {
   AuthController_login: { body: tokens },
@@ -100,4 +102,7 @@ export const RESPONSE_EXAMPLES: Record<string, ResponseExample> = {
   },
   WalletController_getMyEntries: { body: [walletEntry] },
   WalletController_credit: { description: 'Top-up recorded', body: walletEntry },
+
+  PricingController_get: { description: 'Coins per hour, the same in every branch', body: pricing },
+  PricingController_upsert: { description: 'Saved for every branch', body: pricing },
 };

@@ -27,7 +27,7 @@ import {
 } from '../../station/services/presence.service.js';
 import { WalletService } from '../../wallet/services/wallet.service.js';
 import { OPEN_SESSION_STATUSES, SessionsRepository } from '../repository/sessions.repository.js';
-import { costAt, exactCostAt, foldDueRateSwitch, msUntilSpent, rateAt, secondsBetween, type Meter } from '../util/metering.js';
+import { coinsForMinutes, costAt, exactCostAt, foldDueRateSwitch, msUntilSpent, rateAt, secondsBetween, type Meter } from '../util/metering.js';
 import { generatePin, hashPin, PinVault, verifyPin } from '../util/pin.js';
 import { toSessionDto, type SessionRecord } from '../util/public-session.js';
 
@@ -58,8 +58,8 @@ type SettlementSession = NonNullable<Awaited<ReturnType<SessionsRepository['find
 type StartableReservation = NonNullable<Awaited<ReturnType<SessionsRepository['findReservationForStart']>>>;
 
 export interface Quote {
-  centsPerMinute: number;
-  totalCents: number;
+  coinsPerHour: number;
+  totalCoins: number;
   membershipId: string | null;
 }
 
@@ -183,7 +183,7 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
     }
 
     const playStarts = new Date(Math.max(now.getTime(), reservation.startTime.getTime()));
-    const rate = await this.computeRate(reservation.machine.branchId, reservation.gamerProfileId, reservation.isWalkIn, playStarts);
+    const rate = await this.computeRate(reservation.gamerProfileId, reservation.isWalkIn, playStarts);
     const pin = generatePin();
     const pinHash = await hashPin(pin);
 
@@ -202,7 +202,7 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
           appliedMembershipId: rate.membershipId,
           startTime: reservation.startTime,
           endTime: reservation.endTime,
-          rateCentsPerMinute: rate.centsPerMinute,
+          rateCoinsPerHour: rate.coinsPerHour,
           pinHash,
           pinCipher: this.vault.seal(pin),
           pinExpiresAt: deadline,
@@ -232,9 +232,9 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
   // --- money ---------------------------------------------------------------
 
   /** What a booking of `minutes` from `start` would cost this gamer at this branch. */
-  async quote(gamerProfileId: string, branchId: string, isWalkIn: boolean, start: Date, minutes: number): Promise<Quote> {
-    const rate = await this.computeRate(branchId, gamerProfileId, isWalkIn, start);
-    return { ...rate, totalCents: rate.centsPerMinute * minutes };
+  async quote(gamerProfileId: string, isWalkIn: boolean, start: Date, minutes: number): Promise<Quote> {
+    const rate = await this.computeRate(gamerProfileId, isWalkIn, start);
+    return { ...rate, totalCoins: coinsForMinutes(rate.coinsPerHour, minutes) };
   }
 
   /**
@@ -242,17 +242,17 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
    * far plus the rest of their booked time, and every booking ahead that
    * hasn't started. A new booking or an extension must fit in what is left.
    */
-  async committedCents(gamerProfileId: string, now = new Date(), excludeReservationId?: string): Promise<number> {
+  async committedCoins(gamerProfileId: string, now = new Date(), excludeReservationId?: string): Promise<number> {
     let committed = 0;
     for (const session of await this.repo.findGrantedByGamer(gamerProfileId)) {
       const meter = session as Meter;
-      const remainingMin = Math.max((session.endTime.getTime() - now.getTime()) / 60_000, 0);
-      committed += exactCostAt(meter, now) + remainingMin * rateAt(meter, now);
+      const remainingHours = Math.max((session.endTime.getTime() - now.getTime()) / 3_600_000, 0);
+      committed += exactCostAt(meter, now) + remainingHours * rateAt(meter, now);
     }
     for (const booking of await this.repo.findUpcomingUnstarted(gamerProfileId, now, excludeReservationId)) {
       const minutes = (booking.endTime.getTime() - booking.startTime.getTime()) / 60_000;
       const start = booking.startTime > now ? booking.startTime : now;
-      committed += (await this.quote(gamerProfileId, booking.machine.branchId, booking.isWalkIn, start, minutes)).totalCents;
+      committed += (await this.quote(gamerProfileId, booking.isWalkIn, start, minutes)).totalCoins;
     }
     return Math.ceil(committed);
   }
@@ -263,20 +263,19 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
    */
   async assertAffordable(input: {
     gamerProfileId: string;
-    branchId: string;
     isWalkIn: boolean;
     start: Date;
     minutes: number;
   }): Promise<Quote> {
-    const quote = await this.quote(input.gamerProfileId, input.branchId, input.isWalkIn, input.start, input.minutes);
-    if (quote.totalCents <= 0) return quote;
+    const quote = await this.quote(input.gamerProfileId, input.isWalkIn, input.start, input.minutes);
+    if (quote.totalCoins <= 0) return quote;
     const [{ balance }, committed] = await Promise.all([
       this.wallet.getWalletForGamer(input.gamerProfileId),
-      this.committedCents(input.gamerProfileId),
+      this.committedCoins(input.gamerProfileId),
     ]);
-    if (balance - committed < quote.totalCents) {
+    if (balance - committed < quote.totalCoins) {
       throw insufficientFunds(
-        `this booking costs ${quote.totalCents} millimes; your balance leaves ${Math.max(balance - committed, 0)} after your other bookings`,
+        `this booking costs ${quote.totalCoins} coins; your balance leaves ${Math.max(balance - committed, 0)} after your other bookings`,
       );
     }
     return quote;
@@ -290,11 +289,11 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
   }
 
   /** Free play always does; paid play needs the balance for the minimum play time (at least a minute). */
-  private async coversMinimumPlay(gamerProfileId: string, centsPerMinute: number): Promise<boolean> {
-    if (centsPerMinute <= 0) return true;
+  private async coversMinimumPlay(gamerProfileId: string, coinsPerHour: number): Promise<boolean> {
+    if (coinsPerHour <= 0) return true;
     const { balance } = await this.wallet.getWalletForGamer(gamerProfileId);
     const used = await this.usedByRunningSessions(gamerProfileId);
-    return balance - used >= centsPerMinute * Math.max(this.minPlayMinutes, 1);
+    return balance - used >= coinsForMinutes(coinsPerHour, Math.max(this.minPlayMinutes, 1));
   }
 
   // --- extensions ----------------------------------------------------------
@@ -304,15 +303,15 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
     const { session, now } = await this.extendable(gamerProfileId, reservationId);
     const [{ balance }, committed] = await Promise.all([
       this.wallet.getWalletForGamer(gamerProfileId),
-      this.committedCents(gamerProfileId, now),
+      this.committedCoins(gamerProfileId, now),
     ]);
     const options = [];
     for (const minutes of EXTEND_MINUTES) {
       const to = new Date(session.endTime.getTime() + minutes * 60_000);
-      const quote = await this.quote(gamerProfileId, session.reservation.machine.branchId, true, session.endTime, minutes);
+      const quote = await this.quote(gamerProfileId, true, session.endTime, minutes);
       const busy = await this.repo.isMachineBusy(session.reservation.machineId, session.endTime, to, reservationId);
-      const affordable = balance - committed >= quote.totalCents;
-      options.push({ minutes, costCents: quote.totalCents, available: !busy && affordable, reason: busy ? 'SLOT_TAKEN' : affordable ? null : 'INSUFFICIENT_FUNDS' });
+      const affordable = balance - committed >= quote.totalCoins;
+      options.push({ minutes, costCoins: quote.totalCoins, available: !busy && affordable, reason: busy ? 'SLOT_TAKEN' : affordable ? null : 'INSUFFICIENT_FUNDS' });
     }
     return { reservationId, endsAt: session.endTime.toISOString(), options };
   }
@@ -326,19 +325,19 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
     const { session, now } = await this.extendable(gamerProfileId, reservationId);
     const from = session.endTime;
     const to = new Date(from.getTime() + minutes * 60_000);
-    const quote = await this.quote(gamerProfileId, session.reservation.machine.branchId, true, from, minutes);
+    const quote = await this.quote(gamerProfileId, true, from, minutes);
 
     const [{ balance }, committed] = await Promise.all([
       this.wallet.getWalletForGamer(gamerProfileId),
-      this.committedCents(gamerProfileId, now),
+      this.committedCoins(gamerProfileId, now),
     ]);
-    if (balance - committed < quote.totalCents) {
-      throw insufficientFunds(`${minutes} more minutes cost ${quote.totalCents} millimes; your balance doesn't cover it`);
+    if (balance - committed < quote.totalCoins) {
+      throw insufficientFunds(`${minutes} more minutes cost ${quote.totalCoins} coins; your balance doesn't cover it`);
     }
 
     // The extra time bills at the walk-in rate: switch at the old end when the session bills another one.
     const current = rateAt(session as Meter, from);
-    const switchNeeded = !session.rateSwitchAt && current !== quote.centsPerMinute;
+    const switchNeeded = !session.rateSwitchAt && current !== quote.coinsPerHour;
     const result = await this.repo.extendIfFree({
       reservationId,
       sessionId: session.id,
@@ -348,7 +347,7 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
       to,
       session: {
         endingNoticeSentAt: null,
-        ...(switchNeeded ? { nextRateCentsPerMinute: quote.centsPerMinute, rateSwitchAt: from } : {}),
+        ...(switchNeeded ? { nextRateCoinsPerHour: quote.coinsPerHour, rateSwitchAt: from } : {}),
       },
     });
     if (result.kind === 'slot_taken') {
@@ -362,7 +361,7 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
     const updated = { ...session, ...result.session };
     await this.scheduleRunout(updated);
     await this.notify(updated, 'CLEAR');
-    return { reservationId, sessionId: session.id, endsAt: to.toISOString(), costCents: quote.totalCents };
+    return { reservationId, sessionId: session.id, endsAt: to.toISOString(), costCoins: quote.totalCoins };
   }
 
   /** The gamer's own running session on this booking, still inside its window. */
@@ -393,7 +392,7 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
       ...toSessionDto(s as unknown as SessionRecord),
       station: s.reservation.machine,
       gamerUsername: s.reservation.gamerProfile.user.username,
-      costSoFarCents: OPEN_SESSION_STATUSES.includes(s.status) ? costAt(s as Meter, now) : null,
+      costSoFarCoins: OPEN_SESSION_STATUSES.includes(s.status) ? costAt(s as Meter, now) : null,
     }));
   }
 
@@ -418,11 +417,11 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
       station: session.reservation.machine,
       startedAt: session.startTime.toISOString(),
       endsAt: session.endTime.toISOString(),
-      rateCentsPerMinute: rateAt(meter, now),
+      rateCoinsPerHour: rateAt(meter, now),
       playedSeconds: played,
-      costSoFarCents: costAt(meter, now),
+      costSoFarCoins: costAt(meter, now),
       balance,
-      balanceAfterCents: balance - costAt(meter, now),
+      balanceAfterCoins: balance - costAt(meter, now),
     };
   }
 
@@ -563,7 +562,7 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
     const others = (await this.repo.findGrantedByGamer(session.reservation.gamerProfileId))
       .filter((s) => s.id !== session.id)
       .reduce((sum, s) => sum + exactCostAt(s as Meter, now), 0);
-    const margin = (this.runoutMarginS / 60) * rateAt(meter, now);
+    const margin = (this.runoutMarginS / 3600) * rateAt(meter, now);
     return msUntilSpent(meter, now, balance - others - exactCostAt(meter, now) - margin);
   }
 
@@ -605,7 +604,7 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
     }
     if (!(await verifyPin(session.pinHash, credential.trim()))) return rejected('invalid_pin');
     // Money may have been spent since the booking: play starts only with enough for the minimum play time.
-    if (!(await this.coversMinimumPlay(session.reservation.gamerProfileId, session.rateCentsPerMinute ?? 0))) {
+    if (!(await this.coversMinimumPlay(session.reservation.gamerProfileId, session.rateCoinsPerHour ?? 0))) {
       return rejected('insufficient_funds');
     }
     if (!(await this.repo.spendPin(session.id, now))) return rejected('pin_used');
@@ -864,33 +863,33 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
     // No lease reaches past the reservation window, so neither does metering.
     const meteredUntil = new Date(Math.min(endedAt.getTime(), session.endTime.getTime()));
     const meter = session as Meter;
-    const totalCents = costAt(meter, meteredUntil);
+    const totalCoins = costAt(meter, meteredUntil);
     let meteredSeconds = session.meteredSeconds;
     if (session.status === 'ACTIVE' && session.meteringStartedAt && meteredUntil > session.meteringStartedAt) {
       meteredSeconds += secondsBetween(session.meteringStartedAt, meteredUntil);
     }
 
     const breakdown: Record<string, unknown> = {
-      rateCentsPerMinute: session.rateCentsPerMinute ?? 0,
+      rateCoinsPerHour: session.rateCoinsPerHour ?? 0,
       meteredSeconds,
-      accruedCents: session.accruedCents,
-      totalCents,
+      accruedCoins: session.accruedCoins,
+      totalCoins,
       appliedMembershipId: session.appliedMembershipId,
       endReason: reason,
     };
 
-    if (totalCents > 0) {
+    if (totalCoins > 0) {
       try {
         const charged = await this.wallet.debitUpTo(session.reservation.gamerProfileId, {
-          amount: totalCents,
+          amount: totalCoins,
           type: 'PAYMENT',
           sessionId: session.id,
           idempotencyKey: `session-settlement:${session.id}`,
         });
-        breakdown.chargedCents = charged;
-        if (charged < totalCents) {
-          breakdown.shortfallCents = totalCents - charged;
-          this.logger.error(`session ${session.id} settled ${totalCents - charged} short: the wallet held ${charged}`);
+        breakdown.chargedCoins = charged;
+        if (charged < totalCoins) {
+          breakdown.shortfallCoins = totalCoins - charged;
+          this.logger.error(`session ${session.id} settled ${totalCoins - charged} short: the wallet held ${charged}`);
         }
       } catch (err) {
         this.logger.error(`settlement debit failed for session ${session.id}: ${(err as Error).message}`);
@@ -911,18 +910,17 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
   }
 
   /**
-   * Rates are per hour (Pricing convention): paygRate for Play now, bookingRate
-   * for a booking made ahead. The better of the membership discount and a
-   * pass window discount (at the time play starts) applies — they don't stack —
-   * before converting to per minute.
+   * Coins per hour, the same in every branch: paygRate for Play now,
+   * bookingRate for a booking made ahead. The better of the membership
+   * discount and a pass window discount (at the time play starts) applies —
+   * they don't stack. Time is then billed by the second at that rate.
    */
   private async computeRate(
-    branchId: string,
     gamerProfileId: string,
     isWalkIn: boolean,
     playStarts: Date,
-  ): Promise<{ centsPerMinute: number; membershipId: string | null }> {
-    const { paygRate, bookingRate } = await this.pricing.getRatesForBranch(branchId);
+  ): Promise<{ coinsPerHour: number; membershipId: string | null }> {
+    const { paygRate, bookingRate } = await this.pricing.getRates();
     const [membership, pass] = await Promise.all([
       this.membership.getActiveDiscountForGamer(gamerProfileId),
       this.subscriptions.getWindowDiscountForGamer(gamerProfileId, playStarts),
@@ -930,9 +928,8 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
     const membershipPercent = membership ? Number(membership.discountPercent) : 0;
     const passPercent = pass?.discountPercent ?? 0;
     const discountPercent = Math.max(membershipPercent, passPercent);
-    const centsPerHour = Math.round((isWalkIn ? paygRate : bookingRate) * (1 - discountPercent / 100));
     return {
-      centsPerMinute: Math.max(Math.round(centsPerHour / 60), 0),
+      coinsPerHour: Math.max(Math.round((isWalkIn ? paygRate : bookingRate) * (1 - discountPercent / 100)), 0),
       membershipId: membership && membershipPercent >= passPercent ? membership.membershipId : null,
     };
   }
