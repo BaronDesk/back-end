@@ -247,10 +247,17 @@ export class SessionsRepository extends BaseRepository {
   }
 
   /**
-   * Session settles; its reservation -> COMPLETED. Only an open session is
-   * closed: false if another path (presence, force-close, sweep) closed it first.
+   * Session settles; its reservation -> COMPLETED; the gamer gets the XP the
+   * session earned. Only an open session is closed: false if another path
+   * (presence, force-close, sweep) closed it first, and then no XP is added,
+   * so a session awards its XP once.
    */
-  complete(id: string, reservationId: string, data: Prisma.SessionUpdateManyMutationInput): Promise<boolean> {
+  complete(
+    id: string,
+    reservationId: string,
+    data: Prisma.SessionUpdateManyMutationInput,
+    xp?: { gamerProfileId: string; amount: number },
+  ): Promise<boolean> {
     return this.prisma.$transaction(async (tx) => {
       const { count } = await tx.session.updateMany({ where: { id, status: { in: OPEN_SESSION_STATUSES } }, data });
       if (count === 0) return false;
@@ -258,6 +265,9 @@ export class SessionsRepository extends BaseRepository {
         where: { id: reservationId, status: { in: ['CONFIRMED', 'ACTIVE'] } },
         data: { status: 'COMPLETED' },
       });
+      if (xp && xp.amount > 0) {
+        await tx.gamerProfile.update({ where: { id: xp.gamerProfileId }, data: { xp: { increment: xp.amount } } });
+      }
       return true;
     });
   }

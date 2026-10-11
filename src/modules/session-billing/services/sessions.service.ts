@@ -28,6 +28,7 @@ import {
 import { WalletService } from '../../wallet/services/wallet.service.js';
 import { OPEN_SESSION_STATUSES, SessionsRepository } from '../repository/sessions.repository.js';
 import { coinsForMinutes, costAt, exactCostAt, foldDueRateSwitch, msUntilSpent, rateAt, secondsBetween, type Meter } from '../util/metering.js';
+import { xpForSeconds } from '../util/xp.js';
 import { generatePin, hashPin, PinVault, verifyPin } from '../util/pin.js';
 import { toSessionDto, type SessionRecord } from '../util/public-session.js';
 
@@ -869,11 +870,13 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
       meteredSeconds += secondsBetween(session.meteringStartedAt, meteredUntil);
     }
 
+    const xpEarned = xpForSeconds(meteredSeconds);
     const breakdown: Record<string, unknown> = {
       rateCoinsPerHour: session.rateCoinsPerHour ?? 0,
       meteredSeconds,
       accruedCoins: session.accruedCoins,
       totalCoins,
+      xpEarned,
       appliedMembershipId: session.appliedMembershipId,
       endReason: reason,
     };
@@ -897,14 +900,20 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy, StationSe
       }
     }
 
-    const closed = await this.repo.complete(session.id, session.reservationId, {
-      status: 'COMPLETED',
-      meteringStartedAt: null,
-      meteredSeconds,
-      lockedAt: null,
-      settledAt: endedAt,
-      billingBreakdown: breakdown as unknown as Prisma.InputJsonValue,
-    });
+    // The XP lands in the same transaction that closes the session: never twice, never for a session another path closed.
+    const closed = await this.repo.complete(
+      session.id,
+      session.reservationId,
+      {
+        status: 'COMPLETED',
+        meteringStartedAt: null,
+        meteredSeconds,
+        lockedAt: null,
+        settledAt: endedAt,
+        billingBreakdown: breakdown as unknown as Prisma.InputJsonValue,
+      },
+      { gamerProfileId: session.reservation.gamerProfileId, amount: xpEarned },
+    );
     await this.runoutTimer.cancel(session.id);
     return closed;
   }

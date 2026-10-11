@@ -354,6 +354,38 @@ describe('session billing (e2e)', () => {
     agent.socket.close();
   });
 
+  it('awards 25 XP per 15 min played when the session settles, once', async () => {
+    const gamer = await createGamer();
+    await creditWallet(gamer.profileId, 100_000);
+    const machine = await createMachine();
+    const reservation = await createConfirmedReservation(gamer.profileId, machine.id);
+    const agent = await connectAgent(machine);
+    const sessionId = await startAndLogIn(agent, reservation.id);
+
+    // Half an hour of play without waiting for it: metering started 30 min ago.
+    await prisma.session.update({ where: { id: sessionId }, data: { meteringStartedAt: new Date(Date.now() - 30 * 60_000) } });
+
+    await end(sessionId, 'closing');
+    await vi.waitFor(() => expect(agent.commands.some((c) => c.type === 'END_SESSION')).toBe(true));
+    agent.send('heartbeat', { locked: true, sessionId: null });
+    await vi.waitFor(async () => expect((await get(sessionId)).json().status).toBe('COMPLETED'));
+
+    const { meteredSeconds, billingBreakdown } = (await get(sessionId)).json();
+    expect(meteredSeconds).toBeGreaterThanOrEqual(1800);
+    expect(billingBreakdown.xpEarned).toBe(Math.floor((meteredSeconds * 25) / 900));
+    expect(billingBreakdown.xpEarned).toBeGreaterThanOrEqual(50);
+
+    const me = await app.inject({ method: 'GET', url: '/auth/me', headers: as(gamer.token) });
+    expect(me.json().xp).toBe(billingBreakdown.xpEarned);
+
+    // Closing it again is refused and gives no more XP.
+    expect((await end(sessionId)).statusCode).toBe(409);
+    const profile = await prisma.gamerProfile.findUniqueOrThrow({ where: { id: gamer.profileId } });
+    expect(profile.xp).toBe(billingBreakdown.xpEarned);
+
+    agent.socket.close();
+  });
+
   it('refuses the login, not the PIN, when the balance no longer covers the minimum play time', async () => {
     const gamer = await createGamer(0);
     const machine = await createMachine();

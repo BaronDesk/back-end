@@ -379,7 +379,7 @@ describe('SessionsService', () => {
       );
       await service.reconcile(STATION, { locked: false, sessionId: 's1' });
       expect(wallet.debitUpTo).toHaveBeenCalledWith('g1', expect.objectContaining({ amount: 1000, sessionId: 's1' }));
-      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED', meteredSeconds: 600 }));
+      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED', meteredSeconds: 600 }), { gamerProfileId: 'g1', amount: 16 });
       expect(commands.issueSystemEndSession).toHaveBeenCalledWith('m1', 'reservation_ended', 's1');
       expect(commands.issueSessionUnlock).not.toHaveBeenCalled();
     });
@@ -437,7 +437,18 @@ describe('SessionsService', () => {
       await flush();
       // 5 minutes active at 6000 coins/h = 500 coins
       expect(wallet.debitUpTo).toHaveBeenCalledWith('g1', expect.objectContaining({ amount: 500, sessionId: 's1' }));
-      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED', meteredSeconds: 300 }));
+      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED', meteredSeconds: 300 }), { gamerProfileId: 'g1', amount: 8 });
+    });
+
+    it('records the XP earned on the bill: 25 XP per 15 min played', async () => {
+      const endTime = new Date(Date.now() - 60_000);
+      repo.findForSettlement.mockResolvedValueOnce(
+        sessionRow({ status: 'ACTIVE', meteringStartedAt: new Date(endTime.getTime() - 30 * 60_000), endTime }),
+      );
+      await service.reconcile(STATION, { locked: false, sessionId: 's1' });
+      const [, , data, xp] = repo.complete.mock.calls[0];
+      expect(data.billingBreakdown).toMatchObject({ meteredSeconds: 1800, xpEarned: 50 });
+      expect(xp).toEqual({ gamerProfileId: 'g1', amount: 50 });
     });
 
     it('still completes the session, flagged, when the settlement debit fails', async () => {
@@ -448,6 +459,8 @@ describe('SessionsService', () => {
         's1',
         'res-1',
         expect.objectContaining({ status: 'COMPLETED', billingBreakdown: expect.objectContaining({ debitFailed: true }) }),
+        // The XP is for time played: a failed debit doesn't take it away.
+        expect.objectContaining({ gamerProfileId: 'g1' }),
       );
     });
 
@@ -480,7 +493,7 @@ describe('SessionsService', () => {
         sessionRow({ status: 'PAUSED', meteredSeconds: 120, endTime, startTime: new Date(endTime.getTime() - HOUR) }),
       ]);
       await service.sweep();
-      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED', meteredSeconds: 120 }));
+      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED', meteredSeconds: 120 }), { gamerProfileId: 'g1', amount: 3 });
       expect(commands.issueSystemEndSession).toHaveBeenCalledWith('m1', 'reservation_ended', 's1');
       expect(repo.cancelPending).not.toHaveBeenCalled();
     });
@@ -530,7 +543,7 @@ describe('SessionsService', () => {
       repo.findForSettlement.mockResolvedValueOnce(sessionRow({ status: 'ACTIVE', pinUsedAt: new Date(), meteringStartedAt: new Date(Date.now() - 60_000) }));
       await service.forceClose(caller(), 's1', 'desk');
       expect(commands.issueSystemEndSession).toHaveBeenCalledWith('m1', 'desk', 's1');
-      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED' }));
+      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED' }), expect.anything());
 
       repo.findByIdWithReservation.mockResolvedValue(sessionRow({ status: 'PENDING' }));
       repo.findForSettlement.mockResolvedValueOnce(sessionRow({ status: 'PENDING' }));
@@ -657,13 +670,13 @@ describe('SessionsService', () => {
       ]);
       await service.reconcile(STATION, { locked: true, sessionId: null });
       expect(wallet.debitUpTo).toHaveBeenCalledWith('g1', expect.objectContaining({ amount: 1000 }));
-      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ settledAt: lastSeen }));
+      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ settledAt: lastSeen }), expect.anything());
     });
 
     it('settles the session before a shutdown', async () => {
       repo.findGrantedOnMachine.mockResolvedValueOnce([sessionRow({ status: 'PAUSED', pinUsedAt: new Date(), meteredSeconds: 60 })]);
       await service.closeForShutdown(STATION);
-      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED' }));
+      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED' }), expect.anything());
     });
 
     it('unlocks for staff only into the station’s own session', async () => {
@@ -682,7 +695,7 @@ describe('SessionsService', () => {
       const lockedAt = new Date(Date.now() - 60_000);
       repo.findGrantedOnMachine.mockResolvedValueOnce([sessionRow({ id: 'old', status: 'PAUSED', pinUsedAt: new Date(), lockedAt, meteredSeconds: 60 })]);
       await expect(service.login(STATION, 'pin', '123456')).resolves.toMatchObject({ accepted: true, sessionId: 'new' });
-      expect(repo.complete).toHaveBeenCalledWith('old', 'res-1', expect.objectContaining({ settledAt: lockedAt }));
+      expect(repo.complete).toHaveBeenCalledWith('old', 'res-1', expect.objectContaining({ settledAt: lockedAt }), expect.anything());
       expect(commands.issueSystemEndSession).not.toHaveBeenCalled();
     });
   });
