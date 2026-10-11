@@ -23,6 +23,7 @@ describe('TournamentsService', () => {
   let prisma: Record<string, any>;
   let wallet: { debit: ReturnType<typeof vi.fn> };
   let dashboard: { publishToBranch: ReturnType<typeof vi.fn> };
+  let sessions: { endTournamentMatch: ReturnType<typeof vi.fn> };
   let service: TournamentsService;
 
   beforeEach(() => {
@@ -39,19 +40,29 @@ describe('TournamentsService', () => {
           .mockResolvedValue({ id: 'member-1', status: 'PAID' }),
       },
       tournamentEntrant: {
+        findMany: vi.fn(),
+        update: vi.fn(),
         updateMany: vi.fn().mockResolvedValue({ count: 1 }),
       },
-      tournament: { findUnique: vi.fn(), findUniqueOrThrow: vi.fn() },
-      tournamentMatch: {},
+      tournament: { findUnique: vi.fn(), findUniqueOrThrow: vi.fn(), update: vi.fn() },
+      tournamentMatch: { create: vi.fn(), findMany: vi.fn(), update: vi.fn() },
       $transaction: vi.fn((callback: (tx: any) => unknown) => callback(prisma)),
       $executeRaw: vi.fn(),
     };
-    wallet = { debit: vi.fn().mockResolvedValue({ id: 'ledger-1' }) };
+    wallet = {
+      debit: vi.fn().mockResolvedValue({ id: 'ledger-1' }),
+      credit: vi.fn().mockResolvedValue({ id: 'refund-ledger-1' }),
+    } as any;
     dashboard = { publishToBranch: vi.fn() };
+    sessions = { endTournamentMatch: vi.fn().mockResolvedValue(undefined) };
     service = new TournamentsService(
       prisma as any,
       wallet as any,
       dashboard as any,
+      {} as any,
+      sessions as any,
+      { sessionEnded: { subscribe: vi.fn() }, statusChanges: { subscribe: vi.fn() } } as any,
+      { add: vi.fn().mockResolvedValue(undefined) } as any,
     );
   });
 
@@ -174,5 +185,61 @@ describe('TournamentsService', () => {
       }),
     ).rejects.toBeInstanceOf(ConflictException);
     expect(prisma.tournamentMatch.updateMany).toBeUndefined();
+  });
+
+  it('refunds paid entrants who miss check-in with a replay-safe wallet key', async () => {
+    prisma.tournament.findUnique.mockResolvedValue({
+      id: 'tournament-1', branchId: 'branch-1', status: 'REGISTRATION_CLOSED',
+      checkInClosesAt: new Date(Date.now() - 60_000),
+    });
+    prisma.tournamentEntrant.updateMany.mockResolvedValue({ count: 1 });
+    prisma.tournamentMember.findMany.mockResolvedValue([{
+      id: 'member-no-show', gamerProfileId: 'gamer-1', amountPaid: 700,
+    }]);
+
+    await service.onCheckInDeadline('tournament-1');
+
+    expect(wallet.credit).toHaveBeenCalledWith('gamer-1', {
+      amount: 700, type: 'REFUND', idempotencyKey: 'tournament-refund:member-no-show',
+    });
+    expect(prisma.tournamentMember.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'member-no-show', status: 'PAID' },
+      data: { status: 'REFUNDED', refundLedgerEntryId: 'refund-ledger-1' },
+    }));
+  });
+
+  it('builds the bracket with a bye and advances the bye entrant into the next round', async () => {
+    const tournament = {
+      id: 'tournament-1', branchId: 'branch-1', status: 'REGISTRATION_CLOSED',
+      checkInClosesAt: new Date(Date.now() - 60_000),
+    };
+    const entrants = [
+      { id: 'entrant-a', checkedInAt: new Date('2026-10-11T10:00:00Z') },
+      { id: 'entrant-b', checkedInAt: new Date('2026-10-11T10:01:00Z') },
+      { id: 'entrant-c', checkedInAt: new Date('2026-10-11T10:02:00Z') },
+    ];
+    const matches: any[] = [];
+    prisma.tournament.findUnique.mockResolvedValue(tournament);
+    prisma.tournament.findUniqueOrThrow.mockResolvedValue(tournament);
+    prisma.tournamentEntrant.findMany.mockResolvedValue(entrants);
+    prisma.tournamentMatch.create.mockImplementation(async ({ data }: any) => {
+      const row = { id: `match-${matches.length + 1}`, entrant1Id: null, entrant2Id: null, ...data };
+      matches.push(row);
+      return row;
+    });
+    prisma.tournamentMatch.findMany.mockImplementation(async ({ where }: any) =>
+      where.round === 1 ? matches.filter((match) => match.round === 1) : [],
+    );
+    prisma.tournamentMatch.update.mockImplementation(async ({ where, data }: any) => {
+      const row = matches.find((match) => match.id === where.id)!;
+      Object.assign(row, data);
+      return row;
+    });
+    prisma.tournament.update.mockResolvedValue(tournament);
+    await service.start(staff, 'tournament-1');
+
+    expect(matches[0]).toMatchObject({ entrant1Id: 'entrant-a', entrant2Id: 'entrant-c', status: 'READY' });
+    expect(matches[1]).toMatchObject({ entrant1Id: undefined, entrant2Id: 'entrant-b', winnerEntrantId: 'entrant-b', status: 'COMPLETED' });
+    expect(matches[2]).toMatchObject({ entrant2Id: 'entrant-b' });
   });
 });

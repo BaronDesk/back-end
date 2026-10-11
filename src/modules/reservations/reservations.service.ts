@@ -10,17 +10,32 @@ import type { AccessTokenPayload } from '../../common/types/jwt-payload.js';
 import { assertScope } from '../../common/utils/assert-scope.js';
 import { MembershipService } from '../membership/services/membership.service.js';
 import { SessionsService } from '../session-billing/services/sessions.service.js';
-import { CANCELLABLE_STATUSES, ReservationsRepository } from './reservations.repository.js';
-import type { CreateReservationDto, StaffListQuery, WalkInDto } from './reservations.schemas.js';
+import {
+  CANCELLABLE_STATUSES,
+  ReservationsRepository,
+} from './reservations.repository.js';
+import type {
+  CreateReservationDto,
+  StaffListQuery,
+  WalkInDto,
+} from './reservations.schemas.js';
 
 const DAY_MS = 24 * 60 * 60_000;
 
-const minutesBetween = (from: Date, to: Date) => Math.ceil((to.getTime() - from.getTime()) / 60_000);
+const minutesBetween = (from: Date, to: Date) =>
+  Math.ceil((to.getTime() - from.getTime()) / 60_000);
 
 const notCancellable = () =>
-  new ConflictException({ code: 'RESERVATION_NOT_CANCELLABLE', error: 'reservation cannot be cancelled' });
+  new ConflictException({
+    code: 'RESERVATION_NOT_CANCELLABLE',
+    error: 'reservation cannot be cancelled',
+  });
 
-const sessionInProgress = () => new ConflictException({ code: 'SESSION_IN_PROGRESS', error: 'end the session instead' });
+const sessionInProgress = () =>
+  new ConflictException({
+    code: 'SESSION_IN_PROGRESS',
+    error: 'end the session instead',
+  });
 
 @Injectable()
 export class ReservationsService {
@@ -35,7 +50,10 @@ export class ReservationsService {
   /** The gamer's bookings, each with its PIN while unused (it works on that PC from the start until the no-show deadline). */
   async list(caller: AccessTokenPayload) {
     const gamer = await this.getGamer(caller.sub);
-    const [bookings, pins] = await Promise.all([this.reservations.listForGamer(gamer.id), this.sessions.pinsForGamer(gamer.id)]);
+    const [bookings, pins] = await Promise.all([
+      this.reservations.listForGamer(gamer.id),
+      this.sessions.pinsForGamer(gamer.id),
+    ]);
     return bookings.map((b) => ({ ...b, pin: pins.get(b.id) ?? null }));
   }
 
@@ -43,10 +61,16 @@ export class ReservationsService {
     const gamer = await this.getGamer(caller.sub);
     const now = Date.now();
     if (input.startTime.getTime() <= now) {
-      throw new BadRequestException({ code: 'INVALID_RESERVATION_TIME', error: 'reservation must start in the future' });
+      throw new BadRequestException({
+        code: 'INVALID_RESERVATION_TIME',
+        error: 'reservation must start in the future',
+      });
     }
     // The membership plan sets how far ahead a gamer may book; everyone may book the next 24 hours.
-    const advanceDays = Math.max(await this.membership.getBookingAdvanceDays(gamer.id), 1);
+    const advanceDays = Math.max(
+      await this.membership.getBookingAdvanceDays(gamer.id),
+      1,
+    );
     if (input.startTime.getTime() > now + advanceDays * DAY_MS) {
       throw new BadRequestException({
         code: 'BOOKING_TOO_FAR_AHEAD',
@@ -61,8 +85,13 @@ export class ReservationsService {
       start: input.startTime,
       minutes: minutesBetween(input.startTime, input.endTime),
     });
-    const reservation = this.unwrap(await this.reservations.createIfAvailable(gamer.id, input));
-    return { ...reservation, checkIn: await this.issuePin(gamer.id, reservation.id) };
+    const reservation = this.unwrap(
+      await this.reservations.createIfAvailable(gamer.id, input),
+    );
+    return {
+      ...reservation,
+      checkIn: await this.issuePin(gamer.id, reservation.id),
+    };
   }
 
   async walkIn(caller: AccessTokenPayload, input: WalkInDto) {
@@ -75,13 +104,20 @@ export class ReservationsService {
       start: startTime,
       minutes: input.durationMinutes,
     });
-    const result = await this.reservations.createIfAvailable(gamer.id, {
-      machineId: input.machineId,
-      startTime,
-      endTime: new Date(startTime.getTime() + input.durationMinutes * 60_000),
-    }, true);
+    const result = await this.reservations.createIfAvailable(
+      gamer.id,
+      {
+        machineId: input.machineId,
+        startTime,
+        endTime: new Date(startTime.getTime() + input.durationMinutes * 60_000),
+      },
+      true,
+    );
     const reservation = this.unwrap(result);
-    return { ...reservation, checkIn: await this.issuePin(gamer.id, reservation.id) };
+    return {
+      ...reservation,
+      checkIn: await this.issuePin(gamer.id, reservation.id),
+    };
   }
 
   /**
@@ -92,7 +128,9 @@ export class ReservationsService {
     try {
       return await this.sessions.checkIn(gamerProfileId, reservationId);
     } catch (err) {
-      this.logger.warn(`booking ${reservationId}: no PIN issued: ${(err as Error).message}`);
+      this.logger.warn(
+        `booking ${reservationId}: no PIN issued: ${(err as Error).message}`,
+      );
       return null;
     }
   }
@@ -115,10 +153,14 @@ export class ReservationsService {
    */
   async listForStaff(caller: AccessTokenPayload, query: StaffListQuery) {
     if (query.branchId) assertScope(caller, { branchId: query.branchId });
-    const branchId = caller.scope === 'hq' ? (query.branchId ?? null) : caller.branchId;
+    const branchId =
+      caller.scope === 'hq' ? (query.branchId ?? null) : caller.branchId;
     if (caller.scope !== 'hq' && !branchId) return [];
     const rows = await this.reservations.listForStaff({ ...query, branchId });
-    return rows.map(({ gamerProfile, ...r }) => ({ ...r, gamerUsername: gamerProfile.user.username }));
+    return rows.map(({ gamerProfile, ...r }) => ({
+      ...r,
+      gamerUsername: gamerProfile.user.username,
+    }));
   }
 
   /**
@@ -127,9 +169,19 @@ export class ReservationsService {
    */
   async cancelByStaff(caller: AccessTokenPayload, id: string) {
     const reservation = await this.reservations.findForStaff(id);
-    if (!reservation) throw new NotFoundException({ code: 'RESERVATION_NOT_FOUND', error: 'reservation not found' });
+    if (!reservation)
+      throw new NotFoundException({
+        code: 'RESERVATION_NOT_FOUND',
+        error: 'reservation not found',
+      });
     assertScope(caller, { branchId: reservation.machine.branchId });
-    if (!CANCELLABLE_STATUSES.includes(reservation.status)) throw notCancellable();
+    if (reservation.tournamentId)
+      throw new ConflictException({
+        code: 'TOURNAMENT_SEAT_MANAGED',
+        error: 'tournament seats are managed through the tournament flow',
+      });
+    if (!CANCELLABLE_STATUSES.includes(reservation.status))
+      throw notCancellable();
     return this.cancelUnlessInProgress(id);
   }
 
@@ -142,8 +194,18 @@ export class ReservationsService {
   async cancel(caller: AccessTokenPayload, id: string) {
     const gamer = await this.getGamer(caller.sub);
     const reservation = await this.reservations.findOwned(id, gamer.id);
-    if (!reservation) throw new NotFoundException({ code: 'RESERVATION_NOT_FOUND', error: 'reservation not found' });
-    if (!CANCELLABLE_STATUSES.includes(reservation.status)) throw notCancellable();
+    if (!reservation)
+      throw new NotFoundException({
+        code: 'RESERVATION_NOT_FOUND',
+        error: 'reservation not found',
+      });
+    if (reservation.tournamentId)
+      throw new ConflictException({
+        code: 'TOURNAMENT_SEAT_MANAGED',
+        error: 'tournament seats are managed through the tournament flow',
+      });
+    if (!CANCELLABLE_STATUSES.includes(reservation.status))
+      throw notCancellable();
     return this.cancelUnlessInProgress(id);
   }
 
@@ -158,27 +220,49 @@ export class ReservationsService {
   /** An unknown PC can't be booked (checked before the price, so it answers MACHINE_UNAVAILABLE). */
   private async assertMachine(machineId: string): Promise<void> {
     const machine = await this.reservations.findMachine(machineId);
-    if (!machine) throw new ConflictException({ code: 'MACHINE_UNAVAILABLE', error: 'machine is unavailable' });
+    if (!machine)
+      throw new ConflictException({
+        code: 'MACHINE_UNAVAILABLE',
+        error: 'machine is unavailable',
+      });
   }
 
   private async getGamer(userId: string) {
     const gamer = await this.reservations.findGamerProfileId(userId);
-    if (!gamer) throw new NotFoundException({ code: 'GAMER_PROFILE_NOT_FOUND', error: 'gamer profile not found' });
+    if (!gamer)
+      throw new NotFoundException({
+        code: 'GAMER_PROFILE_NOT_FOUND',
+        error: 'gamer profile not found',
+      });
     return gamer;
   }
 
-  private unwrap(result: Awaited<ReturnType<ReservationsRepository['createIfAvailable']>>) {
+  private unwrap(
+    result: Awaited<ReturnType<ReservationsRepository['createIfAvailable']>>,
+  ) {
     if (result.kind === 'machine_unavailable') {
-      throw new ConflictException({ code: 'MACHINE_UNAVAILABLE', error: 'machine is unavailable' });
+      throw new ConflictException({
+        code: 'MACHINE_UNAVAILABLE',
+        error: 'machine is unavailable',
+      });
     }
     if (result.kind === 'invalid_walk_in') {
-      throw new BadRequestException({ code: 'INVALID_WALK_IN', error: 'walk-in start time is invalid' });
+      throw new BadRequestException({
+        code: 'INVALID_WALK_IN',
+        error: 'walk-in start time is invalid',
+      });
     }
     if (result.kind === 'slot_taken') {
-      throw new ConflictException({ code: 'RESERVATION_SLOT_TAKEN', error: 'machine is already reserved for this time' });
+      throw new ConflictException({
+        code: 'RESERVATION_SLOT_TAKEN',
+        error: 'machine is already reserved for this time',
+      });
     }
     if (result.kind === 'gamer_busy') {
-      throw new ConflictException({ code: 'GAMER_ALREADY_BOOKED', error: 'you already have a booking at this time' });
+      throw new ConflictException({
+        code: 'GAMER_ALREADY_BOOKED',
+        error: 'you already have a booking at this time',
+      });
     }
     return result.reservation;
   }

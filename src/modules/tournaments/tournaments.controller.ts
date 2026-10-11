@@ -118,6 +118,24 @@ export class TournamentsController {
   }
 
   @RequireScope('staff')
+  @Post(':id/cancel')
+  cancel(
+    @CurrentUser() caller: AccessTokenPayload,
+    @Param('id', new ZodValidationPipe(idSchema)) id: string,
+  ) {
+    return this.tournaments.cancel(caller, id);
+  }
+
+  @RequireScope('self')
+  @Post('entrants/:entrantId/withdraw')
+  withdraw(
+    @CurrentUser() caller: AccessTokenPayload,
+    @Param('entrantId', new ZodValidationPipe(idSchema)) id: string,
+  ) {
+    return this.tournaments.withdraw(caller, id);
+  }
+
+  @RequireScope('staff')
   @Patch('matches/:matchId/result')
   result(
     @CurrentUser() caller: AccessTokenPayload,

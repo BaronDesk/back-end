@@ -20,9 +20,19 @@ import { SCOPE_RANK } from '../../../common/utils/scope.js';
 import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
 import { DASHBOARD_EVENTS } from '../../../infra/realtime/constants.js';
 import { AgentRegistry } from '../../../infra/realtime/registry.js';
-import type { Command, CommandStatus, Prisma } from '../../../generated/prisma/index.js';
-import { GamesService, type CatalogChange } from '../../games/services/games.service.js';
-import { PresenceService, type StationRef } from '../../station/services/presence.service.js';
+import type {
+  Command,
+  CommandStatus,
+  Prisma,
+} from '../../../generated/prisma/index.js';
+import {
+  GamesService,
+  type CatalogChange,
+} from '../../games/services/games.service.js';
+import {
+  PresenceService,
+  type StationRef,
+} from '../../station/services/presence.service.js';
 import { DashboardGateway } from '../dashboard.gateway.js';
 import { CommandsRepository } from '../repository/commands.repository.js';
 import { AuditLogService } from '../../../common/audit/audit-log.service.js';
@@ -95,11 +105,13 @@ export function toCommandDto(command: Command) {
  * which is compare-and-set in the DB and pushes `command_update`.
  */
 /** Simulations that replace the wire LAUNCH_GAME to provoke an agent-side rejection. */
-const AGENT_REJECTION_SIMULATIONS: ReadonlySet<CommandSimulation> = new Set(['invalid_payload', 'exec_failed']);
+const AGENT_REJECTION_SIMULATIONS: ReadonlySet<CommandSimulation> = new Set([
+  'invalid_payload',
+  'exec_failed',
+]);
 
 /** Nil UUID: commands issued by the system, no staff caller (e.g. a runout lock). Same "no FK" reasoning as any other issuedBy. */
 export const SYSTEM_ACTOR_ID = '00000000-0000-0000-0000-000000000000';
-
 
 @Injectable()
 export class CommandsService implements OnModuleInit, OnModuleDestroy {
@@ -123,25 +135,46 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
   }
 
   onModuleInit(): void {
-    this.catalogSub = this.games.catalogChanges.subscribe((change) => void this.requestCatalogSync(change));
+    this.catalogSub = this.games.catalogChanges.subscribe(
+      (change) => void this.requestCatalogSync(change),
+    );
   }
 
   onModuleDestroy(): void {
     this.catalogSub?.unsubscribe();
   }
 
-  async issue(caller: AccessTokenPayload, stationId: string, body: IssueCommandBody) {
+  async issue(
+    caller: AccessTokenPayload,
+    stationId: string,
+    body: IssueCommandBody,
+  ) {
     // SHUTDOWN powers the machine off: manager+ only. LOCK/UNLOCK are staff+.
-    if (body.type === 'SHUTDOWN' && SCOPE_RANK[caller.scope] < SCOPE_RANK.admin) {
-      throw new ForbiddenException({ code: 'INSUFFICIENT_SCOPE', error: 'SHUTDOWN requires admin scope' });
+    if (
+      body.type === 'SHUTDOWN' &&
+      SCOPE_RANK[caller.scope] < SCOPE_RANK.admin
+    ) {
+      throw new ForbiddenException({
+        code: 'INSUFFICIENT_SCOPE',
+        error: 'SHUTDOWN requires admin scope',
+      });
     }
     if (body.simulate && !this.simulationsAllowed) {
-      throw new BadRequestException({ code: 'SIMULATION_DISABLED', error: 'simulate is dev-only' });
+      throw new BadRequestException({
+        code: 'SIMULATION_DISABLED',
+        error: 'simulate is dev-only',
+      });
     }
 
     const station = await this.resolveStation(caller, stationId);
-    if (!this.presence.isOnline(station.serialNumber) || !this.registry.has(station.serialNumber)) {
-      throw new ConflictException({ code: 'STATION_OFFLINE', error: 'station is not online' });
+    if (
+      !this.presence.isOnline(station.serialNumber) ||
+      !this.registry.has(station.serialNumber)
+    ) {
+      throw new ConflictException({
+        code: 'STATION_OFFLINE',
+        error: 'station is not online',
+      });
     }
 
     // Every rejection happens here, before a row exists or anything is queued.
@@ -156,36 +189,57 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
         if (agent?.locked !== false || !agent.sessionId) {
           throw new ConflictException({
             code: 'STATION_NOT_IN_SESSION',
-            error: 'station must be unlocked with an active session to launch a game',
+            error:
+              'station must be unlocked with an active session to launch a game',
           });
         }
         gameId = (await this.games.findLaunchable(station, wireGameId)).id;
       }
     } else if (body.type === 'END_SESSION') {
       if (!this.presence.sessionOf(station.serialNumber)) {
-        throw new ConflictException({ code: 'NO_ACTIVE_SESSION', error: 'station has no active session' });
+        throw new ConflictException({
+          code: 'NO_ACTIVE_SESSION',
+          error: 'station has no active session',
+        });
       }
       payload = body.reason ? { reason: body.reason } : {};
     } else if (body.type === 'UNLOCK' && !body.simulate) {
       // The agent only unlocks for a session: resume the station's own one (409 without).
       const sessions = this.sessions.current;
-      if (!sessions) throw new ConflictException({ code: 'NO_SESSION_TO_UNLOCK', error: 'sessions are unavailable' });
+      if (!sessions)
+        throw new ConflictException({
+          code: 'NO_SESSION_TO_UNLOCK',
+          error: 'sessions are unavailable',
+        });
       payload = await sessions.unlockFor(station);
     } else if (body.type === 'SHUTDOWN') {
       // The gamer stops playing now: settle before the PC goes dark (its session end arrives later, already closed).
       await this.sessions.current?.closeForShutdown(station);
-      await this.audit.record(caller.sub, 'UPDATE', `machine:${station.machineId}`, {
-        branchId: station.branchId,
-        metadata: { event: 'STATION_SHUTDOWN' },
-      });
+      await this.audit.record(
+        caller.sub,
+        'UPDATE',
+        `machine:${station.machineId}`,
+        {
+          branchId: station.branchId,
+          metadata: { event: 'STATION_SHUTDOWN' },
+        },
+      );
     }
 
     // Labels the session.ended event, which fires only once the agent reports
     // the session gone. The agent also stops the running game itself: no
     // separate stop command. Billing close-out is Member B's, not ours.
-    if (body.type === 'END_SESSION') this.presence.expectSessionEnd(station.serialNumber, body.reason ?? 'normal');
+    if (body.type === 'END_SESSION')
+      this.presence.expectSessionEnd(
+        station.serialNumber,
+        body.reason ?? 'normal',
+      );
 
-    return this.dispatch(station, body.type, caller.sub, { payload, gameId, simulate: body.simulate });
+    return this.dispatch(station, body.type, caller.sub, {
+      payload,
+      gameId,
+      simulate: body.simulate,
+    });
   }
 
   /**
@@ -197,15 +251,24 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
   async requestCatalogSync(change: CatalogChange): Promise<void> {
     const targets = this.presence
       .onlineStations()
-      .filter((s) => change.branchIds.includes(s.branchId) || change.machineIds.includes(s.machineId))
+      .filter(
+        (s) =>
+          change.branchIds.includes(s.branchId) ||
+          change.machineIds.includes(s.machineId),
+      )
       .filter((s) => this.registry.has(s.serialNumber));
     for (const station of targets) {
       try {
         // One pending sync is enough: the agent pulls the latest catalog when it runs.
-        if (await this.repo.hasOpen(station.machineId, 'CATALOG_UPDATE')) continue;
-        await this.dispatch(station, 'CATALOG_UPDATE', change.issuedBy, { payload: {} });
+        if (await this.repo.hasOpen(station.machineId, 'CATALOG_UPDATE'))
+          continue;
+        await this.dispatch(station, 'CATALOG_UPDATE', change.issuedBy, {
+          payload: {},
+        });
       } catch (err) {
-        this.logger.error(`CATALOG_UPDATE for ${station.serialNumber} not issued: ${(err as Error).message}`);
+        this.logger.error(
+          `CATALOG_UPDATE for ${station.serialNumber} not issued: ${(err as Error).message}`,
+        );
       }
     }
   }
@@ -215,7 +278,11 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
     station: StationRef,
     type: StationCommandType,
     issuedBy: string,
-    options: { payload?: CommandPayload; gameId?: string; simulate?: CommandSimulation },
+    options: {
+      payload?: CommandPayload;
+      gameId?: string;
+      simulate?: CommandSimulation;
+    },
   ) {
     const row = await this.repo.create({
       id: randomUUID(),
@@ -225,11 +292,17 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
       issuedBy,
       gameId: options.gameId,
     });
-    this.logger.log(`${row.type} ${row.id} issued for ${station.serialNumber} by ${issuedBy}`);
+    this.logger.log(
+      `${row.type} ${row.id} issued for ${station.serialNumber} by ${issuedBy}`,
+    );
     this.publish(row);
 
     try {
-      await this.enqueue({ commandId: row.id, payload: options.payload, simulate: options.simulate });
+      await this.enqueue({
+        commandId: row.id,
+        payload: options.payload,
+        simulate: options.simulate,
+      });
     } catch (err) {
       const reason = `enqueue failed: ${(err as Error).message}`;
       this.logger.error(`${row.type} ${row.id}: ${reason}`);
@@ -239,7 +312,11 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
     return toCommandDto(row);
   }
 
-  async list(caller: AccessTokenPayload, stationId: string, query: ListCommandsQuery) {
+  async list(
+    caller: AccessTokenPayload,
+    stationId: string,
+    query: ListCommandsQuery,
+  ) {
     const station = await this.resolveStation(caller, stationId);
     const rows = await this.repo.listForMachine(station.machineId, query.limit);
     return rows.map(toCommandDto);
@@ -247,7 +324,11 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
 
   async get(caller: AccessTokenPayload, commandId: string) {
     const row = await this.repo.findById(commandId);
-    if (!row) throw new NotFoundException({ code: 'COMMAND_NOT_FOUND', error: 'command not found' });
+    if (!row)
+      throw new NotFoundException({
+        code: 'COMMAND_NOT_FOUND',
+        error: 'command not found',
+      });
     assertScope(caller, { branchId: row.branchId });
     return toCommandDto(row);
   }
@@ -262,11 +343,17 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
    * Nothing here touches station state: locked / sessionId / runningGameId
    * come only from presence (heartbeat / state_report).
    */
-  async onAgentReply(serialNumber: string, commandId: string, reply: Exclude<CommandReply, { kind: 'timeout' }>) {
+  async onAgentReply(
+    serialNumber: string,
+    commandId: string,
+    reply: Exclude<CommandReply, { kind: 'timeout' }>,
+  ) {
     const row = await this.repo.findById(commandId);
     const station = this.presence.resolve(serialNumber);
     if (!row || !station || row.machineId !== station.machineId) {
-      this.logger.warn(`${reply.kind} for unknown command ${commandId} from ${serialNumber} ignored`);
+      this.logger.warn(
+        `${reply.kind} for unknown command ${commandId} from ${serialNumber} ignored`,
+      );
       return;
     }
 
@@ -282,7 +369,9 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
           };
     const updated = await this.transition(commandId, REPLY_FROM, data);
     if (!updated) {
-      this.logger.debug(`${reply.kind} for ${commandId} ignored: already ${row.status}`);
+      this.logger.debug(
+        `${reply.kind} for ${commandId} ignored: already ${row.status}`,
+      );
     }
     // Wake the worker last, so it only ever sees the persisted outcome.
     this.tracker.settle(commandId, reply);
@@ -290,12 +379,24 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
 
   /** Worker: PENDING|SENT -> SENT for one more delivery attempt. Null if it resolved meanwhile. */
   markSent(commandId: string) {
-    return this.transition(commandId, OPEN_STATUSES, { status: 'SENT', sentAt: new Date(), attempts: { increment: 1 } });
+    return this.transition(commandId, OPEN_STATUSES, {
+      status: 'SENT',
+      sentAt: new Date(),
+      attempts: { increment: 1 },
+    });
   }
 
   /** Worker: terminal status for a command that never got a reply. */
-  finish(commandId: string, status: 'TIMEOUT' | 'FAILED', failureReason: string) {
-    return this.transition(commandId, OPEN_STATUSES, { status, resolvedAt: new Date(), failureReason });
+  finish(
+    commandId: string,
+    status: 'TIMEOUT' | 'FAILED',
+    failureReason: string,
+  ) {
+    return this.transition(commandId, OPEN_STATUSES, {
+      status,
+      resolvedAt: new Date(),
+      failureReason,
+    });
   }
 
   fail(commandId: string, failureReason: string) {
@@ -306,10 +407,16 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
     return this.repo.findById(commandId);
   }
 
-  private async transition(commandId: string, from: CommandStatus[], data: Prisma.CommandUpdateManyMutationInput) {
+  private async transition(
+    commandId: string,
+    from: CommandStatus[],
+    data: Prisma.CommandUpdateManyMutationInput,
+  ) {
     const row = await this.repo.transition(commandId, from, data);
     if (row) {
-      this.logger.log(`${row.type} ${row.id} -> ${row.status}${row.nackCode ? ` (${row.nackCode})` : ''}`);
+      this.logger.log(
+        `${row.type} ${row.id} -> ${row.status}${row.nackCode ? ` (${row.nackCode})` : ''}`,
+      );
       this.publish(row);
     }
     return row;
@@ -318,12 +425,23 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
   // TODO: Redis pub/sub if multi-instance — in-process publish only reaches
   // dashboards connected to this instance.
   private publish(row: Command): void {
-    this.dashboard.publishToBranch(row.branchId, DASHBOARD_EVENTS.COMMAND_UPDATE, toCommandDto(row));
+    this.dashboard.publishToBranch(
+      row.branchId,
+      DASHBOARD_EVENTS.COMMAND_UPDATE,
+      toCommandDto(row),
+    );
   }
 
-  private async resolveStation(caller: AccessTokenPayload, stationId: string): Promise<StationRef> {
+  private async resolveStation(
+    caller: AccessTokenPayload,
+    stationId: string,
+  ): Promise<StationRef> {
     const station = await this.presence.resolveById(stationId);
-    if (!station) throw new NotFoundException({ code: 'STATION_NOT_FOUND', error: 'station not found' });
+    if (!station)
+      throw new NotFoundException({
+        code: 'STATION_NOT_FOUND',
+        error: 'station not found',
+      });
     assertScope(caller, { branchId: station.branchId });
     return station;
   }
@@ -335,14 +453,23 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
   private async enqueue(data: CommandJobData): Promise<void> {
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`queue did not answer within ${ENQUEUE_TIMEOUT_MS}ms`)), ENQUEUE_TIMEOUT_MS);
+      timer = setTimeout(
+        () =>
+          reject(
+            new Error(`queue did not answer within ${ENQUEUE_TIMEOUT_MS}ms`),
+          ),
+        ENQUEUE_TIMEOUT_MS,
+      );
     });
     try {
       await Promise.race([
         this.queue.add('dispatch', data, {
           jobId: data.commandId,
           attempts: Number(this.config.get('COMMAND_MAX_ATTEMPTS') ?? 2),
-          backoff: { type: 'fixed', delay: Number(this.config.get('COMMAND_RETRY_BACKOFF_MS') ?? 1_000) },
+          backoff: {
+            type: 'fixed',
+            delay: Number(this.config.get('COMMAND_RETRY_BACKOFF_MS') ?? 1_000),
+          },
           // Drop finished jobs: the COMMAND row is the record of the outcome.
           removeOnComplete: true,
           removeOnFail: true,
@@ -364,8 +491,41 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
    * issues it only after an accepted login_result, or to resume a session the
    * station reports on reconnect. Station state still comes only from presence.
    */
-  async issueSessionUnlock(machineId: string, payload: SessionUnlockPayload, reason: string): Promise<boolean> {
+  async issueSessionUnlock(
+    machineId: string,
+    payload: SessionUnlockPayload,
+    reason: string,
+  ): Promise<boolean> {
     return this.issueSystem(machineId, 'UNLOCK', reason, payload);
+  }
+
+  /** Launches a reserved tournament game only after the station reports that exact session unlocked. */
+  async issueTournamentGameLaunch(
+    machineId: string,
+    sessionId: string,
+    gameDbId: string,
+    wireGameId: string,
+  ): Promise<boolean> {
+    const station = await this.presence.resolveById(machineId);
+    if (
+      !station ||
+      !this.presence.isOnline(station.serialNumber) ||
+      !this.registry.has(station.serialNumber)
+    )
+      return false;
+    const state = this.presence.agentStateOf(station.serialNumber);
+    if (
+      state?.locked !== false ||
+      state.sessionId !== sessionId ||
+      state.runningGameId === wireGameId
+    )
+      return false;
+    if (await this.repo.hasOpen(machineId, 'LAUNCH_GAME')) return false;
+    await this.dispatch(station, 'LAUNCH_GAME', SYSTEM_ACTOR_ID, {
+      payload: { gameId: wireGameId },
+      gameId: gameDbId,
+    });
+    return true;
   }
 
   /**
@@ -375,13 +535,25 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
    * open END_SESSION per station is enough. Settlement follows presence's
    * session.ended as for any other end.
    */
-  async issueSystemEndSession(machineId: string, reason: string, sessionId: string): Promise<boolean> {
-    return this.issueSystem(machineId, 'END_SESSION', reason, { reason }, async (station) => {
-      if (this.presence.sessionOf(station.serialNumber) !== sessionId) return false;
-      if (await this.repo.hasOpen(station.machineId, 'END_SESSION')) return false;
-      this.presence.expectSessionEnd(station.serialNumber, reason);
-      return true;
-    });
+  async issueSystemEndSession(
+    machineId: string,
+    reason: string,
+    sessionId: string,
+  ): Promise<boolean> {
+    return this.issueSystem(
+      machineId,
+      'END_SESSION',
+      reason,
+      { reason },
+      async (station) => {
+        if (this.presence.sessionOf(station.serialNumber) !== sessionId)
+          return false;
+        if (await this.repo.hasOpen(station.machineId, 'END_SESSION'))
+          return false;
+        this.presence.expectSessionEnd(station.serialNumber, reason);
+        return true;
+      },
+    );
   }
 
   /** Dispatches a SYSTEM_ACTOR_ID command to an online station; false (logged) when it cannot be delivered. */
@@ -395,16 +567,22 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
   ): Promise<boolean> {
     const station = await this.presence.resolveById(machineId);
     if (!station) {
-      this.logger.warn(`system ${type} for ${machineId} skipped: station not found (${reason})`);
+      this.logger.warn(
+        `system ${type} for ${machineId} skipped: station not found (${reason})`,
+      );
       return false;
     }
-    if (!this.presence.isOnline(station.serialNumber) || !this.registry.has(station.serialNumber)) {
-      this.logger.warn(`system ${type} for ${station.serialNumber} skipped: station offline (${reason})`);
+    if (
+      !this.presence.isOnline(station.serialNumber) ||
+      !this.registry.has(station.serialNumber)
+    ) {
+      this.logger.warn(
+        `system ${type} for ${station.serialNumber} skipped: station offline (${reason})`,
+      );
       return false;
     }
     if (beforeDispatch && !(await beforeDispatch(station))) return false;
     await this.dispatch(station, type, SYSTEM_ACTOR_ID, { payload });
     return true;
   }
-
 }

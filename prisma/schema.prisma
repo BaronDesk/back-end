@@ -670,6 +670,7 @@ model TournamentMember {
   amountPaid Int @default(0) @map("amount_paid")
   paidAt DateTime? @map("paid_at") @db.Timestamptz
   ledgerEntryId String? @unique @map("ledger_entry_id") @db.Uuid
+  refundLedgerEntryId String? @unique @map("refund_ledger_entry_id") @db.Uuid
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
   entrant TournamentEntrant @relation(fields: [tournamentId, entrantId], references: [tournamentId, id], onDelete: Cascade)
   tournament Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
