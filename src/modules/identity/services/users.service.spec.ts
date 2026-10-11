@@ -20,7 +20,15 @@ describe('UsersService', () => {
   let repo: Record<string, ReturnType<typeof vi.fn>>;
   let passwords: { hash: ReturnType<typeof vi.fn>; verify: ReturnType<typeof vi.fn> };
   let refreshTokens: { revokeAllForUser: ReturnType<typeof vi.fn> };
+  let ranks: { list: ReturnType<typeof vi.fn> };
   let service: UsersService;
+
+  // Wood → Bronze → Silver, as GET /ranks returns them.
+  const ladder = [
+    { id: 'wood', name: 'Wood', minXp: 0, badgeUrl: null },
+    { id: 'bronze', name: 'Bronze', minXp: 500, badgeUrl: '/uploads/images/bronze.webp' },
+    { id: 'silver', name: 'Silver', minXp: 1500, badgeUrl: null },
+  ];
 
   const user = (overrides: Record<string, unknown> = {}) => ({
     id: 'target', username: 't', role: 'EMPLOYEE', accountStatus: 'ACTIVE', createdAt: new Date(),
@@ -44,7 +52,8 @@ describe('UsersService', () => {
       verify: vi.fn(),
     };
     refreshTokens = { revokeAllForUser: vi.fn(async () => ({ count: 2 })) };
-    service = new UsersService(repo as any, passwords as any, refreshTokens as any, { record: vi.fn() } as any, { release: vi.fn(), save: vi.fn() } as any);
+    ranks = { list: vi.fn(async () => ladder) };
+    service = new UsersService(repo as any, passwords as any, refreshTokens as any, { record: vi.fn() } as any, { release: vi.fn(), save: vi.fn() } as any, ranks as any);
   });
 
   describe('role changes', () => {
@@ -115,6 +124,32 @@ describe('UsersService', () => {
       await expect(service.setHomeBranch(caller({ scope: 'self', role: 'GAMER' }), 'branch-b')).resolves.toMatchObject({ homeBranchId: 'branch-b' });
       repo.findById.mockResolvedValueOnce(user());
       await expect(service.setHomeBranch(caller({}), 'branch-b')).rejects.toMatchObject({ response: { code: 'NOT_A_GAMER' } });
+    });
+  });
+
+  describe('XP and rank', () => {
+    it("places a gamer's XP on the ranks: the rank reached and the next one", async () => {
+      repo.list.mockResolvedValueOnce([user({ role: 'GAMER', employeeProfile: null, gamerProfile: { id: 'gp', homeBranchId: 'branch-a', xp: 700 } })]);
+      const [gamer] = await service.searchGamers('ali');
+      expect(gamer).toMatchObject({
+        xp: 700,
+        rank: { name: 'Bronze', minXp: 500, badgeUrl: '/uploads/images/bronze.webp' },
+        nextRank: { name: 'Silver', minXp: 1500 },
+      });
+    });
+
+    it('gives staff no XP or rank, and reads no ranks for them', async () => {
+      const [employee] = await service.list(caller({ scope: 'hq', role: 'ADMIN', branchId: null }), { limit: 50 });
+      expect(employee).toMatchObject({ xp: null, rank: null, nextRank: null });
+      expect(ranks.list).not.toHaveBeenCalled();
+    });
+
+    it('reads the ranks once for a whole list', async () => {
+      const gamer = (xp: number) => user({ role: 'GAMER', employeeProfile: null, gamerProfile: { id: `gp-${xp}`, homeBranchId: 'branch-a', xp } });
+      repo.list.mockResolvedValueOnce([gamer(0), gamer(2000)]);
+      const result = await service.searchGamers('a');
+      expect(result.map((g) => g.rank?.name)).toEqual(['Wood', 'Silver']);
+      expect(ranks.list).toHaveBeenCalledTimes(1);
     });
   });
 

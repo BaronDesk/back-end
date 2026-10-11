@@ -7,5 +7,7 @@ import { RanksService } from './services/ranks.service.js';
 @Module({
   controllers: [RanksController],
   providers: [RanksService, RanksRepository],
+  // Identity places a gamer's XP on the ranks (GET /auth/me, user lists).
+  exports: [RanksService],
 })
 export class RanksModule {}

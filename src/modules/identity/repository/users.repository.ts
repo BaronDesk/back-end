@@ -4,10 +4,10 @@ import { BaseRepository } from '../../../common/repository/base.repository.js';
 import { PrismaService } from '../../../infra/prisma/prisma.service.js';
 import type { AccountStatus, Prisma, UserRole } from '../../../generated/prisma/index.js';
 
-/** Enough of the profiles for the public user shape: staff branch, gamer profile, home branch and avatar. */
+/** Enough of the profiles for the public user shape: staff branch, gamer profile, home branch, avatar and XP. */
 const withProfiles = {
   employeeProfile: true,
-  gamerProfile: { select: { id: true, homeBranchId: true, avatarUrl: true } },
+  gamerProfile: { select: { id: true, homeBranchId: true, avatarUrl: true, xp: true } },
 } as const;
 
 /** Page size cap for user lists. */

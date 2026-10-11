@@ -200,6 +200,7 @@ Badges (membership tiers, passes, ranks), game images and gamer avatars are file
 * Every picture is checked by its content, re-encoded as WebP (transparency kept, metadata such as a photo's GPS position dropped) and given a random name. Badges and game images fit in 512×512; avatars are 256×256.
 * A `badgeUrl` / `iconUrl` must be a link from `POST /uploads/images` (`/uploads/images/<id>.webp`) or `null`; any other link is refused (400).
 * When a row's image changes or the row is deleted, the old file is deleted once no other row uses it. A picture uploaded but never saved on a row stays on disk.
+* Every user the API returns (`GET /auth/me`, `GET /users`, `GET /gamers`, …) carries the gamer's `xp`, their `rank` (the highest whose `minXp` is at or below their XP) and the `nextRank` their XP bar fills towards, each `{ id, name, minXp, badgeUrl }`. Staff get `null` for all three, and so does `nextRank` at the top rank. XP is not awarded yet.
 * The files sit behind one class (`ImagesService`), so S3 or MinIO could replace the disk later.
 
 ## Realtime endpoints

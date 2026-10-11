@@ -123,4 +123,29 @@ describe('auth + rbac (e2e)', () => {
     const res = await app.inject({ method: 'GET', url: '/auth/me' });
     expect(res.statusCode).toBe(401);
   });
+
+  it("sends the gamer's XP, rank and next rank on /auth/me, and none for staff", async () => {
+    // Far above the seeded ranks, so the result doesn't depend on them.
+    const base = 900_000_000;
+    const names = [`rank-${randomUUID()}`, `rank-${randomUUID()}`];
+    await prisma.rank.createMany({ data: [{ name: names[0], minXp: base }, { name: names[1], minXp: base + 1000 }] });
+    try {
+      const user = await prisma.user.findUniqueOrThrow({ where: { username: gamerUsername } });
+      await prisma.gamerProfile.update({ where: { userId: user.id }, data: { xp: base + 15 } });
+
+      const login = async (username: string) =>
+        (await app.inject({ method: 'POST', url: '/auth/login', payload: { username, password } })).json().accessToken;
+      const me = async (username: string) =>
+        (await app.inject({ method: 'GET', url: '/auth/me', headers: { authorization: `Bearer ${await login(username)}` } })).json();
+
+      expect(await me(gamerUsername)).toMatchObject({
+        xp: base + 15,
+        rank: { name: names[0], minXp: base, badgeUrl: null },
+        nextRank: { name: names[1], minXp: base + 1000 },
+      });
+      expect(await me(adminUsername)).toMatchObject({ xp: null, rank: null, nextRank: null });
+    } finally {
+      await prisma.rank.deleteMany({ where: { name: { in: names } } });
+    }
+  });
 });

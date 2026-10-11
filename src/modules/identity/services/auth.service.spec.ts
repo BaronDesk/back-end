@@ -7,6 +7,7 @@ describe('AuthService', () => {
   let refreshTokens: Record<string, ReturnType<typeof vi.fn>>;
   let passwords: { verify: ReturnType<typeof vi.fn> };
   let tokens: Record<string, ReturnType<typeof vi.fn>>;
+  let ranks: { list: ReturnType<typeof vi.fn> };
   let service: AuthService;
 
   const user = (overrides: Record<string, unknown> = {}) => ({
@@ -37,7 +38,8 @@ describe('AuthService', () => {
       refreshTtlToDate: vi.fn(() => new Date()),
       verifyRefreshToken: vi.fn(async () => ({ sub: 'u1', jti: 'r1' })),
     };
-    service = new AuthService(users as any, refreshTokens as any, passwords as any, tokens as any);
+    ranks = { list: vi.fn(async () => [{ id: 'wood', name: 'Wood', minXp: 0, badgeUrl: null }, { id: 'bronze', name: 'Bronze', minXp: 500, badgeUrl: null }]) };
+    service = new AuthService(users as any, refreshTokens as any, passwords as any, tokens as any, ranks as any);
   });
 
   it('logs an active user in', async () => {
@@ -77,6 +79,21 @@ describe('AuthService', () => {
     await expect(service.changePassword({ sub: 'u1' } as any, { currentPassword: 'bad', newPassword: 'new-secret-1' })).rejects.toMatchObject({
       response: { code: 'INVALID_CREDENTIALS' },
     });
+  });
+
+  it("sends a gamer's XP, rank and next rank on /auth/me", async () => {
+    users.findById.mockResolvedValue(user({ gamerProfile: { id: 'gp', homeBranchId: 'b1', avatarUrl: null, xp: 15 } }));
+    await expect(service.me({ sub: 'u1' } as any)).resolves.toMatchObject({
+      xp: 15,
+      rank: { name: 'Wood', minXp: 0 },
+      nextRank: { name: 'Bronze', minXp: 500 },
+    });
+  });
+
+  it('sends staff no XP or rank on /auth/me', async () => {
+    users.findById.mockResolvedValue(user({ role: 'EMPLOYEE', employeeProfile: { managedBranchId: 'b1' } }));
+    await expect(service.me({ sub: 'u1' } as any)).resolves.toMatchObject({ xp: null, rank: null, nextRank: null });
+    expect(ranks.list).not.toHaveBeenCalled();
   });
 
   it('rotates a valid refresh token', async () => {
