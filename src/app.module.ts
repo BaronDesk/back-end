@@ -26,6 +26,7 @@ import { BranchesModule } from './modules/branches/branches.module.js';
 import { AuditLogModule } from './common/audit/audit-log.module.js';
 import { UploadsModule } from './modules/uploads/uploads.module.js';
 import { RanksModule } from './modules/ranks/ranks.module.js';
+import { TournamentsModule } from './modules/tournaments/tournaments.module.js';
 
 
 @Module({
@@ -48,6 +49,7 @@ import { RanksModule } from './modules/ranks/ranks.module.js';
     ReservationsModule,
     BranchesModule,
     RanksModule,
+    TournamentsModule,
     SessionBillingModule,
     HealthModule,
   ],

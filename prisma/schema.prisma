@@ -43,6 +43,45 @@ enum TransactionType {
   DEBIT
 }
 
+enum TournamentStatus {
+  DRAFT
+  REGISTRATION_OPEN
+  REGISTRATION_CLOSED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+enum TournamentEntrantKind {
+  SOLO
+  TEAM
+}
+enum TournamentEntrantStatus {
+  FORMING
+  CONFIRMED
+  CHECKED_IN
+  ELIMINATED
+  WINNER
+  WITHDRAWN
+  DISQUALIFIED
+}
+enum TournamentMemberRole {
+  CAPTAIN
+  MEMBER
+}
+enum TournamentMemberStatus {
+  INVITED
+  PAYMENT_PENDING
+  PAID
+  REFUNDED
+  REMOVED
+}
+enum TournamentMatchStatus {
+  PENDING
+  READY
+  IN_PROGRESS
+  COMPLETED
+}
+
 enum ReservationStatus {
   PENDING
   CONFIRMED
@@ -161,6 +200,7 @@ model Branch {
   enrollmentTokens  EnrollmentToken[]
   gamers            GamerProfile[]
   auditLogs         AuditLog[]
+  tournaments       Tournament[]
 
   @@index([name])
   @@map("branches")
@@ -257,6 +297,7 @@ model GamerProfile {
   reservations  Reservation[]
   memberships   Membership[]
   subscriptions Subscription[]
+  tournamentMembers TournamentMember[]
 
   @@index([userId])
   @@index([homeBranchId])
@@ -390,6 +431,7 @@ model Game {
   machineGames MachineGame[]
   gameBranches GameBranch[]
   commands     Command[]
+  tournaments  Tournament[]
 
   @@index([enabled, sortOrder])
   @@map("games")
@@ -559,6 +601,10 @@ model Reservation {
   gamerProfile GamerProfile @relation(fields: [gamerProfileId], references: [id], onDelete: Cascade)
   machine      Machine      @relation(fields: [machineId], references: [id], onDelete: Cascade)
   sessions     Session[]
+  tournamentId String? @map("tournament_id") @db.Uuid
+  tournamentMatchId String? @map("tournament_match_id") @db.Uuid
+  tournament Tournament? @relation(fields: [tournamentId], references: [id], onDelete: SetNull)
+  tournamentMatch TournamentMatch? @relation(fields: [tournamentMatchId], references: [id], onDelete: SetNull)
 
   @@index([gamerProfileId])
   @@index([machineId])
@@ -566,6 +612,94 @@ model Reservation {
   @@index([startTime])
   @@index([createdAt])
   @@map("reservations")
+}
+
+model Tournament {
+  id                   String           @id @default(uuid()) @db.Uuid
+  branchId             String           @map("branch_id") @db.Uuid
+  gameId               String           @map("game_id") @db.Uuid
+  status               TournamentStatus @default(DRAFT)
+  entryFeePerPlayer    Int              @map("entry_fee_per_player")
+  teamSize             Int              @default(1) @map("team_size")
+  maxEntrants          Int              @map("max_entrants")
+  registrationClosesAt DateTime         @map("registration_closes_at") @db.Timestamptz
+  checkInOpensAt       DateTime         @map("check_in_opens_at") @db.Timestamptz
+  checkInClosesAt      DateTime         @map("check_in_closes_at") @db.Timestamptz
+  publishedAt          DateTime?        @map("published_at") @db.Timestamptz
+  prizesJson           Json             @default("[]") @map("prizes_json")
+  createdAt            DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt            DateTime         @updatedAt @map("updated_at") @db.Timestamptz
+  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  game Game @relation(fields: [gameId], references: [id], onDelete: Restrict)
+  entrants TournamentEntrant[]
+  members TournamentMember[]
+  matches TournamentMatch[]
+  reservations Reservation[]
+  @@index([branchId, status])
+  @@index([status, registrationClosesAt])
+  @@map("tournaments")
+}
+
+model TournamentEntrant {
+  id String @id @default(uuid()) @db.Uuid
+  tournamentId String @map("tournament_id") @db.Uuid
+  kind TournamentEntrantKind
+  name String
+  seed Int?
+  checkedInAt DateTime? @map("checked_in_at") @db.Timestamptz
+  status TournamentEntrantStatus @default(FORMING)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  tournament Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  members TournamentMember[]
+  matchesAsOne TournamentMatch[] @relation("EntrantOne")
+  matchesAsTwo TournamentMatch[] @relation("EntrantTwo")
+  wonMatches TournamentMatch[] @relation("MatchWinner")
+  @@unique([tournamentId, id])
+  @@index([tournamentId, status])
+  @@map("tournament_entrants")
+}
+
+model TournamentMember {
+  id String @id @default(uuid()) @db.Uuid
+  entrantId String @map("entrant_id") @db.Uuid
+  tournamentId String @map("tournament_id") @db.Uuid
+  gamerProfileId String @map("gamer_profile_id") @db.Uuid
+  role TournamentMemberRole @default(MEMBER)
+  status TournamentMemberStatus @default(INVITED)
+  amountDue Int @map("amount_due")
+  amountPaid Int @default(0) @map("amount_paid")
+  paidAt DateTime? @map("paid_at") @db.Timestamptz
+  ledgerEntryId String? @unique @map("ledger_entry_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  entrant TournamentEntrant @relation(fields: [tournamentId, entrantId], references: [tournamentId, id], onDelete: Cascade)
+  tournament Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  gamerProfile GamerProfile @relation(fields: [gamerProfileId], references: [id], onDelete: Cascade)
+  @@unique([tournamentId, gamerProfileId])
+  @@index([entrantId, status])
+  @@map("tournament_members")
+}
+
+model TournamentMatch {
+  id String @id @default(uuid()) @db.Uuid
+  tournamentId String @map("tournament_id") @db.Uuid
+  round Int
+  position Int
+  version Int @default(1)
+  status TournamentMatchStatus @default(PENDING)
+  entrant1Id String? @map("entrant1_id") @db.Uuid
+  entrant2Id String? @map("entrant2_id") @db.Uuid
+  winnerEntrantId String? @map("winner_entrant_id") @db.Uuid
+  scoresJson Json? @map("scores_json")
+  nextMatchId String? @map("next_match_id") @db.Uuid
+  nextMatchSlot Int? @map("next_match_slot")
+  tournament Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  entrant1 TournamentEntrant? @relation("EntrantOne", fields: [entrant1Id], references: [id], onDelete: SetNull)
+  entrant2 TournamentEntrant? @relation("EntrantTwo", fields: [entrant2Id], references: [id], onDelete: SetNull)
+  winner TournamentEntrant? @relation("MatchWinner", fields: [winnerEntrantId], references: [id], onDelete: SetNull)
+  reservations Reservation[]
+  @@unique([tournamentId, round, position])
+  @@index([tournamentId, status])
+  @@map("tournament_matches")
 }
 
 model Session {

@@ -33,7 +33,8 @@ export const SERVER_MESSAGE_TYPES = {
   STATION_CREDENTIAL: 'station_credential',
 } as const;
 
-export type AgentMessageType = (typeof AGENT_MESSAGE_TYPES)[keyof typeof AGENT_MESSAGE_TYPES];
+export type AgentMessageType =
+  (typeof AGENT_MESSAGE_TYPES)[keyof typeof AGENT_MESSAGE_TYPES];
 
 export const DASHBOARD_EVENTS = {
   STATION_STATUS: 'station_status',
@@ -48,5 +49,7 @@ export const DASHBOARD_EVENTS = {
   /** To the gamer: low balance / time left / clear, as shown on the station. */
   SESSION_NOTICE: 'session_notice',
   PERIPHERAL_STATUS: 'peripheral_status',
+  TOURNAMENT_UPDATE: 'tournament_update',
 } as const;
-export type DashboardEvent = (typeof DASHBOARD_EVENTS)[keyof typeof DASHBOARD_EVENTS];
+export type DashboardEvent =
+  (typeof DASHBOARD_EVENTS)[keyof typeof DASHBOARD_EVENTS];
