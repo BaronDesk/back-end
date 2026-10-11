@@ -45,11 +45,12 @@ export class SubscriptionsController {
   @RequireScope('admin')
   @Patch('subscription-plans/:id')
   updatePlan(
+    @CurrentUser() caller: AccessTokenPayload,
     @Param('id', new ZodValidationPipe(idParamSchema)) id: string,
     @Body(new ZodValidationPipe(updateSubscriptionPlanSchema))
     dto: UpdateSubscriptionPlanDto,
   ) {
-    return this.subscriptions.updatePlan(id, dto);
+    return this.subscriptions.updatePlan(caller, id, dto);
   }
 
   @RequireScope('admin')

@@ -50,6 +50,10 @@ export class MachinesRepository extends BaseRepository {
     return this.prisma.machine.update({ where: { id }, data: { peripherals, peripheralsReportedAt: reportedAt } });
   }
 
+  setPolicy(id: string, policy: Prisma.InputJsonValue) {
+    return this.prisma.machine.update({ where: { id }, data: { policy } });
+  }
+
   rename(id: string, name: string) {
     return this.prisma.machine.update({ where: { id }, data: { name } });
   }

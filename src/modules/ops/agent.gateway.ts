@@ -41,6 +41,7 @@ import {
   commandNackPayloadSchema,
   NACK_CODES,
   type CommandSimulation,
+  type PolicyUpdatePayload,
   type StationCommandType,
 } from './schemas/command.schemas.js';
 import {
@@ -381,6 +382,13 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     if (renewed) {
       this.send(socket, conn, SERVER_MESSAGE_TYPES.STATION_CREDENTIAL, { stationToken: renewed });
       this.logger.log(`renewed the station credential of ${handshake.serialNumber}`);
+    }
+
+    const policy = await this.presence.getStoredPolicy(conn.principal.machineId);
+    if (policy) {
+      await this.commands
+        .issuePolicyUpdate(conn.principal.machineId, policy as PolicyUpdatePayload)
+        .catch((err) => this.logger.error(`policy resend for ${handshake.serialNumber} failed: ${(err as Error).message}`));
     }
   }
 
