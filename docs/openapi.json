@@ -4607,6 +4607,41 @@
         "description": "Needs a bearer token. Minimum scope: **self** (any signed-in user)."
       }
     },
+    "/sessions/me/history": {
+      "get": {
+        "operationId": "SessionsController_history",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": ""
+          },
+          "401": {
+            "description": "Missing or invalid access token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "error": "Unauthorized",
+                  "code": "UNAUTHORIZED"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Sessions"
+        ],
+        "summary": "History (sessions)",
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "description": "Needs a bearer token. Minimum scope: **self** (any signed-in user)."
+      }
+    },
     "/sessions/{id}": {
       "get": {
         "operationId": "SessionsController_get",

@@ -110,7 +110,7 @@ Docker Compose reads `.env` when it creates a container. After editing it, run `
 
 ## Seed data
 
-`npm run db:seed` fills the database (safe to run again). It creates the price list (4000 coins/h walk-in and booked), 2 branches with machines, 6 games, membership and subscription plans, the 7 ranks (Wood → GrandMaster), the Graphic-Charter badges of the tiers, passes and ranks (from `prisma/seed-assets/badges`, written to `UPLOAD_DIR`; a badge already set is kept), 2 managers, 4 employees and 10 gamers (one per XP tier), plus reservations and sessions in every status. All seeded accounts use the password `password123`. Usernames include `gamer.gold`, `gamer.silver`, `gamer.newbie`; see the header of [prisma/seed.ts](prisma/seed.ts) for the full list.
+`npm run db:seed` fills the database (safe to run again). It creates the price list (4000 coins/h walk-in and booked), 2 branches with machines, 9 games (League of Legends, Brawlhalla and Minecraft with their posters from `prisma/seed-assets/games`), membership and subscription plans, the 7 ranks (Wood → GrandMaster), the Graphic-Charter badges of the tiers, passes and ranks (from `prisma/seed-assets/badges`, written to `UPLOAD_DIR`; a badge already set is kept), 2 managers, 4 employees and 10 gamers (one per XP tier), plus reservations and sessions in every status. All seeded accounts use the password `password123`. Usernames include `gamer.gold`, `gamer.silver`, `gamer.newbie`; see the header of [prisma/seed.ts](prisma/seed.ts) for the full list.
 
 ## Without Docker
 
@@ -201,7 +201,7 @@ Badges (membership tiers, passes, ranks), game images and gamer avatars are file
 * A `badgeUrl` / `iconUrl` must be a link from `POST /uploads/images` (`/uploads/images/<id>.webp`) or `null`; any other link is refused (400).
 * When a row's image changes or the row is deleted, the old file is deleted once no other row uses it. A picture uploaded but never saved on a row stays on disk.
 * Every user the API returns (`GET /auth/me`, `GET /users`, `GET /gamers`, …) carries the gamer's `xp`, their `rank` (the highest whose `minXp` is at or below their XP) and the `nextRank` their XP bar fills towards, each `{ id, name, minXp, badgeUrl }`. Staff get `null` for all three, and so does `nextRank` at the top rank.
-* XP is earned by playing: **25 XP per 15 min** metered (paused time doesn't count), by the second and rounded down (1 XP every 36 s; 1 h = 100 XP). It is added when the session settles, in the same transaction that closes it, so a session gives its XP once; the bill records it as `billingBreakdown.xpEarned`. Free play (a pass window) and a bill the wallet couldn't fully cover earn XP too.
+* XP is earned by playing: **25 XP per 15 min** metered (paused time doesn't count), by the second and rounded down (1 XP every 36 s; 1 h = 100 XP). It is added when the session settles, in the same transaction that closes it, so a session gives its XP once; the bill records it as `billingBreakdown.xpEarned`. `GET /sessions/me/history` (the gamer) lists their 50 latest settled sessions: PC, branch, time played, `totalCoins`, `chargedCoins` and `xpEarned` (null for sessions settled before XP existed). Free play (a pass window) and a bill the wallet couldn't fully cover earn XP too.
 * The files sit behind one class (`ImagesService`), so S3 or MinIO could replace the disk later.
 
 ## Realtime endpoints

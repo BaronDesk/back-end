@@ -378,6 +378,17 @@ describe('session billing (e2e)', () => {
     const me = await app.inject({ method: 'GET', url: '/auth/me', headers: as(gamer.token) });
     expect(me.json().xp).toBe(billingBreakdown.xpEarned);
 
+    // Sessions History lists it, with the bill and the XP.
+    const history = await app.inject({ method: 'GET', url: '/sessions/me/history', headers: as(gamer.token) });
+    expect(history.statusCode).toBe(200);
+    expect(history.json()[0]).toMatchObject({
+      sessionId,
+      meteredSeconds,
+      totalCoins: billingBreakdown.totalCoins,
+      chargedCoins: billingBreakdown.chargedCoins,
+      xpEarned: billingBreakdown.xpEarned,
+    });
+
     // Closing it again is refused and gives no more XP.
     expect((await end(sessionId)).statusCode).toBe(409);
     const profile = await prisma.gamerProfile.findUniqueOrThrow({ where: { id: gamer.profileId } });

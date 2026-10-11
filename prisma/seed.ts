@@ -5,7 +5,7 @@
 *
 * Pricing:             one price list for every branch: 4000 coins/h (1 DT per 15 min) walk-in and booked
 * Branches (2):        CENTRE El Manar, CENTRE Lac 2 — each w/ 5 machines + full game catalog
-* Games (6):            cs2, valorant, dota2, lol, fortnite, fc25
+* Games (9):            notepad, cs2, valorant, dota2, lol, fortnite, fc25, brawlhalla, minecraft (lol, brawlhalla, minecraft with posters)
 * Membership plans (3): Standard (free/0%), Pro (15000 coins/mo, 10%), Elite (30000 coins/mo, 20%)
 * Subscription plans:   The Night Owl (25000 coins/mo), The Weekend Warrior (40000 coins/mo)
 * Ranks (7):           Wood 0 XP, Bronze 500, Silver 1500, Gold 4000, Diamond 8000, Master 15000, GrandMaster 25000
@@ -74,17 +74,21 @@ async function hashPassword(plain: string): Promise<string> {
 // Same folder as the backend (UploadsModule): /app/uploads in Docker, the `uploads` volume.
 const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR ?? 'uploads');
 const BADGES = path.join(import.meta.dirname, 'seed-assets', 'badges');
+const POSTERS = path.join(import.meta.dirname, 'seed-assets', 'games');
 
 /**
- * Gives a row its Graphic-Charter badge, unless it has a badge whose file is
+ * Gives a row its Graphic-Charter image, unless it has one whose file is
  * there (set by an earlier run, or by an admin since). Returns whether it wrote one.
  */
-async function seedBadge(folder: string, name: string, current: string | null, save: (badgeUrl: string) => Promise<unknown>) {
+async function seedImage(source: string, current: string | null, save: (url: string) => Promise<unknown>) {
   const file = current ? fileOf(UPLOAD_DIR, current) : null;
   if (current && (!file || (await access(file).then(() => true, () => false)))) return false;
-  await save(await writeImage(UPLOAD_DIR, await readFile(path.join(BADGES, folder, `${name}.webp`)), 'image'));
+  await save(await writeImage(UPLOAD_DIR, await readFile(source), 'image'));
   return true;
 }
+
+const seedBadge = (folder: string, name: string, current: string | null, save: (badgeUrl: string) => Promise<unknown>) =>
+  seedImage(path.join(BADGES, folder, `${name}.webp`), current, save);
 
 interface LedgerPlan {
   amount: number; // signed + credit, - debit
@@ -248,6 +252,14 @@ async function main() {
     },
     { gameId: 'fortnite', name: 'Fortnite', launchType: 'epic' as const, target: 'Fortnite', processName: 'FortniteClient-Win64-Shipping.exe' },
     { gameId: 'fc25', name: 'EA Sports FC 25', launchType: 'steam' as const, target: '2195250', processName: 'FC25.exe' },
+    { gameId: 'brawlhalla', name: 'Brawlhalla', launchType: 'steam' as const, target: '291550', processName: 'Brawlhalla.exe' },
+    {
+      gameId: 'minecraft',
+      name: 'Minecraft',
+      launchType: 'exe' as const,
+      target: 'C:\\Program Files (x86)\\Minecraft Launcher\\MinecraftLauncher.exe',
+      processName: 'javaw.exe',
+    },
   ];
   const games: Record<string, Awaited<ReturnType<typeof prisma.game.upsert>>> = {};
   for (const [i, seed] of gameSeeds.entries()) {
@@ -267,6 +279,14 @@ async function main() {
     }
   }
   console.log(`seeded ${Object.keys(games).length} game(s), assigned to every branch`);
+
+  // --- Game posters (Graphic-Charter/Games Posters; the portal's collection shows them) ---
+  let posters = 0;
+  for (const gameId of ['lol', 'brawlhalla', 'minecraft']) {
+    const game = await prisma.game.findUniqueOrThrow({ where: { gameId } });
+    if (await seedImage(path.join(POSTERS, `${gameId}.webp`), game.iconUrl, (iconUrl) => prisma.game.update({ where: { id: game.id }, data: { iconUrl } }))) posters++;
+  }
+  console.log(`seeded ${posters} game poster(s) into ${UPLOAD_DIR}`);
 
   // --- Machines ---
   const machinesByBranch: Record<string, Awaited<ReturnType<typeof prisma.machine.upsert>>[]> = {};

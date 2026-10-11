@@ -96,6 +96,25 @@ export class SessionsRepository extends BaseRepository {
     });
   }
 
+  /** The gamer's settled sessions, latest first, with the PC and its branch. */
+  listSettledForGamer(gamerProfileId: string, limit: number) {
+    return this.prisma.session.findMany({
+      where: { status: 'COMPLETED', settledAt: { not: null }, reservation: { gamerProfileId } },
+      orderBy: { settledAt: 'desc' },
+      take: limit,
+      select: {
+        id: true,
+        startTime: true,
+        settledAt: true,
+        meteredSeconds: true,
+        billingBreakdown: true,
+        reservation: {
+          select: { isWalkIn: true, machine: { select: { name: true, serialNumber: true, branch: { select: { name: true } } } } },
+        },
+      },
+    });
+  }
+
   gamerProfileIdForUser(userId: string) {
     return this.prisma.gamerProfile.findUnique({ where: { userId }, select: { id: true } }).then((p) => p?.id ?? null);
   }
