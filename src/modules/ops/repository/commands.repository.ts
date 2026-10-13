@@ -17,6 +17,9 @@ export class CommandsRepository extends BaseRepository {
     type: CommandType;
     issuedBy: string;
     gameId?: string;
+    /** Set for a command resolved at creation (APPLIED_ON_RECONNECT): never queued. */
+    status?: CommandStatus;
+    resolvedAt?: Date;
   }) {
     return this.prisma.command.create({ data });
   }

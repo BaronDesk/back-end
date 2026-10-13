@@ -196,6 +196,28 @@ export class SessionsRepository extends BaseRepository {
   }
 
   /**
+   * Adds `seconds` of play to a session paused offline at `pausedAt`, once:
+   * only while it is still that very pause, and not already billed for it.
+   * False when another path got there first (a resume, a settle, a repeat).
+   */
+  async billOfflineOnce(id: string, pausedAt: Date, seconds: number): Promise<boolean> {
+    const { count } = await this.prisma.session.updateMany({
+      where: {
+        id,
+        status: 'PAUSED',
+        lockedAt: pausedAt,
+        OR: [{ offlineBilledFor: null }, { offlineBilledFor: { not: pausedAt } }],
+      },
+      data: {
+        meteredSeconds: { increment: seconds },
+        offlineBilledSeconds: { increment: seconds },
+        offlineBilledFor: pausedAt,
+      },
+    });
+    return count > 0;
+  }
+
+  /**
    * The PENDING session a login on this station is for: its booking has
    * started (a PIN never works early), is CONFIRMED and its window not over.
    */

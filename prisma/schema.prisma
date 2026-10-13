@@ -113,6 +113,9 @@ enum CommandStatus {
   NACKED
   TIMEOUT
   FAILED
+  // A staff LOCK / END_SESSION the station could not receive: applied to the
+  // session from server state, and enforced when the PC reconnects.
+  APPLIED_ON_RECONNECT
 }
 
 enum AuditAction {
@@ -575,7 +578,9 @@ model Session {
   status              SessionStatus @default(PENDING)
   // --- billing (feat/session-billing) ---
   lockedAt            DateTime?     @map("locked_at") @db.Timestamptz
-  // Why the backend locked it ("runout" = out of funds: a top-up resumes it). Null otherwise.
+  // Why it is locked: "runout" (out of funds: a top-up resumes it), "staff" (a
+  // staff LOCK: only a staff UNLOCK resumes it), "offline" (the station went
+  // away: resumed on reconnect). Null otherwise.
   lockReason          String?       @map("lock_reason")
   meteringStartedAt   DateTime?     @map("metering_started_at") @db.Timestamptz
   meteredSeconds      Int           @default(0) @map("metered_seconds")
@@ -588,6 +593,11 @@ model Session {
   // When the "time left" notice for the current end went out (reset by an extension).
   endingNoticeSentAt  DateTime?     @map("ending_notice_sent_at") @db.Timestamptz
   billingBreakdown    Json?         @map("billing_breakdown")
+  // Play time billed after a single station's drop (last heartbeat -> the
+  // station's own lock, capped by the lease), and the pause it was billed for
+  // (its lockedAt): each offline pause is billed at most once.
+  offlineBilledSeconds Int          @default(0) @map("offline_billed_seconds")
+  offlineBilledFor    DateTime?     @map("offline_billed_for") @db.Timestamptz
   settledAt           DateTime?     @map("settled_at") @db.Timestamptz
   // --- station login PIN: only the hash is stored; single-use, short-lived ---
   pinHash             String?       @map("pin_hash")

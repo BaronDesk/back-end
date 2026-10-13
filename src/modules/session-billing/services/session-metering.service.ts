@@ -158,6 +158,29 @@ export class SessionMeteringService implements OnModuleInit {
     await this.runoutTimer.cancel(session.id);
   }
 
+  /**
+   * After a single station's drop: the gamer kept playing on the unlocked PC
+   * until it locked itself, so bill from the pause (its last heartbeat) to
+   * `stationLockedAt`, never past `maxSeconds` after the pause (the lease it
+   * held, plus grace) nor the booking end. Once per pause: a repeated
+   * reconnect bills nothing more. Returns the session as billed.
+   */
+  async billOfflineDrop(session: SettlementSession, stationLockedAt: Date, maxSeconds: number): Promise<SettlementSession> {
+    const pausedAt = session.lockedAt;
+    if (session.status !== 'PAUSED' || !pausedAt) return session;
+    if (session.offlineBilledFor?.getTime() === pausedAt.getTime()) return session;
+    const until = new Date(Math.min(stationLockedAt.getTime(), pausedAt.getTime() + maxSeconds * 1000, session.endTime.getTime()));
+    const seconds = until > pausedAt ? secondsBetween(pausedAt, until) : 0;
+    if (seconds <= 0 || !(await this.repo.billOfflineOnce(session.id, pausedAt, seconds))) return session;
+    this.logger.log(`session ${session.id}: billed ${seconds}s played after the station dropped at ${pausedAt.toISOString()}`);
+    return {
+      ...session,
+      meteredSeconds: session.meteredSeconds + seconds,
+      offlineBilledSeconds: (session.offlineBilledSeconds ?? 0) + seconds,
+      offlineBilledFor: pausedAt,
+    };
+  }
+
   // --- settlement ----------------------------------------------------------
 
   /**
@@ -185,6 +208,8 @@ export class SessionMeteringService implements OnModuleInit {
       appliedMembershipId: session.appliedMembershipId,
       endReason: reason,
     };
+    // Play billed after a single station's drop (already in meteredSeconds).
+    if (session.offlineBilledSeconds) breakdown.offlineBilledSeconds = session.offlineBilledSeconds;
 
     if (totalCents > 0) {
       try {

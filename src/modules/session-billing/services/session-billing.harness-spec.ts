@@ -94,6 +94,7 @@ export function createHarness() {
     findEndingSoon: vi.fn(async () => []),
     extendIfFree: vi.fn(async (input) => ({ kind: 'extended', session: sessionRow({ ...input.session, endTime: input.to }) })),
     isMachineBusy: vi.fn(async () => false),
+    billOfflineOnce: vi.fn(async () => true),
   };
   const presence: Record<string, any> = {
     statusChanges: new Subject(),
@@ -102,6 +103,8 @@ export function createHarness() {
     resolve: vi.fn(() => STATION),
     sessionOf: vi.fn(() => 's1'),
     lastSeenBeforeConnect: vi.fn(() => null),
+    lastContactOf: vi.fn(() => null),
+    outageOf: vi.fn(() => null),
   };
   const agents: { sendControl: ReturnType<typeof vi.fn> } = { sendControl: vi.fn(() => true) };
   const dashboard: { publishToBranch: ReturnType<typeof vi.fn>; publishToUser: ReturnType<typeof vi.fn> } = { publishToBranch: vi.fn(), publishToUser: vi.fn() };
@@ -141,7 +144,9 @@ export function createHarness() {
     repo as any, presence as any, wallet as any, commands as any, runoutTimer as any, dashboard as any, metering, notices, config as any,
   );
   const login = new SessionLoginService(repo as any, metering, config as any);
-  const stationLink = new StationLinkService(repo as any, presence as any, commands as any, runoutTimer as any, metering, runout, config as any);
+  const stationLink = new StationLinkService(
+    repo as any, presence as any, commands as any, runoutTimer as any, metering, runout, dashboard as any, config as any,
+  );
   const extensions = new SessionExtensionsService(repo as any, wallet as any, metering, runout, notices);
   const sweep = new SessionSweepService(repo as any, metering, notices, config as any);
   const queries = new SessionQueriesService(repo as any, wallet as any);

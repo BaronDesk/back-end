@@ -6,7 +6,7 @@ import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
 import { StationNotConnectedError } from '../agent.gateway.js';
 import { CommandAckTracker } from './command-ack-tracker.js';
 import { CommandProcessor } from './command.processor.js';
-import { CommandsService, SYSTEM_ACTOR_ID } from './commands.service.js';
+import { CommandsService, STATION_OFFLINE_MESSAGE, SYSTEM_ACTOR_ID } from './commands.service.js';
 import { issueCommandBodySchema } from '../schemas/command.schemas.js';
 
 const STATION = { machineId: 'm1', branchId: 'b1', serialNumber: 'SN-1' };
@@ -47,7 +47,8 @@ describe('CommandsService', () => {
   let queue: { add: ReturnType<typeof vi.fn> };
   let games: { findLaunchable: ReturnType<typeof vi.fn>; catalogChanges: Subject<unknown> };
   let tracker: CommandAckTracker;
-  let sessions: { unlockFor: ReturnType<typeof vi.fn>; closeForShutdown: ReturnType<typeof vi.fn> };
+  let sessions: Record<string, ReturnType<typeof vi.fn>>;
+  let audit: { record: ReturnType<typeof vi.fn> };
   let service: CommandsService;
 
   const GAME = { id: '9d3c1f4e-8a55-4d1b-9a36-2f0f5c1e7b20', gameId: 'cs2', enabled: true };
@@ -79,7 +80,11 @@ describe('CommandsService', () => {
     sessions = {
       unlockFor: vi.fn(async () => ({ sessionId: 'sess-1', leaseSeconds: 180, serverTime: new Date().toISOString() })),
       closeForShutdown: vi.fn(async () => undefined),
+      markStaffLock: vi.fn(async () => undefined),
+      lockWhileOffline: vi.fn(async () => false),
+      endWhileOffline: vi.fn(async () => false),
     };
+    audit = { record: vi.fn(async () => undefined) };
     const port = { current: sessions };
     service = new CommandsService(
       repo as any,
@@ -91,7 +96,7 @@ describe('CommandsService', () => {
       config({ NODE_ENV: 'development', COMMAND_MAX_ATTEMPTS: 2 }),
       games as any,
       port as any,
-      { record: vi.fn() } as any,
+      audit as any,
     );
   });
 
@@ -172,6 +177,98 @@ describe('CommandsService', () => {
     presence.isOnline.mockReturnValue(false);
     await expect(service.issue(caller(), 'm1', { type: 'LOCK' })).rejects.toBeInstanceOf(ConflictException);
     expect(repo.create).not.toHaveBeenCalled();
+  });
+
+  it('marks the session locked by staff when a LOCK goes out', async () => {
+    await service.issue(caller(), 'm1', { type: 'LOCK' });
+    expect(sessions.markStaffLock).toHaveBeenCalledWith(STATION);
+    await service.issue(caller(), 'm1', { type: 'LOCK', simulate: 'stale_ts' });
+    expect(sessions.markStaffLock).toHaveBeenCalledTimes(1);
+  });
+
+  describe('a station that is not connected', () => {
+    beforeEach(() => presence.isOnline.mockReturnValue(false));
+
+    it('applies a staff LOCK to its open session: APPLIED_ON_RECONNECT, audited, never queued', async () => {
+      sessions.lockWhileOffline.mockResolvedValueOnce(true);
+      const dto = await service.issue(caller(), 'm1', { type: 'LOCK' });
+      expect(sessions.lockWhileOffline).toHaveBeenCalledWith(STATION);
+      expect(repo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'LOCK', issuedBy: 'u1', status: 'APPLIED_ON_RECONNECT', resolvedAt: expect.any(Date) }),
+      );
+      expect(dto.status).toBe('APPLIED_ON_RECONNECT');
+      expect(queue.add).not.toHaveBeenCalled();
+      expect(dashboard.publishToBranch).toHaveBeenCalledWith('b1', 'command_update', expect.objectContaining({ status: 'APPLIED_ON_RECONNECT' }));
+      expect(audit.record).toHaveBeenCalledWith('u1', 'UPDATE', 'machine:m1', {
+        branchId: 'b1',
+        metadata: { event: 'STATION_LOCK_APPLIED_ON_RECONNECT', commandId: dto.commandId },
+      });
+    });
+
+    it('applies a staff END_SESSION by closing its open session from server state', async () => {
+      sessions.endWhileOffline.mockResolvedValueOnce(true);
+      const dto = await service.issue(caller(), 'm1', { ...endSession, reason: 'closing' });
+      expect(sessions.endWhileOffline).toHaveBeenCalledWith(STATION, 'closing');
+      expect(dto).toMatchObject({ type: 'END_SESSION', status: 'APPLIED_ON_RECONNECT' });
+      expect(presence.expectSessionEnd).not.toHaveBeenCalled();
+      expect(audit.record).toHaveBeenCalledWith('u1', 'UPDATE', 'machine:m1', expect.objectContaining({
+        metadata: expect.objectContaining({ event: 'STATION_END_SESSION_APPLIED_ON_RECONNECT' }),
+      }));
+    });
+
+    it('refuses a LOCK or END_SESSION when no session is open there', async () => {
+      await expect(service.issue(caller(), 'm1', { type: 'LOCK' })).rejects.toMatchObject({ response: { code: 'STATION_OFFLINE' } });
+      await expect(service.issue(caller(), 'm1', endSession)).rejects.toMatchObject({ response: { code: 'STATION_OFFLINE' } });
+      expect(repo.create).not.toHaveBeenCalled();
+    });
+
+    it('refuses SHUTDOWN, LAUNCH_GAME and UNLOCK with a clear message, never applying or queueing them', async () => {
+      for (const body of [{ type: 'SHUTDOWN' as const }, launch, { type: 'UNLOCK' as const }]) {
+        await expect(service.issue(caller({ role: 'MANAGER', scope: 'admin' }), 'm1', body)).rejects.toMatchObject({
+          response: { code: 'STATION_OFFLINE', error: STATION_OFFLINE_MESSAGE },
+        });
+      }
+      expect(STATION_OFFLINE_MESSAGE).toBe('station offline, try again when it is back');
+      expect(sessions.closeForShutdown).not.toHaveBeenCalled();
+      expect(sessions.lockWhileOffline).not.toHaveBeenCalled();
+      expect(repo.create).not.toHaveBeenCalled();
+      expect(queue.add).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('resolveUndelivered (the worker could not reach the station)', () => {
+    it('applies a staff LOCK it could not deliver and records APPLIED_ON_RECONNECT', async () => {
+      sessions.lockWhileOffline.mockResolvedValueOnce(true);
+      await service.resolveUndelivered('c1', 'FAILED', STATION_OFFLINE_MESSAGE);
+      expect(sessions.lockWhileOffline).toHaveBeenCalledWith(STATION);
+      expect(repo.transition).toHaveBeenCalledWith('c1', ['PENDING', 'SENT'], expect.objectContaining({ status: 'APPLIED_ON_RECONNECT' }));
+      expect(audit.record).toHaveBeenCalledWith('u1', 'UPDATE', 'machine:m1', expect.objectContaining({
+        metadata: expect.objectContaining({ event: 'STATION_LOCK_APPLIED_ON_RECONNECT' }),
+      }));
+    });
+
+    it('applies an unacknowledged staff END_SESSION with its reason', async () => {
+      repo.findById.mockResolvedValueOnce(row({ type: 'END_SESSION', status: 'SENT' }));
+      sessions.endWhileOffline.mockResolvedValueOnce(true);
+      await service.resolveUndelivered('c1', 'TIMEOUT', 'no ack', { reason: 'closing' });
+      expect(sessions.endWhileOffline).toHaveBeenCalledWith(STATION, 'closing');
+      expect(repo.transition).toHaveBeenCalledWith('c1', expect.any(Array), expect.objectContaining({ status: 'APPLIED_ON_RECONNECT' }));
+    });
+
+    it('fails a SHUTDOWN, a system LOCK, or a LOCK with no open session, and delivers nothing later', async () => {
+      repo.findById.mockResolvedValueOnce(row({ type: 'SHUTDOWN' }));
+      await service.resolveUndelivered('c1', 'FAILED', STATION_OFFLINE_MESSAGE);
+      expect(repo.transition).toHaveBeenLastCalledWith('c1', ['PENDING', 'SENT'], expect.objectContaining({ status: 'FAILED', failureReason: STATION_OFFLINE_MESSAGE }));
+
+      repo.findById.mockResolvedValueOnce(row({ issuedBy: SYSTEM_ACTOR_ID }));
+      await service.resolveUndelivered('c1', 'FAILED', STATION_OFFLINE_MESSAGE);
+      expect(repo.transition).toHaveBeenLastCalledWith('c1', expect.any(Array), expect.objectContaining({ status: 'FAILED' }));
+
+      await service.resolveUndelivered('c1', 'TIMEOUT', 'no ack');
+      expect(repo.transition).toHaveBeenLastCalledWith('c1', expect.any(Array), expect.objectContaining({ status: 'TIMEOUT' }));
+      expect(sessions.lockWhileOffline).toHaveBeenCalledTimes(1);
+      expect(audit.record).not.toHaveBeenCalled();
+    });
   });
 
   it('gates SHUTDOWN at admin scope', async () => {
@@ -305,6 +402,7 @@ describe('CommandProcessor', () => {
       findById: vi.fn(async () => row()),
              markSent: vi.fn(async () => row({ status: 'SENT', attempts: 1 })),
              finish: vi.fn(async () => row()),
+             resolveUndelivered: vi.fn(async () => row()),
              fail: vi.fn(async () => row()),
     };
     gateway = { isConnected: vi.fn(() => true), sendCommand: vi.fn(async () => undefined) };
@@ -338,7 +436,7 @@ describe('CommandProcessor', () => {
     expect(commands.finish).not.toHaveBeenCalled();
 
     await processor.process(job(1));
-    expect(commands.finish).toHaveBeenCalledWith('c1', 'TIMEOUT', expect.stringContaining('no ack'));
+    expect(commands.resolveUndelivered).toHaveBeenCalledWith('c1', 'TIMEOUT', expect.stringContaining('no ack'), undefined);
     // Both attempts carried the same commandId.
     expect(gateway.sendCommand.mock.calls.map((c) => c[2])).toEqual(['c1', 'c1']);
   });
@@ -346,13 +444,14 @@ describe('CommandProcessor', () => {
   it('does not hold the job when the station is gone', async () => {
     gateway.isConnected.mockReturnValue(false);
     await processor.process(job());
-    expect(commands.finish).toHaveBeenCalledWith('c1', 'FAILED', expect.any(String));
+    expect(commands.resolveUndelivered).toHaveBeenCalledWith('c1', 'FAILED', STATION_OFFLINE_MESSAGE, undefined);
     expect(commands.markSent).not.toHaveBeenCalled();
 
     gateway.isConnected.mockReturnValue(true);
     gateway.sendCommand.mockRejectedValue(new StationNotConnectedError('SN-1'));
     await processor.process(job());
-    expect(commands.finish).toHaveBeenLastCalledWith('c1', 'FAILED', expect.stringContaining('not connected'));
+    expect(commands.resolveUndelivered).toHaveBeenLastCalledWith('c1', 'FAILED', STATION_OFFLINE_MESSAGE, undefined);
+    expect(commands.finish).not.toHaveBeenCalled();
   });
 
   it('retries a failed socket write, and fails it on the last attempt', async () => {

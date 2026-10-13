@@ -27,12 +27,30 @@ export type Peripheral = z.infer<typeof peripheralSchema>;
 /** peripheral_status: a full snapshot of the watched peripherals. */
 export const peripheralStatusPayloadSchema = z.object({ peripherals: z.array(peripheralSchema).max(200) });
 
+/** Why the agent locked itself (state_report.lockReason). */
+export const AGENT_LOCK_REASONS = ['lease_expired', 'command', 'gamer_ended', 'startup'] as const;
+export type AgentLockReason = (typeof AGENT_LOCK_REASONS)[number];
+
+/** An ISO timestamp the agent read off the server clock; a bad one is dropped, not the report. */
+const serverTimestamp = z.string().datetime({ offset: true }).optional().catch(undefined);
+
+/**
+ * state_report on (re)connect. `restarted`, `offlineSince`, `lockedAt` and
+ * `lockReason` are optional (newer agents): `restarted` means the station
+ * rebooted or the agent restarted since its last connection; `offlineSince` is
+ * when it lost the backend and `lockedAt` when it locked itself (both on the
+ * server clock). Missing fields leave reconnect handling as before.
+ */
 export const stateReportPayloadSchema = z.object({
   locked: z.boolean().optional(),
   sessionId: z.string().nullish(),
   runningGameId: z.string().nullish(),
   leaseExpiresAt: z.string().nullish(),
   peripherals: z.array(peripheralSchema).max(200).optional(),
+  restarted: z.boolean().optional().catch(undefined),
+  offlineSince: serverTimestamp,
+  lockedAt: serverTimestamp,
+  lockReason: z.enum(AGENT_LOCK_REASONS).optional().catch(undefined),
 });
 export type StateReportPayload = z.infer<typeof stateReportPayloadSchema>;
 

@@ -169,3 +169,28 @@ describe('SessionsRepository.list', () => {
     });
   });
 });
+
+describe('SessionsRepository.billOfflineOnce', () => {
+  const pausedAt = new Date('2026-10-13T10:00:00Z');
+
+  it('adds the seconds only to that very offline pause, and records which pause it billed', async () => {
+    const prisma = { session: { updateMany: vi.fn(async () => ({ count: 1 })) } };
+    const repo = new SessionsRepository(prisma as any);
+
+    await expect(repo.billOfflineOnce('s1', pausedAt, 120)).resolves.toBe(true);
+    expect(prisma.session.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: 's1',
+        status: 'PAUSED',
+        lockedAt: pausedAt,
+        OR: [{ offlineBilledFor: null }, { offlineBilledFor: { not: pausedAt } }],
+      },
+      data: { meteredSeconds: { increment: 120 }, offlineBilledSeconds: { increment: 120 }, offlineBilledFor: pausedAt },
+    });
+  });
+
+  it('is false when the pause was already billed, resumed or settled', async () => {
+    const prisma = { session: { updateMany: vi.fn(async () => ({ count: 0 })) } };
+    await expect(new SessionsRepository(prisma as any).billOfflineOnce('s1', pausedAt, 120)).resolves.toBe(false);
+  });
+});

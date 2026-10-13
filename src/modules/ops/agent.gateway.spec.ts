@@ -64,6 +64,9 @@ describe('AgentGateway session login and lease', () => {
       reconcile: vi.fn(async () => undefined),
       unlockFor: vi.fn(),
       closeForShutdown: vi.fn(async () => undefined),
+      markStaffLock: vi.fn(async () => undefined),
+      lockWhileOffline: vi.fn(async () => false),
+      endWhileOffline: vi.fn(async () => false),
     };
     port = new StationSessionPort();
     port.register(handler as unknown as StationSessionHandler);

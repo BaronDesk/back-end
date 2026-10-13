@@ -5,6 +5,7 @@ import {
   createHarness,
   flush,
   HOUR,
+  sessionRow,
   type Harness,
 } from './session-billing.harness-spec.js';
 import { SessionMeteringService } from './session-metering.service.js';
@@ -68,6 +69,39 @@ describe('SessionMeteringService', () => {
       await expect(
         service.assertAffordable({ gamerProfileId: 'g1', branchId: 'b1', isWalkIn: true, start: new Date(), minutes: 10 }),
       ).resolves.toMatchObject({ totalCents: 1000 });
+    });
+  });
+
+  describe('billOfflineDrop', () => {
+    const pausedAt = new Date(Date.now() - 20 * 60_000);
+    const paused = (overrides: Record<string, unknown> = {}) =>
+      sessionRow({ status: 'PAUSED', pinUsedAt: new Date(), lockedAt: pausedAt, lockReason: 'offline', meteredSeconds: 600, ...overrides }) as any;
+    const after = (seconds: number) => new Date(pausedAt.getTime() + seconds * 1000);
+
+    it('adds the time from the pause to the station lock, capped, and returns the session as billed', async () => {
+      const billed = await service.billOfflineDrop(paused(), after(120), 190);
+      expect(repo.billOfflineOnce).toHaveBeenCalledWith('s1', pausedAt, 120);
+      expect(billed).toMatchObject({ meteredSeconds: 720, offlineBilledSeconds: 120, offlineBilledFor: pausedAt });
+
+      await service.billOfflineDrop(paused(), after(3600), 190);
+      expect(repo.billOfflineOnce).toHaveBeenLastCalledWith('s1', pausedAt, 190);
+    });
+
+    it('never bills past the booking end', async () => {
+      await service.billOfflineDrop(paused({ endTime: after(30) }), after(120), 190);
+      expect(repo.billOfflineOnce).toHaveBeenCalledWith('s1', pausedAt, 30);
+    });
+
+    it('bills a pause once: already billed, lost the race, or nothing to bill', async () => {
+      const already = paused({ offlineBilledFor: pausedAt });
+      await expect(service.billOfflineDrop(already, after(120), 190)).resolves.toBe(already);
+
+      repo.billOfflineOnce.mockResolvedValueOnce(false);
+      await expect(service.billOfflineDrop(paused(), after(120), 190)).resolves.toMatchObject({ meteredSeconds: 600 });
+
+      await service.billOfflineDrop(paused(), after(-5), 190);
+      await service.billOfflineDrop(paused({ status: 'ACTIVE' }), after(120), 190);
+      expect(repo.billOfflineOnce).toHaveBeenCalledTimes(1);
     });
   });
 });

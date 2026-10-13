@@ -9,6 +9,11 @@ import { OPEN_SESSION_STATUSES, type SessionsRepository } from '../repository/se
 export const RUNOUT_LOCK = 'runout';
 /** Session.lockReason: the station went offline mid-session; metering stopped at its last heartbeat. */
 export const OFFLINE_LOCK = 'offline';
+/** Session.lockReason: staff locked the station; only a staff UNLOCK resumes it. */
+export const STAFF_LOCK = 'staff';
+
+/** Lock reasons that hold: the station stays locked until their own resume path (staff UNLOCK, top-up). */
+const HELD_LOCKS: ReadonlySet<string> = new Set([STAFF_LOCK, RUNOUT_LOCK]);
 
 export type SettlementSession = NonNullable<Awaited<ReturnType<SessionsRepository['findForSettlement']>>>;
 export type StartableReservation = NonNullable<Awaited<ReturnType<SessionsRepository['findReservationForStart']>>>;
@@ -27,6 +32,7 @@ export function sessionConfig(config: ConfigService) {
     runoutMarginS: Number(config.get('SESSION_RUNOUT_MARGIN_S') ?? 30),
     noShowGraceMs: Number(config.get('NO_SHOW_GRACE_MINUTES') ?? 30) * 60_000,
     endingNoticeMs: Number(config.get('SESSION_ENDING_NOTICE_MINUTES') ?? 10) * 60_000,
+    stationLeaseGraceS: Number(config.get('STATION_LEASE_GRACE_S') ?? 10),
   };
 }
 
@@ -53,4 +59,20 @@ export function isGranted(session: Session, now: Date): boolean {
 export function isDeadPin(session: Session, now: Date, pinMaxAttempts: number): boolean {
   if (session.status !== 'PENDING' || session.pinUsedAt) return false;
   return !session.pinExpiresAt || session.pinExpiresAt <= now || session.pinAttempts >= pinMaxAttempts;
+}
+
+/** A lock only staff (staff UNLOCK) or the gamer (a top-up) can lift: never by a reconnect. */
+export function isHeldLock(lockReason: string | null): boolean {
+  return lockReason !== null && HELD_LOCKS.has(lockReason);
+}
+
+/**
+ * Whether a station reconnecting with this (granted) session gets it back:
+ * one never paused (ACTIVE through a short drop, or logged into and not yet
+ * playing), or paused only because the station went offline. A session locked
+ * by staff, for funds, or for no recorded reason stays locked.
+ */
+export function resumesOnReconnect(session: Session): boolean {
+  if (session.status === 'ACTIVE' || session.status === 'PENDING') return true;
+  return session.status === 'PAUSED' && session.lockReason === OFFLINE_LOCK;
 }

@@ -11,6 +11,7 @@ import { toSessionDto, type SessionRecord } from '../util/public-session.js';
 import {
   isDeadPin,
   isGranted,
+  isHeldLock,
   leaseFor,
   notFound,
   sessionConfig,
@@ -182,8 +183,9 @@ export class SessionLoginService {
 
   /**
    * heartbeat_ack lease. Zero unless the station reports a session of its own
-   * that was logged into and is still open and inside its window: a station
-   * is never left unlocked without a reason to be.
+   * that was logged into and is still open and inside its window, and not
+   * locked by staff or for funds: a station is never left unlocked without a
+   * reason to be.
    */
   async lease(station: StationRef, sessionId: string | null): Promise<StationLease> {
     const now = new Date();
@@ -192,6 +194,7 @@ export class SessionLoginService {
     if (!session || session.reservation.machineId !== station.machineId || !isGranted(session, now)) {
       return toLease(0, now);
     }
+    if (session.status === 'PAUSED' && isHeldLock(session.lockReason)) return toLease(0, now);
     return leaseFor(session, now, this.leaseCapSeconds);
   }
 }

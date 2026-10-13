@@ -43,6 +43,24 @@ export interface SessionEndedEvent {
 /** An END_SESSION reason is matched to the observed session end only within this window. */
 const SESSION_END_MATCH_MS = 2 * 60_000;
 
+/** Offline transitions are kept this long for telling a venue outage from a single drop. */
+const DROP_LOG_RETENTION_MS = 6 * 60 * 60_000;
+
+/**
+ * Why a station was away: `venue` when enough of its branch dropped with it,
+ * or the backend itself restarted (nobody is billed for that time); `single`
+ * when it dropped on its own.
+ */
+export type OutageKind = 'venue' | 'single';
+
+/** A station going OFFLINE, at its last heartbeat; `stale` when recovered from a previous backend run. */
+interface StationDrop {
+  serialNumber: string;
+  branchId: string;
+  at: Date;
+  stale: boolean;
+}
+
 /** What other modules may know about a station: identity and branch, nothing more. */
 export interface StationRef {
   machineId: string;
@@ -65,6 +83,10 @@ interface PresenceState {
   lastPersistedAt: number;
   /** When the station was last heard from before this connection (null: never, or unknown). */
   lastSeenBeforeConnect: Date | null;
+  /** The latest OFFLINE transition of this station (null: none known to this process). */
+  drop: StationDrop | null;
+  /** The drop the current connection ended (null: it never went OFFLINE, or this process never saw it). */
+  reconnectedFrom: StationDrop | null;
 }
 
 /** The station token's machine has no MACHINE row. */
@@ -122,6 +144,8 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
   private readonly states = new Map<string, PresenceState>();
   /** serial -> END_SESSION reason awaiting the agent's report that the session is gone. */
   private readonly pendingSessionEnds = new Map<string, { reason: string; at: number }>();
+  /** Recent OFFLINE transitions of every station, oldest first. */
+  private drops: StationDrop[] = [];
   private watchdog?: NodeJS.Timeout;
 
   /**
@@ -134,6 +158,8 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
   private readonly offlineAfterMs: number;
   private readonly watchdogIntervalMs: number;
   private readonly persistIntervalMs: number;
+  private readonly outagePeerCount: number;
+  private readonly outageWindowMs: number;
 
   constructor(
     private readonly machines: MachinesRepository,
@@ -143,6 +169,8 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
     this.offlineAfterMs = Number(config.get('PRESENCE_OFFLINE_AFTER_MS') ?? 45_000);
     this.watchdogIntervalMs = Number(config.get('PRESENCE_WATCHDOG_INTERVAL_MS') ?? 10_000);
     this.persistIntervalMs = Number(config.get('PRESENCE_PERSIST_INTERVAL_MS') ?? 15_000);
+    this.outagePeerCount = Number(config.get('OUTAGE_PEER_COUNT') ?? 2);
+    this.outageWindowMs = Number(config.get('OUTAGE_WINDOW_S') ?? 60) * 1000;
   }
 
   onModuleInit(): void {
@@ -188,6 +216,8 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
       leaseExpiresAt: previous?.leaseExpiresAt ?? null,
       lastPersistedAt: now.getTime(),
       lastSeenBeforeConnect,
+      drop: previous?.drop ?? null,
+      reconnectedFrom: previous?.status === 'OFFLINE' ? previous.drop : null,
     };
     this.states.set(serialNumber, state);
     await this.writeCache(state);
@@ -241,6 +271,33 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
   /** When the station was last heard from before its current connection (for closing out what it dropped meanwhile). */
   lastSeenBeforeConnect(serialNumber: string): Date | null {
     return this.states.get(serialNumber)?.lastSeenBeforeConnect ?? null;
+  }
+
+  /** The station's last heartbeat (or connect): the last moment it is known to have been in use. */
+  lastContactOf(serialNumber: string): Date | null {
+    return this.states.get(serialNumber)?.lastSeen ?? null;
+  }
+
+  /**
+   * What kind of outage the station's current connection ended: `venue` when
+   * at least OUTAGE_PEER_COUNT other stations of its branch went OFFLINE
+   * within OUTAGE_WINDOW_S of it, or it was recovered OFFLINE after a backend
+   * restart; else `single`. Null when it never went OFFLINE (a short drop) or
+   * this process did not see it go (it restarted meanwhile): unknown, so
+   * nothing may be billed or flagged for it.
+   */
+  outageOf(serialNumber: string): OutageKind | null {
+    const state = this.states.get(serialNumber);
+    const drop = state?.reconnectedFrom;
+    if (!state || !drop) return null;
+    if (drop.stale) return 'venue';
+    const peers = new Set(
+      this.drops
+        .filter((d) => d.branchId === drop.branchId && d.serialNumber !== serialNumber)
+        .filter((d) => Math.abs(d.at.getTime() - drop.at.getTime()) <= this.outageWindowMs)
+        .map((d) => d.serialNumber),
+    );
+    return peers.size >= this.outagePeerCount ? 'venue' : 'single';
   }
 
   /**
@@ -356,7 +413,11 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
           leaseExpiresAt: null,
           lastPersistedAt: Date.now(),
           lastSeenBeforeConnect: null,
+          drop: null,
+          reconnectedFrom: null,
         };
+        // The backend went down, not (necessarily) the station: always a venue outage.
+        state.drop = this.recordDrop(state, true);
         this.states.set(machine.serialNumber, state);
         await this.writeCache(state);
         this.logger.log(`station ${machine.serialNumber} OFFLINE (stale row from previous run)`);
@@ -373,6 +434,7 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
 
     state.status = 'OFFLINE';
     state.lastPersistedAt = Date.now();
+    state.drop = this.recordDrop(state, false);
     await this.machines.setStatus(state.machineId, 'OFFLINE', state.lastSeen);
     await this.writeCache(state);
     this.logger.log(`station ${serialNumber} OFFLINE (${reason})`);
@@ -424,6 +486,14 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
       reason,
       endedAt: new Date().toISOString(),
     });
+  }
+
+  private recordDrop(state: PresenceState, stale: boolean): StationDrop {
+    const drop: StationDrop = { serialNumber: state.serialNumber, branchId: state.branchId, at: state.lastSeen, stale };
+    const cutoff = Date.now() - DROP_LOG_RETENTION_MS;
+    this.drops = this.drops.filter((d) => d.at.getTime() >= cutoff);
+    this.drops.push(drop);
+    return drop;
   }
 
   private emit(state: PresenceState): void {

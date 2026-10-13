@@ -4,6 +4,8 @@ import type { Subscription } from 'rxjs';
 
 import { assertScope } from '../../../common/utils/assert-scope.js';
 import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
+import { DASHBOARD_EVENTS } from '../../../infra/realtime/constants.js';
+import { DashboardGateway } from '../../ops/dashboard.gateway.js';
 import { CommandsService } from '../../ops/services/commands.service.js';
 import type { StateReportPayload } from '../../station/schemas/presence.schemas.js';
 import {
@@ -18,11 +20,15 @@ import { toSessionDto, type SessionRecord } from '../util/public-session.js';
 import {
   insufficientFunds,
   isGranted,
+  isHeldLock,
   leaseFor,
   notFound,
   OFFLINE_LOCK,
+  resumesOnReconnect,
   RUNOUT_LOCK,
   sessionConfig,
+  STAFF_LOCK,
+  type SettlementSession,
 } from '../util/session-rules.js';
 
 import { RunoutTimerService } from './runout-timer.service.js';
@@ -34,13 +40,20 @@ import { SessionRunoutService } from './session-runout.service.js';
  * agent-reported lock state (the same path whether a station got locked by
  * staff, by a lapsed lease, by running out of funds or by going offline,
  * never by a command ack), COMPLETED once the station ends it. Also the
- * reconnect reconcile, and the staff controls that reach the station.
+ * reconnect reconcile, and the staff controls that reach the station (or are
+ * applied from server state when they cannot).
+ *
+ * Why a session is locked decides what lifts it: "offline" is lifted by the
+ * station reconnecting, "staff" only by a staff UNLOCK, "runout" only by a
+ * top-up (or a staff UNLOCK once the wallet covers the minimum play time).
  */
 @Injectable()
 export class StationLinkService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(StationLinkService.name);
   private readonly subs: Subscription[] = [];
   private readonly leaseCapSeconds: number;
+  /** The most play billed after a single drop: the lease the station held, plus grace. */
+  private readonly offlineBillCapSeconds: number;
 
   constructor(
     private readonly repo: SessionsRepository,
@@ -49,9 +62,12 @@ export class StationLinkService implements OnModuleInit, OnModuleDestroy {
     private readonly runoutTimer: RunoutTimerService,
     private readonly metering: SessionMeteringService,
     private readonly runout: SessionRunoutService,
+    private readonly dashboard: DashboardGateway,
     config: ConfigService,
   ) {
-    this.leaseCapSeconds = sessionConfig(config).leaseCapSeconds;
+    const settings = sessionConfig(config);
+    this.leaseCapSeconds = settings.leaseCapSeconds;
+    this.offlineBillCapSeconds = settings.leaseCapSeconds + settings.stationLeaseGraceS;
   }
 
   onModuleInit(): void {
@@ -100,6 +116,17 @@ export class StationLinkService implements OnModuleInit, OnModuleDestroy {
       // The station may be gone for good; settlement must not depend on it.
       this.logger.warn(`force-close END_SESSION for session ${id} failed: ${(err as Error).message}`);
     }
+    await this.closeFromServerState(id, new Date(), reason ?? 'force_close');
+    const closed = await this.repo.findByIdWithReservation(id);
+    return toSessionDto((closed ?? session) as SessionRecord);
+  }
+
+  /**
+   * Closes a session without the station: settled up to `endedAt` if it
+   * played, a no-show if nobody logged into it. Shared debit key: a later
+   * session end from the station never bills it twice.
+   */
+  private async closeFromServerState(id: string, endedAt: Date, reason: string): Promise<void> {
     // One retry covers a PENDING session that a login activated between the read and the close.
     for (let attempt = 0; attempt < 2; attempt++) {
       const current = await this.repo.findForSettlement(id);
@@ -107,12 +134,53 @@ export class StationLinkService implements OnModuleInit, OnModuleDestroy {
       const closed =
         current.status === 'PENDING' && !current.pinUsedAt
           ? await this.repo.closeAsNoShow(current.id, current.reservationId, { unusedPinOnly: true })
-          : await this.metering.settle(current, new Date(), reason ?? 'force_close');
+          : await this.metering.settle(current, endedAt, reason);
       if (closed) break;
     }
     await this.runoutTimer.cancel(id);
-    const closed = await this.repo.findByIdWithReservation(id);
-    return toSessionDto((closed ?? session) as SessionRecord);
+  }
+
+  /** A staff LOCK on its way: the open session is locked by staff, so a reconnect never lifts it. */
+  async markStaffLock(station: StationRef): Promise<void> {
+    for (const session of await this.repo.findGrantedOnMachine(station.machineId)) {
+      await this.repo.update(session.id, { lockReason: STAFF_LOCK });
+    }
+  }
+
+  /**
+   * A staff LOCK the station could not receive (offline, or no ack): the
+   * intent is kept. A session still ACTIVE stops metering at the last
+   * contact; either way it is locked by staff, and the reconnect keeps it
+   * locked. False when the station has no open session.
+   */
+  async lockWhileOffline(station: StationRef): Promise<boolean> {
+    const sessions = await this.repo.findGrantedOnMachine(station.machineId);
+    const lastContact = this.presence.lastContactOf(station.serialNumber) ?? new Date();
+    for (const found of sessions) {
+      if (found.status === 'ACTIVE') {
+        const session = await this.metering.foldRateSwitch(found, lastContact);
+        await this.metering.pause(session, lastContact, STAFF_LOCK);
+      } else {
+        await this.repo.update(found.id, { lockReason: STAFF_LOCK });
+      }
+      this.logger.log(`session ${found.id} locked by staff while station ${station.serialNumber} is unreachable`);
+    }
+    return sessions.length > 0;
+  }
+
+  /**
+   * A staff END_SESSION the station could not receive: closed from server
+   * state as a force-close, billed up to the last contact. The reconnect ends
+   * it on the station (reconcile). False when the station has no open session.
+   */
+  async endWhileOffline(station: StationRef, reason: string): Promise<boolean> {
+    const sessions = await this.repo.findGrantedOnMachine(station.machineId);
+    const lastContact = this.presence.lastContactOf(station.serialNumber) ?? new Date();
+    for (const session of sessions) {
+      await this.closeFromServerState(session.id, lastContact, reason);
+      this.logger.log(`session ${session.id} ended by staff while station ${station.serialNumber} is unreachable`);
+    }
+    return sessions.length > 0;
   }
 
   /** A staff UNLOCK resumes the station's own open session; there is no unlocking without one. */
@@ -133,6 +201,8 @@ export class StationLinkService implements OnModuleInit, OnModuleDestroy {
     ) {
       throw insufficientFunds('the gamer ran out of money: top up their wallet first');
     }
+    // Staff lifts whatever lock it held: the station reporting itself unlocked now resumes metering.
+    if (session.lockReason) await this.repo.update(session.id, { lockReason: null });
     return { sessionId: session.id, ...leaseFor(session, now, this.leaseCapSeconds) };
   }
 
@@ -172,9 +242,11 @@ export class StationLinkService implements OnModuleInit, OnModuleDestroy {
     const now = new Date();
     if (!report.sessionId) {
       const lastSeen = this.presence.lastSeenBeforeConnect(station.serialNumber);
-      for (const session of await this.repo.findGrantedOnMachine(station.machineId)) {
+      for (const found of await this.repo.findGrantedOnMachine(station.machineId)) {
+        const session = await this.billSingleDrop(station, found, report);
         const endedAt = session.lockedAt ?? lastSeen ?? now;
         this.logger.warn(`station ${station.serialNumber} no longer holds session ${session.id}; settling it at ${endedAt.toISOString()}`);
+        this.flagAttention(station, session, report, now);
         await this.metering.settle(session, endedAt, 'station_dropped');
       }
       return;
@@ -184,9 +256,17 @@ export class StationLinkService implements OnModuleInit, OnModuleDestroy {
     const session = found?.reservation.machineId === station.machineId ? found : null;
 
     if (session && isGranted(session, now)) {
+      this.flagAttention(station, session, report, now);
+      if (!resumesOnReconnect(session)) {
+        // Locked by staff, for funds, or for no recorded reason: a reconnect never lifts that.
+        this.logger.log(`station ${station.serialNumber} reconnected; session ${session.id} stays locked (${session.lockReason ?? 'no reason'})`);
+        if (report.locked === false) await this.commands.issueSystemLock(station.machineId, session.lockReason ?? 'locked');
+        return;
+      }
+      const resumed = await this.billSingleDrop(station, session, report);
       await this.commands.issueSessionUnlock(
         station.machineId,
-        { sessionId: session.id, ...leaseFor(session, now, this.leaseCapSeconds) },
+        { sessionId: resumed.id, ...leaseFor(resumed, now, this.leaseCapSeconds) },
         'resume',
       );
       return;
@@ -197,6 +277,43 @@ export class StationLinkService implements OnModuleInit, OnModuleDestroy {
     }
     this.logger.warn(`station ${station.serialNumber} reports session ${report.sessionId}, which is not open for it; ending it`);
     await this.commands.issueSystemEndSession(station.machineId, 'session_closed', report.sessionId);
+  }
+
+  /**
+   * A session paused offline whose station dropped on its own (not with its
+   * venue) and says when it locked itself: the gamer played on until then, so
+   * that time is billed (capped by the lease, once). A venue outage, an
+   * unknown drop, a restart or a lock at startup bills nothing past the last
+   * contact.
+   */
+  private async billSingleDrop(station: StationRef, session: SettlementSession, report: StateReportPayload): Promise<SettlementSession> {
+    if (session.status !== 'PAUSED' || session.lockReason !== OFFLINE_LOCK || !report.lockedAt) return session;
+    if (report.restarted || report.lockReason === 'startup') return session;
+    if (this.presence.outageOf(station.serialNumber) !== 'single') return session;
+    return this.metering.billOfflineDrop(session, new Date(report.lockedAt), this.offlineBillCapSeconds);
+  }
+
+  /**
+   * A paid session whose station dropped on its own, or restarted: staff get a
+   * STATION_ATTENTION on the branch dashboard (no automatic penalty).
+   */
+  private flagAttention(station: StationRef, session: SettlementSession, report: StateReportPayload, now: Date): void {
+    if (rateAt(session as Meter, now) <= 0) return;
+    const reasons: string[] = [];
+    if (this.presence.outageOf(station.serialNumber) === 'single') reasons.push('single_drop');
+    if (report.restarted) reasons.push('restarted');
+    if (!reasons.length) return;
+    this.logger.warn(`station ${station.serialNumber} needs attention (${reasons.join(', ')}) during paid session ${session.id}`);
+    this.dashboard.publishToBranch(station.branchId, DASHBOARD_EVENTS.STATION_ATTENTION, {
+      machineId: station.machineId,
+      serialNumber: station.serialNumber,
+      sessionId: session.id,
+      reason: reasons[0],
+      reasons,
+      offlineSince: report.offlineSince ?? null,
+      lockedAt: report.lockedAt ?? null,
+      lockReason: report.lockReason ?? null,
+    });
   }
 
   private async onStationStatus(event: StationStatusEvent): Promise<void> {
@@ -213,6 +330,12 @@ export class StationLinkService implements OnModuleInit, OnModuleDestroy {
       if (event.locked === false && session.status !== 'ACTIVE') {
         // The agent binds a session only from an UNLOCK, which only follows an accepted login.
         if (session.status === 'PENDING' && !session.pinUsedAt) return;
+        // Every UNLOCK that lifts a staff or funds lock clears its reason first: a station
+        // still unlocked from before (a reconnect) does not resume it; reconcile locks it.
+        if (session.status === 'PAUSED' && isHeldLock(session.lockReason)) {
+          this.logger.warn(`station ${event.serialNumber} reports session ${session.id} unlocked, but it is locked (${session.lockReason})`);
+          return;
+        }
         const now = new Date();
         await this.repo.activate(session.id, session.reservationId, {
           status: 'ACTIVE',
@@ -237,7 +360,8 @@ export class StationLinkService implements OnModuleInit, OnModuleDestroy {
     for (const found of await this.repo.findGrantedOnMachine(station.machineId)) {
       if (found.status !== 'ACTIVE') continue;
       const session = await this.metering.foldRateSwitch(found, lastSeen);
-      await this.metering.pause(session, lastSeen, OFFLINE_LOCK);
+      // A lock already on its way (staff, funds) keeps its reason: the reconnect must not lift it.
+      await this.metering.pause(session, lastSeen, isHeldLock(session.lockReason) ? session.lockReason : OFFLINE_LOCK);
       this.logger.log(`session ${session.id} paused: station ${event.serialNumber} offline since ${event.lastSeen}`);
     }
   }

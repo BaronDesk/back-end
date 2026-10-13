@@ -48,6 +48,15 @@ const ENQUEUE_TIMEOUT_MS = 5_000;
 /** Statuses a command can still leave. Everything else is terminal. */
 export const OPEN_STATUSES: CommandStatus[] = ['PENDING', 'SENT'];
 
+/** Why a command for a station that is not connected is refused or FAILED. Nothing is delivered later. */
+export const STATION_OFFLINE_MESSAGE = 'station offline, try again when it is back';
+
+/**
+ * Staff commands that still take effect when the station cannot receive them:
+ * applied to its session from server state, and enforced when it reconnects.
+ */
+const APPLIED_WHILE_OFFLINE: ReadonlySet<StationCommandType> = new Set(['LOCK', 'END_SESSION']);
+
 /**
  * An agent reply can land after the timeout already fired: the agent did act,
  * so a late ack/nack still overrides TIMEOUT.
@@ -142,7 +151,11 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
 
     const station = await this.resolveStation(caller, stationId);
     if (!this.presence.isOnline(station.serialNumber) || !this.registry.has(station.serialNumber)) {
-      throw new ConflictException({ code: 'STATION_OFFLINE', error: 'station is not online' });
+      // A LOCK / END_SESSION for a session still open there is applied now and enforced on reconnect.
+      if (!body.simulate && APPLIED_WHILE_OFFLINE.has(body.type) && (await this.applyWhileOffline(station, body.type, body.reason))) {
+        return this.recordAppliedWhileOffline(station, body.type, caller.sub);
+      }
+      throw new ConflictException({ code: 'STATION_OFFLINE', error: STATION_OFFLINE_MESSAGE });
     }
 
     // Every rejection happens here, before a row exists or anything is queued.
@@ -182,6 +195,9 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
     } else if (body.type === 'POLICY_UPDATE') {
       payload = body.policy;
       await this.presence.setPolicy(station.machineId, body.policy!);
+    } else if (body.type === 'LOCK' && !body.simulate) {
+      // Locked by staff: a reconnect must not lift it, only a staff UNLOCK.
+      await this.sessions.current?.markStaffLock(station);
     }
 
     // Labels the session.ended event, which fires only once the agent reports
@@ -300,6 +316,61 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
   /** Worker: terminal status for a command that never got a reply. */
   finish(commandId: string, status: 'TIMEOUT' | 'FAILED', failureReason: string) {
     return this.transition(commandId, OPEN_STATUSES, { status, resolvedAt: new Date(), failureReason });
+  }
+
+  /**
+   * Worker: a command the station could not receive (not connected at send
+   * time, or no ack after every attempt). A staff LOCK / END_SESSION for a
+   * session still open there is applied from server state and ends
+   * APPLIED_ON_RECONNECT; anything else ends `status` and is never delivered
+   * later.
+   */
+  async resolveUndelivered(commandId: string, status: 'TIMEOUT' | 'FAILED', failureReason: string, payload?: CommandPayload) {
+    const row = await this.repo.findById(commandId);
+    const type = row?.type as StationCommandType | undefined;
+    if (row && type && row.issuedBy !== SYSTEM_ACTOR_ID && APPLIED_WHILE_OFFLINE.has(type) && OPEN_STATUSES.includes(row.status)) {
+      const station = await this.presence.resolveById(row.machineId);
+      const reason = (payload as { reason?: string } | undefined)?.reason;
+      if (station && (await this.applyWhileOffline(station, type, reason))) {
+        const applied = await this.transition(commandId, OPEN_STATUSES, { status: 'APPLIED_ON_RECONNECT', resolvedAt: new Date(), failureReason });
+        if (applied) await this.auditAppliedWhileOffline(applied);
+        return applied;
+      }
+    }
+    return this.finish(commandId, status, failureReason);
+  }
+
+  /** Applies a staff LOCK / END_SESSION to the station's open session; false when it has none. */
+  private async applyWhileOffline(station: StationRef, type: StationCommandType, reason?: string): Promise<boolean> {
+    const sessions = this.sessions.current;
+    if (!sessions) return false;
+    if (type === 'LOCK') return sessions.lockWhileOffline(station);
+    if (type === 'END_SESSION') return sessions.endWhileOffline(station, reason ?? 'force_close');
+    return false;
+  }
+
+  /** The record of a staff command applied to an offline station: never queued, already resolved. */
+  private async recordAppliedWhileOffline(station: StationRef, type: StationCommandType, issuedBy: string) {
+    const row = await this.repo.create({
+      id: randomUUID(),
+      machineId: station.machineId,
+      branchId: station.branchId,
+      type,
+      issuedBy,
+      status: 'APPLIED_ON_RECONNECT',
+      resolvedAt: new Date(),
+    });
+    this.logger.log(`${row.type} ${row.id} for offline ${station.serialNumber} by ${issuedBy}: applied, enforced on reconnect`);
+    this.publish(row);
+    await this.auditAppliedWhileOffline(row);
+    return toCommandDto(row);
+  }
+
+  private async auditAppliedWhileOffline(row: Command): Promise<void> {
+    await this.audit.record(row.issuedBy, 'UPDATE', `machine:${row.machineId}`, {
+      branchId: row.branchId,
+      metadata: { event: `STATION_${row.type}_APPLIED_ON_RECONNECT`, commandId: row.id },
+    });
   }
 
   fail(commandId: string, failureReason: string) {

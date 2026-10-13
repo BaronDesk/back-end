@@ -13,6 +13,11 @@ export const envSchema = z.object({
   PRESENCE_OFFLINE_AFTER_MS: z.coerce.number().int().positive().default(45_000),
   PRESENCE_WATCHDOG_INTERVAL_MS: z.coerce.number().int().positive().default(10_000),
   PRESENCE_PERSIST_INTERVAL_MS: z.coerce.number().int().positive().default(15_000),
+  // A station's drop is a venue outage (power, network: nobody is billed for
+  // it) when at least OUTAGE_PEER_COUNT other stations of its branch went
+  // offline within OUTAGE_WINDOW_S of it; otherwise it is a single drop.
+  OUTAGE_PEER_COUNT: z.coerce.number().int().min(1).default(2),
+  OUTAGE_WINDOW_S: z.coerce.number().int().positive().default(60),
   // Telemetry. A hardware alert fires when a temperature crosses its threshold.
   CPU_TEMP_THRESHOLD_C: z.coerce.number().positive().default(85),
   GPU_TEMP_THRESHOLD_C: z.coerce.number().positive().default(90),
@@ -47,6 +52,9 @@ export const envSchema = z.object({
   // agent re-locks once its lease lapses, so this is how long a station stays
   // unlocked after it loses the backend.
   SESSION_LEASE_CAP_S: z.coerce.number().int().positive().default(180),
+  // After a single station's drop, play is billed up to when the station says
+  // it locked, never past its last heartbeat + SESSION_LEASE_CAP_S + this.
+  STATION_LEASE_GRACE_S: z.coerce.number().int().nonnegative().default(10),
   // How often reservations past their window are closed out (NO_SHOW / END_SESSION).
   SESSION_SWEEP_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
   // Runout timer: how long before the calculated lock time the WARN job fires.

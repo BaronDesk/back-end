@@ -27,7 +27,8 @@ export type { Quote } from './session-metering.service.js';
  * - SessionLoginService: PINs, station login, leases.
  * - SessionMeteringService: rates, affordability, metering, settlement.
  * - SessionRunoutService: the funds run-out timer, lock and resume.
- * - StationLinkService: station status, offline pause, reconnect, staff controls.
+ * - StationLinkService: station status, offline pause, reconnect, staff controls
+ *   (and staff LOCK / END_SESSION applied while the station is unreachable).
  * - SessionExtensionsService: extra time on a running booking.
  * - SessionSweepService: the periodic sweep.
  * - SessionQueriesService: lists and lookups.
@@ -121,6 +122,18 @@ export class SessionsService implements OnModuleInit, StationSessionHandler {
 
   retireMachine(machineId: string): Promise<void> {
     return this.stationLink.retireMachine(machineId);
+  }
+
+  markStaffLock(station: StationRef): Promise<void> {
+    return this.stationLink.markStaffLock(station);
+  }
+
+  lockWhileOffline(station: StationRef): Promise<boolean> {
+    return this.stationLink.lockWhileOffline(station);
+  }
+
+  endWhileOffline(station: StationRef, reason: string): Promise<boolean> {
+    return this.stationLink.endWhileOffline(station, reason);
   }
 
   // --- runout --------------------------------------------------------------

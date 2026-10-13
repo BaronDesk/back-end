@@ -31,6 +31,18 @@ export interface StationSessionHandler {
   unlockFor(station: StationRef): Promise<{ sessionId: string; leaseSeconds: number; serverTime: string }>;
   /** Before a SHUTDOWN: settles whatever session the station holds, now. */
   closeForShutdown(station: StationRef): Promise<void>;
+  /** A staff LOCK on its way: the station's open session is locked by staff (only a staff UNLOCK resumes it). */
+  markStaffLock(station: StationRef): Promise<void>;
+  /**
+   * A staff LOCK the station cannot receive: pauses its open session at the
+   * last contact, locked by staff. False when it has no open session.
+   */
+  lockWhileOffline(station: StationRef): Promise<boolean>;
+  /**
+   * A staff END_SESSION the station cannot receive: closes its open session
+   * from server state, billed up to the last contact. False when it has none.
+   */
+  endWhileOffline(station: StationRef, reason: string): Promise<boolean>;
 }
 
 /**

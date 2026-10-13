@@ -7,7 +7,7 @@ import { PresenceService } from '../../station/services/presence.service.js';
 import { AgentGateway, StationNotConnectedError } from '../agent.gateway.js';
 import type { CommandJobData } from '../schemas/command.schemas.js';
 import { CommandAckTracker } from './command-ack-tracker.js';
-import { COMMAND_QUEUE, CommandsService, OPEN_STATUSES } from './commands.service.js';
+import { COMMAND_QUEUE, CommandsService, OPEN_STATUSES, STATION_OFFLINE_MESSAGE } from './commands.service.js';
 
 /** Thrown to hand the job back to BullMQ for another attempt (same job, same commandId). */
 class RetryableCommandError extends Error {}
@@ -18,7 +18,10 @@ class RetryableCommandError extends Error {}
  * and every retry resends the same commandId: the agent re-acks a command it
  * already ran instead of running it twice. Every nack (UNKNOWN_TYPE,
  * EXEC_FAILED, STALE) and every other outcome is final and returns normally,
- * so BullMQ never retries it.
+ * so BullMQ never retries it. A command the station never received (not
+ * connected, or no ack after the last attempt) goes to
+ * CommandsService.resolveUndelivered: a staff LOCK / END_SESSION is applied
+ * from server state, anything else ends there and is never delivered later.
  */
 @Processor(COMMAND_QUEUE, { concurrency: 16 })
 export class CommandProcessor extends WorkerHost {
@@ -53,7 +56,7 @@ export class CommandProcessor extends WorkerHost {
 
     // Checked before marking SENT so an offline station doesn't burn an attempt.
     if (!this.gateway.isConnected(station.serialNumber)) {
-      await this.commands.finish(commandId, this.offlineStatus, 'station not connected at send time');
+      await this.commands.resolveUndelivered(commandId, this.offlineStatus, STATION_OFFLINE_MESSAGE, payload);
       return;
     }
 
@@ -67,7 +70,7 @@ export class CommandProcessor extends WorkerHost {
     } catch (err) {
       this.tracker.settle(commandId, { kind: 'timeout' });
       if (err instanceof StationNotConnectedError) {
-        await this.commands.finish(commandId, this.offlineStatus, err.message);
+        await this.commands.resolveUndelivered(commandId, this.offlineStatus, STATION_OFFLINE_MESSAGE, payload);
         return;
       }
       const reason = `send failed: ${(err as Error).message}`;
@@ -87,10 +90,11 @@ export class CommandProcessor extends WorkerHost {
       this.logger.warn(`${command.type} ${commandId}: no ack within ${this.ackTimeoutMs}ms; retrying with same id`);
       throw new RetryableCommandError('ack timeout');
     }
-    await this.commands.finish(
+    await this.commands.resolveUndelivered(
       commandId,
       'TIMEOUT',
       `no ack within ${this.ackTimeoutMs}ms after ${sending.attempts} attempt(s)`,
+      payload,
     );
   }
 

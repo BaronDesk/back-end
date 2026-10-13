@@ -1,4 +1,6 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { stateReportPayloadSchema } from '../schemas/presence.schemas.js';
 
 import {
   assertStationAdmitted,
@@ -110,5 +112,96 @@ describe('PresenceService agent-reported state', () => {
     expect(statuses.at(-1)).toEqual(expect.objectContaining({ runningGameId: 'steam:730' }));
     await service.touch('SN-1', { locked: false, sessionId: null });
     expect(statuses.at(-1)?.runningGameId).toBe('steam:730');
+  });
+});
+
+describe('PresenceService outage classification', () => {
+  const T0 = new Date('2026-10-13T10:00:00Z').getTime();
+  const machine = (n: number, branchId = 'b1') => ({ ...MACHINE, id: `m${n}`, serialNumber: `SN-${n}`, branchId });
+  const rows = new Map([1, 2, 3, 4].map((n) => [`m${n}`, machine(n)]));
+  rows.set('m5', machine(5, 'b2'));
+  let machines: Record<string, ReturnType<typeof vi.fn>>;
+  let service: PresenceService;
+
+  const connect = (n: number) => {
+    const row = rows.get(`m${n}`)!;
+    return service.connect({ serialNumber: row.serialNumber }, null, { ...PRINCIPAL, machineId: row.id, serialNumber: row.serialNumber, branchId: row.branchId });
+  };
+  /** The station's last heartbeat at T0 + `seconds`, then its socket closes. */
+  const dropAt = async (n: number, seconds: number) => {
+    vi.setSystemTime(T0 + seconds * 1000);
+    await service.touch(`SN-${n}`, { locked: false, sessionId: null });
+    await service.disconnect(`SN-${n}`);
+  };
+
+  beforeEach(async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(T0);
+    machines = {
+      findById: vi.fn(async (id: string) => rows.get(id) ?? null),
+      markOnline: vi.fn(async (id: string) => rows.get(id)),
+      setStatus: vi.fn(async () => undefined),
+      touchLastSeen: vi.fn(async () => undefined),
+      findStaleOnline: vi.fn(async () => []),
+    };
+    service = new PresenceService(machines as any, { hset: vi.fn(async () => 1) } as any, { get: () => undefined } as any);
+    for (const n of [1, 2, 3, 4, 5]) await connect(n);
+  });
+
+  afterEach(() => vi.useRealTimers());
+
+  it('calls a station that dropped on its own a single drop', async () => {
+    await dropAt(1, 10);
+    vi.setSystemTime(T0 + 10 * 60_000);
+    await connect(1);
+    expect(service.outageOf('SN-1')).toBe('single');
+    expect(service.lastContactOf('SN-1')).toEqual(new Date(T0 + 10 * 60_000));
+  });
+
+  it('calls it a venue outage when at least 2 other stations of its branch dropped within 60 s of it', async () => {
+    await dropAt(1, 10);
+    await dropAt(2, 40);
+    await dropAt(3, 65);
+    vi.setSystemTime(T0 + 10 * 60_000);
+    await connect(1);
+    expect(service.outageOf('SN-1')).toBe('venue');
+  });
+
+  it('counts neither drops outside the window nor stations of another branch', async () => {
+    await dropAt(1, 10);
+    await dropAt(2, 200); // too late
+    await dropAt(5, 20); // other branch
+    await dropAt(3, 30);
+    vi.setSystemTime(T0 + 10 * 60_000);
+    await connect(1);
+    expect(service.outageOf('SN-1')).toBe('single');
+  });
+
+  it('calls a station recovered OFFLINE after a backend restart a venue outage', async () => {
+    const fresh = new PresenceService(machines as any, { hset: vi.fn(async () => 1) } as any, { get: () => undefined } as any);
+    machines.findStaleOnline.mockResolvedValueOnce([{ ...rows.get('m1')!, lastSeen: new Date(T0 - 5 * 60_000) }]);
+    await (fresh as any).sweep();
+    await fresh.connect({ serialNumber: 'SN-1' }, null, PRINCIPAL);
+    expect(fresh.outageOf('SN-1')).toBe('venue');
+  });
+
+  it('knows no outage for a station that never went OFFLINE, or that this process never saw go', async () => {
+    expect(service.outageOf('SN-1')).toBeNull();
+    await connect(1); // reconnected before presence marked it OFFLINE
+    expect(service.outageOf('SN-1')).toBeNull();
+    expect(service.outageOf('SN-9')).toBeNull();
+  });
+});
+
+describe('stateReportPayloadSchema', () => {
+  it('takes the optional reconnect fields, and drops a malformed one instead of the report', () => {
+    const lockedAt = '2026-10-13T10:03:10.000Z';
+    expect(
+      stateReportPayloadSchema.parse({ locked: true, sessionId: 's1', restarted: false, offlineSince: '2026-10-13T10:00:00Z', lockedAt, lockReason: 'lease_expired' }),
+    ).toMatchObject({ restarted: false, offlineSince: '2026-10-13T10:00:00Z', lockedAt, lockReason: 'lease_expired' });
+
+    const parsed = stateReportPayloadSchema.parse({ locked: true, sessionId: 's1', lockedAt: 'yesterday', lockReason: 'power_cut', restarted: 'yes' });
+    expect(parsed).toEqual({ locked: true, sessionId: 's1', lockedAt: undefined, lockReason: undefined, restarted: undefined });
+    expect(stateReportPayloadSchema.parse({ locked: false })).toEqual({ locked: false });
   });
 });

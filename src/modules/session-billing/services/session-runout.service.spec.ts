@@ -43,6 +43,18 @@ describe('SessionRunoutService', () => {
       expect(commands.issueSessionUnlock).toHaveBeenCalledWith('m1', expect.objectContaining({ sessionId: 's1' }), 'topup');
     });
 
+    it('lifts the funds lock before the top-up UNLOCK, and puts it back when the UNLOCK cannot go out', async () => {
+      repo.findPausedByGamer.mockResolvedValue(sessionRow({ status: 'PAUSED', lockReason: 'runout', pinUsedAt: new Date() }));
+      wallet.credited.next({ gamerProfileId: 'g1' });
+      await vi.waitFor(() => expect(commands.issueSessionUnlock).toHaveBeenCalled());
+      expect(repo.update).toHaveBeenCalledWith('s1', { lockReason: null });
+      expect(repo.update.mock.invocationCallOrder[0]).toBeLessThan(commands.issueSessionUnlock.mock.invocationCallOrder[0]);
+
+      commands.issueSessionUnlock.mockResolvedValueOnce(false);
+      wallet.credited.next({ gamerProfileId: 'g1' });
+      await vi.waitFor(() => expect(repo.update).toHaveBeenLastCalledWith('s1', { lockReason: 'runout' }));
+    });
+
     it('keeps a session locked for funds locked when the top-up is still too small', async () => {
       wallet.getWalletForGamer.mockResolvedValue({ balance: 100 });
       repo.findPausedByGamer.mockResolvedValue(sessionRow({ status: 'PAUSED', lockReason: 'runout' }));

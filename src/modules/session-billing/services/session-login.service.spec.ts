@@ -224,6 +224,15 @@ describe('SessionLoginService', () => {
   });
 
   describe('lease', () => {
+    it('is zero for a session locked by staff or for funds, and runs on for one paused offline', async () => {
+      for (const lockReason of ['staff', 'runout']) {
+        repo.findForSettlement.mockResolvedValueOnce(sessionRow({ status: 'PAUSED', pinUsedAt: new Date(), lockReason }));
+        expect((await service.lease(STATION, 's1')).leaseSeconds).toBe(0);
+      }
+      repo.findForSettlement.mockResolvedValueOnce(sessionRow({ status: 'PAUSED', pinUsedAt: new Date(), lockReason: 'offline' }));
+      expect((await service.lease(STATION, 's1')).leaseSeconds).toBe(LEASE_CAP_S);
+    });
+
     it('is the shorter of the remaining window and the cap for a logged-in session on this station', async () => {
       expect((await service.lease(STATION, 's1')).leaseSeconds).toBe(LEASE_CAP_S);
 

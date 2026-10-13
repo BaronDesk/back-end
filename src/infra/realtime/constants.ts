@@ -48,5 +48,7 @@ export const DASHBOARD_EVENTS = {
   /** To the gamer: low balance / time left / clear, as shown on the station. */
   SESSION_NOTICE: 'session_notice',
   PERIPHERAL_STATUS: 'peripheral_status',
+  /** A paid session's station dropped on its own, or restarted: staff should look at it. */
+  STATION_ATTENTION: 'station_attention',
 } as const;
 export type DashboardEvent = (typeof DASHBOARD_EVENTS)[keyof typeof DASHBOARD_EVENTS];

@@ -130,11 +130,14 @@ export class SessionRunoutService implements OnModuleInit, OnModuleDestroy {
       const paused = await this.repo.findPausedByGamer(gamerProfileId, RUNOUT_LOCK, now);
       if (!paused || !(await this.metering.coversMinimumPlay(gamerProfileId, rateAt(paused as Meter, now)))) return;
       if (this.presence.sessionOf(paused.reservation.machine.serialNumber) !== paused.id) return; // the PC moved on
-      await this.commands.issueSessionUnlock(
+      // The funds lock is lifted before the UNLOCK, so the station reporting itself unlocked resumes metering.
+      await this.repo.update(paused.id, { lockReason: null });
+      const sent = await this.commands.issueSessionUnlock(
         paused.reservation.machineId,
         { sessionId: paused.id, ...leaseFor(paused, now, this.leaseCapSeconds) },
         'topup',
       );
+      if (!sent) await this.repo.update(paused.id, { lockReason: RUNOUT_LOCK }); // still locked: the next top-up tries again
     } catch (err) {
       this.logger.error(`top-up handling failed for gamer ${gamerProfileId}: ${(err as Error).message}`);
     }
