@@ -49,7 +49,10 @@ describe('CommandsService', () => {
   let tracker: CommandAckTracker;
   let sessions: Record<string, ReturnType<typeof vi.fn>>;
   let audit: { record: ReturnType<typeof vi.fn> };
+  let stationPolicy: { effectiveFor: ReturnType<typeof vi.fn>; branchPolicyChanges: Subject<{ branchId: string }> };
   let service: CommandsService;
+
+  const EFFECTIVE = { cpuTempAlertThreshold: 80, heartbeatIntervalSeconds: 15, defaultLeaseDurationSeconds: 60, leaseGracePeriodSeconds: 10 };
 
   const GAME = { id: '9d3c1f4e-8a55-4d1b-9a36-2f0f5c1e7b20', gameId: 'cs2', enabled: true };
   const launch = { type: 'LAUNCH_GAME' as const, gameId: 'cs2', payload: undefined };
@@ -85,6 +88,7 @@ describe('CommandsService', () => {
       endWhileOffline: vi.fn(async () => false),
     };
     audit = { record: vi.fn(async () => undefined) };
+    stationPolicy = { effectiveFor: vi.fn(async () => EFFECTIVE), branchPolicyChanges: new Subject() };
     const port = { current: sessions };
     service = new CommandsService(
       repo as any,
@@ -97,6 +101,7 @@ describe('CommandsService', () => {
       games as any,
       port as any,
       audit as any,
+      stationPolicy as any,
     );
   });
 
@@ -177,6 +182,42 @@ describe('CommandsService', () => {
     presence.isOnline.mockReturnValue(false);
     await expect(service.issue(caller(), 'm1', { type: 'LOCK' })).rejects.toBeInstanceOf(ConflictException);
     expect(repo.create).not.toHaveBeenCalled();
+  });
+
+  describe('station policy', () => {
+    beforeEach(() => service.onModuleInit());
+
+    it("stores a staff POLICY_UPDATE as the station's own policy and sends the station its effective policy", async () => {
+      presence.setPolicy = vi.fn(async () => undefined);
+      await service.issue(caller(), 'm1', { type: 'POLICY_UPDATE', policy: { cpuTempAlertThreshold: 80 } });
+      expect(presence.setPolicy).toHaveBeenCalledWith('m1', { cpuTempAlertThreshold: 80 });
+      expect(stationPolicy.effectiveFor).toHaveBeenCalledWith('m1');
+      expect(queue.add).toHaveBeenCalledWith('dispatch', expect.objectContaining({ payload: EFFECTIVE }), expect.anything());
+    });
+
+    it('issuePolicyUpdate sends the effective policy, timing included, as a system command', async () => {
+      expect(await service.issuePolicyUpdate('m1')).toBe(true);
+      expect(repo.create).toHaveBeenCalledWith(expect.objectContaining({ type: 'POLICY_UPDATE', issuedBy: SYSTEM_ACTOR_ID }));
+      expect(queue.add).toHaveBeenCalledWith('dispatch', expect.objectContaining({ payload: EFFECTIVE }), expect.anything());
+
+      stationPolicy.effectiveFor.mockResolvedValueOnce(null);
+      expect(await service.issuePolicyUpdate('gone')).toBe(false);
+      expect(repo.create).toHaveBeenCalledTimes(1);
+    });
+
+    it("pushes a branch's new default to its online stations only", async () => {
+      const other = { machineId: 'm2', branchId: 'b2', serialNumber: 'SN-2' };
+      const third = { machineId: 'm3', branchId: 'b1', serialNumber: 'SN-3' };
+      presence.onlineStations.mockReturnValue([STATION, other, third]);
+      presence.resolveById.mockImplementation(async (id: string) => [STATION, other, third].find((s) => s.machineId === id));
+      registry.has.mockImplementation((serial: string) => serial !== 'SN-3'); // SN-3: no live socket
+
+      stationPolicy.branchPolicyChanges.next({ branchId: 'b1' });
+      await vi.waitFor(() => expect(repo.create).toHaveBeenCalled());
+      expect(stationPolicy.effectiveFor).toHaveBeenCalledWith('m1');
+      expect(repo.create).toHaveBeenCalledTimes(1);
+      expect(repo.create).toHaveBeenCalledWith(expect.objectContaining({ type: 'POLICY_UPDATE', machineId: 'm1' }));
+    });
   });
 
   it('marks the session locked by staff when a LOCK goes out', async () => {

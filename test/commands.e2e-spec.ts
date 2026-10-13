@@ -8,6 +8,7 @@ import type { Redis } from 'ioredis';
 import WebSocket from 'ws';
 
 import { AppModule } from '../src/app.module.js';
+import { Prisma } from '../src/generated/prisma/index.js';
 import { PrismaService } from '../src/infra/prisma/prisma.service.js';
 import { REDIS } from '../src/infra/redis/redis.module.js';
 import { makeFrame } from '../src/infra/realtime/frame.js';
@@ -85,6 +86,8 @@ describe('station commands (e2e)', () => {
       headers: { authorization: `Bearer ${stationToken}` },
     });
     const commands: OutboundEnvelope[] = [];
+    // The backend sends the effective policy on every connect: acked like the real agent, kept apart.
+    const policies: OutboundEnvelope<Record<string, unknown>>[] = [];
     let seq = 0;
     let lastCommandSeq = 0;
     let handshaken = false;
@@ -94,6 +97,12 @@ describe('station commands (e2e)', () => {
     socket.on('message', (data: Buffer) => {
       const frame = JSON.parse(data.toString()) as OutboundEnvelope;
       if (frame.type === 'handshake_ack') handshaken = true;
+      if (frame.type === 'POLICY_UPDATE') {
+        policies.push(frame as OutboundEnvelope<Record<string, unknown>>);
+        lastCommandSeq = Math.max(lastCommandSeq, frame.seq);
+        send('command_ack', { commandId: frame.id });
+        return;
+      }
       if (!COMMAND_TYPES.has(frame.type)) return;
       commands.push(frame);
       if (frame.seq <= lastCommandSeq || Math.abs(Date.now() - Date.parse(frame.ts)) > 30_000) {
@@ -111,7 +120,7 @@ describe('station commands (e2e)', () => {
     });
     send('handshake', { serialNumber });
     await vi.waitFor(() => expect(handshaken).toBe(true));
-    return { machine, socket, commands, send, stationToken };
+    return { machine, socket, commands, policies, send, stationToken };
   }
 
   const issue = (machineId: string, body: Record<string, unknown>, token = staffToken) =>
@@ -119,6 +128,43 @@ describe('station commands (e2e)', () => {
 
   const status = async (commandId: string) =>
     (await app.inject({ method: 'GET', url: `/api/v1/commands/${commandId}`, headers: auth() })).json();
+
+  describe('station policy', () => {
+    const TIMING = { heartbeatIntervalSeconds: 0.5, defaultLeaseDurationSeconds: 60, leaseGracePeriodSeconds: 10 };
+    const putBranchPolicy = (policy: Record<string, unknown>, token = managerToken) =>
+      app.inject({ method: 'PUT', url: `/branches/${branchId}/station-policy`, headers: auth(token), payload: policy });
+
+    afterEach(async () => {
+      await prisma.branch.update({ where: { id: branchId }, data: { stationPolicy: Prisma.DbNull } });
+    });
+
+    it('sends the backend timing on connect, even with no policy stored', async () => {
+      const agent = await connectAgent();
+      await vi.waitFor(() => expect(agent.policies).toHaveLength(1));
+      expect(agent.policies[0].payload).toEqual(TIMING);
+      agent.socket.close();
+    });
+
+    it("pushes a branch's new default to its online stations, under each station's own overrides", async () => {
+      const agent = await connectAgent();
+      await vi.waitFor(() => expect(agent.policies).toHaveLength(1));
+      await prisma.machine.update({ where: { id: agent.machine.id }, data: { policy: { cpuTempAlertThreshold: 70 } } });
+
+      expect((await putBranchPolicy({ cpuTempAlertThreshold: 90, gpuTempAlertThreshold: 95 }, staffToken)).statusCode).toBe(403);
+      expect((await putBranchPolicy({ heartbeatIntervalSeconds: 1 })).statusCode).toBe(400); // timing is not staff-editable
+
+      const res = await putBranchPolicy({ cpuTempAlertThreshold: 90, gpuTempAlertThreshold: 95 });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ branchId, policy: { cpuTempAlertThreshold: 90, gpuTempAlertThreshold: 95 } });
+      await vi.waitFor(() => expect(agent.policies).toHaveLength(2));
+      expect(agent.policies[1].payload).toEqual({ cpuTempAlertThreshold: 70, gpuTempAlertThreshold: 95, ...TIMING });
+
+      const read = await app.inject({ method: 'GET', url: `/branches/${branchId}/station-policy`, headers: auth(managerToken) });
+      expect(read.json()).toEqual({ branchId, policy: { cpuTempAlertThreshold: 90, gpuTempAlertThreshold: 95 } });
+      expect(await prisma.auditLog.count({ where: { target: `branch:${branchId}`, branchId } })).toBeGreaterThan(0);
+      agent.socket.close();
+    });
+  });
 
   it('delivers LOCK with the commandId as envelope id and records the ack', async () => {
     const client = ioClient(baseUrl, {
@@ -229,7 +275,8 @@ describe('station commands (e2e)', () => {
     expect(res.json().code).toBe('NO_SESSION_TO_UNLOCK');
     await new Promise((r) => setTimeout(r, 200));
     expect(agent.commands).toHaveLength(0);
-    expect(await prisma.command.count({ where: { machineId: agent.machine.id } })).toBe(0);
+    // The policy goes out on every connect; nothing else may.
+    expect(await prisma.command.count({ where: { machineId: agent.machine.id, type: { not: 'POLICY_UPDATE' } } })).toBe(0);
     agent.socket.close();
   });
 

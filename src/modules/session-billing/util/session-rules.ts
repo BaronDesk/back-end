@@ -1,5 +1,7 @@
 import { ConflictException, NotFoundException } from '@nestjs/common';
 import type { ConfigService } from '@nestjs/config';
+
+import { stationTiming } from '../../../config/station-timing.js';
 import type { Session } from '../../../generated/prisma/index.js';
 
 import type { StationLease } from '../../ops/services/station-session.port.js';
@@ -24,15 +26,17 @@ export const insufficientFunds = (error: string) => new ConflictException({ code
 
 /** The session-billing settings, with their defaults. Each service reads the ones it needs. */
 export function sessionConfig(config: ConfigService) {
+  const timing = stationTiming(config);
   return {
     pinMaxAttempts: Number(config.get('SESSION_PIN_MAX_ATTEMPTS') ?? 5),
-    leaseCapSeconds: Number(config.get('SESSION_LEASE_CAP_S') ?? 180),
+    /** The longest lease granted: min(SESSION_LEASE_CAP_S, STATION_LEASE_S), what the station itself holds to. */
+    leaseCapSeconds: timing.leaseSeconds,
     sweepIntervalMs: Number(config.get('SESSION_SWEEP_INTERVAL_MS') ?? 60_000),
     minPlayMinutes: Number(config.get('SESSION_MIN_PLAY_MINUTES') ?? 5),
     runoutMarginS: Number(config.get('SESSION_RUNOUT_MARGIN_S') ?? 30),
     noShowGraceMs: Number(config.get('NO_SHOW_GRACE_MINUTES') ?? 30) * 60_000,
     endingNoticeMs: Number(config.get('SESSION_ENDING_NOTICE_MINUTES') ?? 10) * 60_000,
-    stationLeaseGraceS: Number(config.get('STATION_LEASE_GRACE_S') ?? 10),
+    stationLeaseGraceS: timing.leaseGraceSeconds,
   };
 }
 

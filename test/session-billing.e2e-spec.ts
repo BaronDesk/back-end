@@ -68,6 +68,9 @@ describe('session billing (e2e)', () => {
     return (await app.inject({ method: 'GET', url: `/wallets/${gamerProfileId}`, headers: as(adminToken) })).json().balance;
   }
 
+  /** Every fake agent's socket: closed in afterAll even when a failed test skipped its own close. */
+  const agentSockets: WebSocket[] = [];
+
   /**
    * Minimal fake agent: acks every command it receives, records login_result
    * and heartbeat_ack frames, and exposes `send` for any agent frame.
@@ -77,6 +80,7 @@ describe('session billing (e2e)', () => {
     const socket = new WebSocket(`${baseUrl.replace('http', 'ws')}/agent-ws`, {
       headers: { authorization: `Bearer ${stationToken}` },
     });
+    agentSockets.push(socket);
     const commands: OutboundEnvelope<Record<string, unknown>>[] = [];
     const loginResults: OutboundEnvelope<{ requestId: string; accepted: boolean; reason?: string }>[] = [];
     const heartbeatAcks: OutboundEnvelope<{ leaseSeconds: number; serverTime: string }>[] = [];
@@ -90,6 +94,8 @@ describe('session billing (e2e)', () => {
       if (frame.type === 'handshake_ack') handshaken = true;
       if (frame.type === 'login_result') loginResults.push(frame);
       if (frame.type === 'heartbeat_ack') heartbeatAcks.push(frame);
+      // The effective policy, sent on every connect: acked like the real agent, not one of the commands under test.
+      if (frame.type === 'POLICY_UPDATE') return void send('command_ack', { commandId: frame.id });
       if (!['LOCK', 'UNLOCK', 'SHUTDOWN', 'LAUNCH_GAME', 'END_SESSION', 'CATALOG_UPDATE'].includes(frame.type)) return;
       commands.push(frame);
       send('command_ack', { commandId: frame.id });
@@ -109,7 +115,8 @@ describe('session billing (e2e)', () => {
   async function typePin(agent: Agent, credential: string) {
     const requestId = randomUUID();
     agent.send('login_request', { method: 'pin', credential }, requestId);
-    await vi.waitFor(() => expect(agent.loginResults.some((r) => r.payload?.requestId === requestId)).toBe(true));
+    // The PIN check (argon2) alone can take most of waitFor's 1 s default when the whole suite runs.
+    await vi.waitFor(() => expect(agent.loginResults.some((r) => r.payload?.requestId === requestId)).toBe(true), { timeout: 5_000 });
     return agent.loginResults.find((r) => r.payload?.requestId === requestId)!.payload!;
   }
 
@@ -189,6 +196,8 @@ describe('session billing (e2e)', () => {
   }, 30_000);
 
   afterAll(async () => {
+    // An open agent socket keeps app.close() waiting.
+    for (const socket of agentSockets) socket.close();
     const machines = await prisma.machine.findMany({ where: { branchId: { in: branchIds } } });
     if (machines.length) await redis.del(...machines.map((m) => `node:${m.serialNumber}`));
     await prisma.user.deleteMany({ where: { username: { in: usernames } } });
@@ -224,7 +233,8 @@ describe('session billing (e2e)', () => {
 
     await new Promise((r) => setTimeout(r, 300));
     expect(agent.commands).toHaveLength(0);
-    expect(await prisma.command.count({ where: { machineId: machine.id } })).toBe(0);
+    // The policy goes out on every connect; nothing else may.
+    expect(await prisma.command.count({ where: { machineId: machine.id, type: { not: 'POLICY_UPDATE' } } })).toBe(0);
 
     agent.socket.close();
   });
@@ -599,7 +609,7 @@ describe('session billing (e2e)', () => {
     expect(res.statusCode).toBe(201);
     expect(res.json().status).toBe('PENDING');
     expect(await prisma.session.count({ where: { reservationId: reservation.id } })).toBe(1);
-    expect(await prisma.command.count({ where: { machineId: machine.id } })).toBe(0);
+    expect(await prisma.command.count({ where: { machineId: machine.id, type: { not: 'POLICY_UPDATE' } } })).toBe(0);
   });
 
   it('state_report on reconnect re-grants an open in-window session, and ends one that closed meanwhile', async () => {

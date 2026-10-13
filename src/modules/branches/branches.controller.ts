@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Patch, Post } from '@nestjs/common';
+import { Body, Controller, Get, Param, Patch, Post, Put } from '@nestjs/common';
 import { z } from 'zod';
 
 import { Public } from '../../common/decorators/public.decorator.js';
@@ -6,6 +6,7 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator.js';
 import { RequireScope } from '../../common/decorators/require-scope.decorator.js';
 import { ZodValidationPipe } from '../../common/pipes/zod-validation.pipe.js';
 import type { AccessTokenPayload } from '../../common/types/jwt-payload.js';
+import { stationPolicySchema, type StationPolicy } from '../station/schemas/policy.schemas.js';
 import { BranchesService } from './branches.service.js';
 
 const idParamSchema = z.string().uuid();
@@ -40,6 +41,24 @@ export class BranchesController {
     @Body(new ZodValidationPipe(updateBranchSchema)) dto: z.infer<typeof updateBranchSchema>,
   ) {
     return this.branches.update(caller, id, dto);
+  }
+
+  /** The branch's default station policy ({} when none): each station overrides it field by field. */
+  @RequireScope('admin')
+  @Get(':id/station-policy')
+  stationPolicy(@CurrentUser() caller: AccessTokenPayload, @Param('id', new ZodValidationPipe(idParamSchema)) id: string) {
+    return this.branches.stationPolicy(caller, id);
+  }
+
+  /** Replaces the branch's default station policy ({} clears it); its online stations get it at once. */
+  @RequireScope('admin')
+  @Put(':id/station-policy')
+  setStationPolicy(
+    @CurrentUser() caller: AccessTokenPayload,
+    @Param('id', new ZodValidationPipe(idParamSchema)) id: string,
+    @Body(new ZodValidationPipe(stationPolicySchema)) policy: StationPolicy,
+  ) {
+    return this.branches.setStationPolicy(caller, id, policy);
   }
 
   /** The branch's stations for booking: any logged-in user (gamers book any branch). */

@@ -87,7 +87,9 @@ describe('realtime gateways (e2e)', () => {
     let read = 0;
 
     socket.on('message', (data: Buffer) => {
-      frames.push(JSON.parse(data.toString()) as OutboundEnvelope);
+      const frame = JSON.parse(data.toString()) as OutboundEnvelope;
+      if (frame.type === 'POLICY_UPDATE') return; // sent on every connect; not what these tests read
+      frames.push(frame);
       const waiter = waiters.shift();
       if (waiter) waiter(frames[read++]);
     });

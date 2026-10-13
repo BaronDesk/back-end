@@ -22,7 +22,9 @@ export function caller(overrides: Partial<AccessTokenPayload> = {}): AccessToken
 
 export const STATION = { machineId: 'm1', branchId: 'b1', serialNumber: 'SN-1' };
 export const HOUR = 60 * 60_000;
-export const LEASE_CAP_S = 180;
+/** The lease granted: min(SESSION_LEASE_CAP_S, STATION_LEASE_S), what the station itself holds to. */
+export const LEASE_CAP_S = 60;
+const SESSION_LEASE_CAP_S = 180;
 export const MAX_ATTEMPTS = 3;
 
 /** A reservation window that is open right now: started 10 minutes ago, ends in 50. */
@@ -133,7 +135,7 @@ export function createHarness() {
   const config = {
     getOrThrow: () => 'test-jwt-secret',
     get: (key: string) =>
-      ({ SESSION_LEASE_CAP_S: LEASE_CAP_S, SESSION_PIN_MAX_ATTEMPTS: MAX_ATTEMPTS, SESSION_PIN_TTL_S: 900 })[key],
+      ({ SESSION_LEASE_CAP_S, STATION_LEASE_S: LEASE_CAP_S, SESSION_PIN_MAX_ATTEMPTS: MAX_ATTEMPTS, SESSION_PIN_TTL_S: 900 })[key],
   };
 
   const notices = new SessionNoticesService(repo as any, agents as any, dashboard as any);

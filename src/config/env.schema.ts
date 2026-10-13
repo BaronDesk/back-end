@@ -9,7 +9,8 @@ export const envSchema = z.object({
   JWT_REFRESH_SECRET: z.string().min(1),
   JWT_ACCESS_TTL: z.string().min(1).default('15m'),
   JWT_REFRESH_TTL: z.string().min(1).default('7d'),
-  // Node tracking. The agent heartbeats every 15s; OFFLINE after ~3 missed.
+  // Node tracking. The agent heartbeats every STATION_HEARTBEAT_INTERVAL_S; OFFLINE after ~3 missed
+  // (the backend refuses to start with less than 3 heartbeats' worth).
   PRESENCE_OFFLINE_AFTER_MS: z.coerce.number().int().positive().default(45_000),
   PRESENCE_WATCHDOG_INTERVAL_MS: z.coerce.number().int().positive().default(10_000),
   PRESENCE_PERSIST_INTERVAL_MS: z.coerce.number().int().positive().default(15_000),
@@ -52,8 +53,14 @@ export const envSchema = z.object({
   // agent re-locks once its lease lapses, so this is how long a station stays
   // unlocked after it loses the backend.
   SESSION_LEASE_CAP_S: z.coerce.number().int().positive().default(180),
-  // After a single station's drop, play is billed up to when the station says
-  // it locked, never past its last heartbeat + SESSION_LEASE_CAP_S + this.
+  // Station timing, sent to every station in its policy on each (re)connect
+  // (not staff-editable). The agent heartbeats every STATION_HEARTBEAT_INTERVAL_S.
+  // A lease lasts min(SESSION_LEASE_CAP_S, STATION_LEASE_S); the agent keeps a
+  // lapsed one STATION_LEASE_GRACE_S more before it locks. After a single
+  // station's drop, play is billed up to when the station says it locked,
+  // never past its last heartbeat + that lease + the grace.
+  STATION_HEARTBEAT_INTERVAL_S: z.coerce.number().positive().default(15),
+  STATION_LEASE_S: z.coerce.number().int().positive().default(60),
   STATION_LEASE_GRACE_S: z.coerce.number().int().nonnegative().default(10),
   // How often reservations past their window are closed out (NO_SHOW / END_SESSION).
   SESSION_SWEEP_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
@@ -71,6 +78,15 @@ export const envSchema = z.object({
   // Uploaded images (badges, game images, avatars), served under /uploads/.
   // Relative paths are read from the working directory (/app/uploads in Docker, a volume).
   UPLOAD_DIR: z.string().min(1).default('uploads'),
+}).superRefine((env, ctx) => {
+  // Fewer than 3 heartbeats before OFFLINE: one late heartbeat would pause a running session.
+  if (env.PRESENCE_OFFLINE_AFTER_MS < 3 * env.STATION_HEARTBEAT_INTERVAL_S * 1000) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['PRESENCE_OFFLINE_AFTER_MS'],
+      message: `must be at least 3 x STATION_HEARTBEAT_INTERVAL_S (${3 * env.STATION_HEARTBEAT_INTERVAL_S * 1000} ms)`,
+    });
+  }
 });
 
 export type EnvConfig = z.infer<typeof envSchema>;
