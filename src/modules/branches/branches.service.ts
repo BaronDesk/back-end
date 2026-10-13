@@ -1,6 +1,9 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 
+import { assertScope } from '../../common/utils/assert-scope.js';
+import type { StationPolicy } from '../station/schemas/policy.schemas.js';
 import { PresenceService } from '../station/services/presence.service.js';
+import { StationPolicyService } from '../station/services/station-policy.service.js';
 import { BranchesRepository } from './branches.repository.js';
 import { AuditLogService } from '../../common/audit/audit-log.service.js';
 import type { AccessTokenPayload } from '../../common/types/jwt-payload.js';
@@ -24,6 +27,7 @@ export class BranchesService {
     private readonly repo: BranchesRepository,
     private readonly presence: PresenceService,
     private readonly audit: AuditLogService,
+    private readonly policies: StationPolicyService,
   ) {}
 
   async list() {
@@ -42,6 +46,26 @@ export class BranchesService {
       metadata: { event: 'BRANCH_UPDATED', fields: Object.keys(data) },
     });
     return toBranchDto(updated);
+  }
+
+  /** The branch's default station policy: its own admins, or HQ. */
+  async stationPolicy(caller: AccessTokenPayload, id: string) {
+    assertScope(caller, { branchId: id });
+    const policy = await this.policies.getBranchPolicy(id);
+    if (!policy) throw notFound();
+    return { branchId: id, policy };
+  }
+
+  /** Replaces the branch's default station policy; ops pushes it to the branch's online stations. */
+  async setStationPolicy(caller: AccessTokenPayload, id: string, policy: StationPolicy) {
+    assertScope(caller, { branchId: id });
+    if (!(await this.repo.findById(id))) throw notFound();
+    const saved = await this.policies.setBranchPolicy(id, policy);
+    await this.audit.record(caller.sub, 'UPDATE', `branch:${id}`, {
+      branchId: id,
+      metadata: { event: 'BRANCH_STATION_POLICY_UPDATED', policy: saved },
+    });
+    return { branchId: id, policy: saved };
   }
 
   /**

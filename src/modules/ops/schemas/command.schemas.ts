@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 import { AGENT_COMMANDS } from '../../../infra/realtime/constants.js';
+import { stationPolicySchema, type EffectiveStationPolicy, type StationPolicy } from '../../station/schemas/policy.schemas.js';
 
 /** The commands staff can issue. */
 export const STATION_COMMAND_TYPES = [
@@ -32,13 +33,9 @@ export type StationCommandType = (typeof STATION_COMMAND_TYPES)[number];
 export const COMMAND_SIMULATIONS = ['stale_ts', 'duplicate_send', 'invalid_payload', 'exec_failed'] as const;
 export type CommandSimulation = (typeof COMMAND_SIMULATIONS)[number];
 
-export const policyUpdatePayloadSchema = z.object({
-  cpuTempAlertThreshold: z.number().positive().optional(),
-  gpuTempAlertThreshold: z.number().positive().optional(),
-  usbDebounceWindowSeconds: z.number().int().positive().optional(),
-  telemetryCadenceSeconds: z.number().int().positive().optional(),
-}).strict();
-export type PolicyUpdatePayload = z.infer<typeof policyUpdatePayloadSchema>;
+/** A station's own policy (staff POLICY_UPDATE): the same fields as its branch default. */
+export const policyUpdatePayloadSchema = stationPolicySchema;
+export type PolicyUpdatePayload = StationPolicy;
 
 
 /**
@@ -132,7 +129,7 @@ export type LaunchGamePayload = { gameId: string };
 /** END_SESSION wire payload. `{}` makes the agent default the reason to "normal". */
 export type EndSessionPayload = { reason?: string };
 
-export type CommandPayload = SessionUnlockPayload | LaunchGamePayload | EndSessionPayload | PolicyUpdatePayload | Record<string, never>;
+export type CommandPayload = SessionUnlockPayload | LaunchGamePayload | EndSessionPayload | EffectiveStationPolicy | Record<string, never>;
 
 /** What a BullMQ `commands` job carries. */
 export interface CommandJobData {

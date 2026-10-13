@@ -313,15 +313,15 @@ describe('StationLinkService', () => {
 
     it('bills from the last heartbeat to when the station locked itself, then resumes', async () => {
       presence.outageOf.mockReturnValue('single');
-      await service.reconcile(STATION, { locked: true, sessionId: 's1', lockedAt: at(100), lockReason: 'lease_expired' });
-      expect(repo.billOfflineOnce).toHaveBeenCalledWith('s1', pausedAt, 100);
+      await service.reconcile(STATION, { locked: true, sessionId: 's1', lockedAt: at(50), lockReason: 'lease_expired' });
+      expect(repo.billOfflineOnce).toHaveBeenCalledWith('s1', pausedAt, 50);
       expect(commands.issueSessionUnlock).toHaveBeenCalledWith('m1', expect.objectContaining({ sessionId: 's1' }), 'resume');
     });
 
-    it('caps it at the lease the station held plus grace (180 s + 10 s)', async () => {
+    it('caps it at the lease the station held plus grace (60 s + 10 s)', async () => {
       presence.outageOf.mockReturnValue('single');
       await service.reconcile(STATION, { locked: true, sessionId: 's1', lockedAt: at(900) });
-      expect(repo.billOfflineOnce).toHaveBeenCalledWith('s1', pausedAt, 190);
+      expect(repo.billOfflineOnce).toHaveBeenCalledWith('s1', pausedAt, 70);
     });
 
     it('bills a pause only once', async () => {

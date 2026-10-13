@@ -318,10 +318,6 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
     await this.machines.setPolicy(machineId, policy);
   }
 
-  async getStoredPolicy(machineId: string): Promise<Record<string, unknown> | null> {
-    const machine = await this.machines.findById(machineId);
-    return (machine?.policy as Record<string, unknown> | null) ?? null;
-  }
 
   /** A staff rename: the live state (and dashboards) show it at once. */
   renamed(machineId: string, name: string): void {

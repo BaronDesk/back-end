@@ -85,7 +85,10 @@ describe('telemetry & alerts (e2e)', () => {
       headers: { authorization: `Bearer ${mintStationToken(app, machine)}` },
     });
     const frames: OutboundEnvelope[] = [];
-    socket.on('message', (data: Buffer) => frames.push(JSON.parse(data.toString()) as OutboundEnvelope));
+    socket.on('message', (data: Buffer) => {
+      const frame = JSON.parse(data.toString()) as OutboundEnvelope;
+      if (frame.type !== 'POLICY_UPDATE') frames.push(frame); // sent on every connect; not what these tests read
+    });
     await new Promise((resolve, reject) => {
       socket.on('open', resolve);
       socket.on('error', reject);

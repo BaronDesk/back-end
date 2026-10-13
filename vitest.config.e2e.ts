@@ -22,6 +22,8 @@ export default defineConfig({
     env: {
       PRESENCE_OFFLINE_AFTER_MS: '1500',
       PRESENCE_WATCHDOG_INTERVAL_MS: '300',
+      // OFFLINE must allow 3 heartbeats: the startup check refuses less.
+      STATION_HEARTBEAT_INTERVAL_S: '0.5',
       // Short ack timeout so the command retry/timeout cases run in seconds.
       COMMAND_ACK_TIMEOUT_MS: '800',
       COMMAND_RETRY_BACKOFF_MS: '50',

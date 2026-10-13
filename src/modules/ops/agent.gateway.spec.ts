@@ -57,7 +57,7 @@ describe('AgentGateway session login and lease', () => {
       reportState: vi.fn(async () => undefined),
       sessionOf: vi.fn(() => 'sess-1'),
     };
-    commands = { issueSessionUnlock: vi.fn(async () => true) };
+    commands = { issueSessionUnlock: vi.fn(async () => true), issuePolicyUpdate: vi.fn(async () => true) };
     handler = {
       login: vi.fn(async () => ({ accepted: true, sessionId: 'sess-1', lease: { leaseSeconds: 120, serverTime: new Date().toISOString() } })),
       lease: vi.fn(async () => ({ leaseSeconds: 90, serverTime: new Date().toISOString() })),
@@ -78,7 +78,7 @@ describe('AgentGateway session login and lease', () => {
       {} as any,
       commands as any,
       {} as any,
-      {} as any,
+      { renewalFor: vi.fn(() => null) } as any,
       port,
     );
 
@@ -178,6 +178,18 @@ describe('AgentGateway session login and lease', () => {
     await receive('handshake', { serialNumber: 'SN-1' });
     await receive('heartbeat', { locked: false, sessionId: 'sess-1' });
     expect(sentOf('heartbeat_ack')[0].payload).toMatchObject({ leaseSeconds: 0 });
+  });
+
+  it('sends the effective policy on every (re)connect', async () => {
+    expect(commands.issuePolicyUpdate).toHaveBeenCalledWith('m1');
+    const fresh = new FakeSocket();
+    const request = { headers: {}, socket: { remoteAddress: '127.0.0.1' } };
+    (gateway as any).principals.set(request, PRINCIPAL);
+    (gateway as any).handleConnection(fresh, request);
+    socket = fresh;
+    seq = 0;
+    await receive('handshake', { serialNumber: 'SN-1' });
+    expect(commands.issuePolicyUpdate).toHaveBeenCalledTimes(2);
   });
 
   it('reconciles a state_report after presence has recorded it', async () => {

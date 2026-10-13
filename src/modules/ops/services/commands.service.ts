@@ -24,6 +24,7 @@ import type { Command, CommandStatus, Prisma } from '../../../generated/prisma/i
 import { GamesService, type CatalogChange } from '../../games/services/games.service.js';
 import { PresenceService, type StationRef } from '../../station/services/presence.service.js';
 import { StationAttentionService, type StationAttentionChange } from '../../station/services/station-attention.service.js';
+import { StationPolicyService } from '../../station/services/station-policy.service.js';
 import { DashboardGateway } from '../dashboard.gateway.js';
 import { CommandsRepository } from '../repository/commands.repository.js';
 import { AuditLogService } from '../../../common/audit/audit-log.service.js';
@@ -33,7 +34,6 @@ import {
   type CommandPayload,
   type CommandSimulation,
   type IssueCommandBody,
-  type PolicyUpdatePayload,
   type SessionUnlockPayload,
   type StationCommandType,
   type ListCommandsQuery,
@@ -118,6 +118,7 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
   private readonly simulationsAllowed: boolean;
   private catalogSub?: Subscription;
   private attentionSub?: Subscription;
+  private policySub?: Subscription;
 
   constructor(
     private readonly repo: CommandsRepository,
@@ -131,6 +132,7 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
     private readonly sessions: StationSessionPort,
     private readonly audit: AuditLogService,
     private readonly attention: StationAttentionService,
+    private readonly stationPolicy: StationPolicyService,
   ) {
     this.simulationsAllowed = config.get('NODE_ENV') !== 'production';
   }
@@ -138,11 +140,13 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
   onModuleInit(): void {
     this.catalogSub = this.games.catalogChanges.subscribe((change) => void this.requestCatalogSync(change));
     this.attentionSub = this.attention.changes.subscribe((change) => this.publishAttention(change));
+    this.policySub = this.stationPolicy.branchPolicyChanges.subscribe(({ branchId }) => void this.requestPolicySync(branchId));
   }
 
   onModuleDestroy(): void {
     this.catalogSub?.unsubscribe();
     this.attentionSub?.unsubscribe();
+    this.policySub?.unsubscribe();
   }
 
   async issue(caller: AccessTokenPayload, stationId: string, body: IssueCommandBody) {
@@ -198,8 +202,9 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
         metadata: { event: 'STATION_SHUTDOWN' },
       });
     } else if (body.type === 'POLICY_UPDATE') {
-      payload = body.policy;
+      // The station's own overrides are stored; it is sent what it must run with (branch default, overrides, timing).
       await this.presence.setPolicy(station.machineId, body.policy!);
+      payload = (await this.stationPolicy.effectiveFor(station.machineId)) ?? undefined;
     } else if (body.type === 'LOCK' && !body.simulate) {
       // Locked by staff: a reconnect must not lift it, only a staff UNLOCK.
       await this.sessions.current?.markStaffLock(station);
@@ -494,9 +499,33 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  /** Re-sent on every (re)connect so a policy survives a station restart. */
-  async issuePolicyUpdate(machineId: string, policy: PolicyUpdatePayload): Promise<boolean> {
-    return this.issueSystem(machineId, 'POLICY_UPDATE', 'resume', policy);
+  /**
+   * The station's effective policy (branch default, its own overrides, the
+   * backend's timing). Sent on every (re)connect, so the station runs the
+   * backend's settings even after a restart, and when its branch default changes.
+   */
+  async issuePolicyUpdate(machineId: string, reason = 'resume'): Promise<boolean> {
+    const policy = await this.stationPolicy.effectiveFor(machineId);
+    if (!policy) return false;
+    return this.issueSystem(machineId, 'POLICY_UPDATE', reason, policy);
+  }
+
+  /**
+   * A branch's default policy changed: POLICY_UPDATE to each of its online
+   * stations. Offline ones get it on their next connect. Never throws: this
+   * runs from a subscription.
+   */
+  async requestPolicySync(branchId: string): Promise<void> {
+    const targets = this.presence
+      .onlineStations()
+      .filter((s) => s.branchId === branchId && this.registry.has(s.serialNumber));
+    for (const station of targets) {
+      try {
+        await this.issuePolicyUpdate(station.machineId, 'branch_policy');
+      } catch (err) {
+        this.logger.error(`POLICY_UPDATE for ${station.serialNumber} not issued: ${(err as Error).message}`);
+      }
+    }
   }
 
   /** Dispatches a SYSTEM_ACTOR_ID command to an online station; false (logged) when it cannot be delivered. */
