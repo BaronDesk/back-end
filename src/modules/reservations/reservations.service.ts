@@ -155,10 +155,13 @@ export class ReservationsService {
     throw notCancellable();
   }
 
-  /** An unknown PC can't be booked (checked before the price, so it answers MACHINE_UNAVAILABLE). */
+  /**
+   * An unknown PC, or one that needs attention from staff, can't be booked
+   * (checked before the price, so it answers MACHINE_UNAVAILABLE).
+   */
   private async assertMachine(machineId: string): Promise<void> {
     const machine = await this.reservations.findMachine(machineId);
-    if (!machine) throw new ConflictException({ code: 'MACHINE_UNAVAILABLE', error: 'machine is unavailable' });
+    if (!machine || machine.needsAttention) throw new ConflictException({ code: 'MACHINE_UNAVAILABLE', error: 'machine is unavailable' });
   }
 
   private async getGamer(userId: string) {

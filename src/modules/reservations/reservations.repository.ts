@@ -44,9 +44,10 @@ export class ReservationsRepository extends BaseRepository {
       // (check-in checks it is online when the time comes).
       const machine = await tx.machine.findUnique({
         where: { id: input.machineId },
-        select: { id: true, enrollmentStatus: true, status: true },
+        select: { id: true, enrollmentStatus: true, status: true, needsAttention: true },
       });
-      if (!machine || machine.enrollmentStatus !== 'ENROLLED' || (walkIn && machine.status !== 'ONLINE')) {
+      // A station needing attention takes no new booking until staff clear it.
+      if (!machine || machine.enrollmentStatus !== 'ENROLLED' || machine.needsAttention || (walkIn && machine.status !== 'ONLINE')) {
         return { kind: 'machine_unavailable' as const };
       }
 
@@ -130,7 +131,7 @@ export class ReservationsRepository extends BaseRepository {
   }
 
   findMachine(machineId: string) {
-    return this.prisma.machine.findUnique({ where: { id: machineId }, select: { id: true, branchId: true } });
+    return this.prisma.machine.findUnique({ where: { id: machineId }, select: { id: true, branchId: true, needsAttention: true } });
   }
 
   async findOwned(id: string, gamerProfileId: string) {

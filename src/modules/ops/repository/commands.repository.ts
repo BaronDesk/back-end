@@ -33,6 +33,26 @@ export class CommandsRepository extends BaseRepository {
     return open !== null;
   }
 
+  /**
+   * The outcomes of the station's last `limit` staff commands that got one:
+   * no system sends (SYSTEM_ACTOR_ID), no CATALOG_UPDATE, nothing still open,
+   * and APPLIED_ON_RECONNECT doesn't count either way. Latest first.
+   */
+  async lastStaffOutcomes(machineId: string, systemActorId: string, limit: number): Promise<CommandStatus[]> {
+    const rows = await this.prisma.command.findMany({
+      where: {
+        machineId,
+        issuedBy: { not: systemActorId },
+        type: { not: 'CATALOG_UPDATE' },
+        status: { in: ['ACKED', 'NACKED', 'FAILED', 'TIMEOUT'] },
+      },
+      orderBy: [{ resolvedAt: 'desc' }, { issuedAt: 'desc' }],
+      take: limit,
+      select: { status: true },
+    });
+    return rows.map((r) => r.status);
+  }
+
   findById(id: string) {
     return this.prisma.command.findUnique({ where: { id } });
   }

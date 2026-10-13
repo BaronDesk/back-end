@@ -5,6 +5,7 @@ import { StationsController } from './controllers/stations.controller.js';
 import { StationAuthGuard } from './guards/station-auth.guard.js';
 import { MachinesRepository } from './repository/machines.repository.js';
 import { PresenceService } from './services/presence.service.js';
+import { StationAttentionService } from './services/station-attention.service.js';
 import { StationAuthService } from './services/station-auth.service.js';
 import { StationTokenService } from './services/station-token.service.js';
 import { StationsService } from './services/stations.service.js';
@@ -15,11 +16,12 @@ import { StationsService } from './services/stations.service.js';
   providers: [
     MachinesRepository,
     PresenceService,
+    StationAttentionService,
     StationsService,
     StationTokenService,
     StationAuthService,
     StationAuthGuard,
   ],
-  exports: [PresenceService, StationAuthService, StationAuthGuard],
+  exports: [PresenceService, StationAttentionService, StationAuthService, StationAuthGuard],
 })
 export class StationModule {}

@@ -94,6 +94,13 @@ export class SessionLoginService {
     if (reservation.status !== 'CONFIRMED') {
       throw new ConflictException({ code: 'RESERVATION_NOT_CONFIRMED', error: 'reservation is not confirmed' });
     }
+    // The backend can't control that PC right now: no PIN for it until staff clear the flag.
+    if (reservation.machine.needsAttention) {
+      throw new ConflictException({
+        code: 'STATION_NEEDS_ATTENTION',
+        error: 'this PC needs a check by staff before it can be used: please ask at the desk',
+      });
+    }
     const deadline = this.noShowDeadline(reservation);
     if (deadline <= now) {
       throw new ConflictException({ code: 'RESERVATION_EXPIRED', error: 'the booking is over, or passed its no-show deadline' });

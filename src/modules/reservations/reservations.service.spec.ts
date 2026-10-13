@@ -53,6 +53,14 @@ describe('ReservationsRepository.createIfAvailable', () => {
     expect(await repo.createIfAvailable('g1', later)).toMatchObject({ kind: 'created', reservation: { isWalkIn: false } });
   });
 
+  it('refuses a booking or walk-in on a station that needs attention, as an unavailable machine', async () => {
+    tx.machine.findUnique.mockResolvedValue({ id: MACHINE_ID, enrollmentStatus: 'ENROLLED', status: 'ONLINE', needsAttention: true });
+    expect(await repo.createIfAvailable('g1', slot(), true)).toEqual({ kind: 'machine_unavailable' });
+    const later = { ...slot(), startTime: new Date(Date.now() + 60 * 60_000), endTime: new Date(Date.now() + 2 * 60 * 60_000) };
+    expect(await repo.createIfAvailable('g1', later)).toEqual({ kind: 'machine_unavailable' });
+    expect(tx.reservation.create).not.toHaveBeenCalled();
+  });
+
   it('rejects a walk-in while someone still plays on the station, under the station lock', async () => {
     tx.session.findFirst.mockResolvedValueOnce({ id: 's-open' });
     expect(await repo.createIfAvailable('g1', slot(), true)).toEqual({ kind: 'slot_taken' });
@@ -262,6 +270,16 @@ describe('ReservationsService walk-in and check-in', () => {
     membership.getBookingAdvanceDays.mockResolvedValue(7);
     await expect(service.create(GAMER, booking(6 * 24))).resolves.toMatchObject({ id: 'r1' });
     await expect(service.create(GAMER, booking(8 * 24))).rejects.toMatchObject({ response: { code: 'BOOKING_TOO_FAR_AHEAD' } });
+  });
+
+  it('refuses a booking or walk-in on a station that needs attention before pricing it: MACHINE_UNAVAILABLE', async () => {
+    repo.findMachine.mockResolvedValue({ id: MACHINE_ID, branchId: 'b1', needsAttention: true });
+    await expect(service.create(GAMER, booking(2))).rejects.toMatchObject({ response: { code: 'MACHINE_UNAVAILABLE' } });
+    await expect(service.walkIn(GAMER, { machineId: MACHINE_ID, durationMinutes: 60 })).rejects.toMatchObject({
+      response: { code: 'MACHINE_UNAVAILABLE' },
+    });
+    expect(sessions.assertAffordable).not.toHaveBeenCalled();
+    expect(repo.createIfAvailable).not.toHaveBeenCalled();
   });
 
   it('refuses a booking or walk-in the wallet cannot pay for, before anything is created', async () => {

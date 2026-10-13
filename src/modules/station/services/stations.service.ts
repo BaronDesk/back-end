@@ -1,12 +1,14 @@
-import { Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { ConflictException, Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { Redis } from 'ioredis';
 
+import { AuditLogService } from '../../../common/audit/audit-log.service.js';
 import { assertScope } from '../../../common/utils/assert-scope.js';
 import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
 import { REDIS } from '../../../infra/redis/redis.module.js';
 import type { Machine } from '../../../generated/prisma/index.js';
 import { MachinesRepository } from '../repository/machines.repository.js';
 import { PresenceService, presenceCacheKey } from './presence.service.js';
+import { StationAttentionService } from './station-attention.service.js';
 
 type CachedPresence = Record<string, string>;
 
@@ -18,6 +20,8 @@ export class StationsService {
     private readonly machines: MachinesRepository,
     private readonly presence: PresenceService,
     @Inject(REDIS) private readonly redis: Redis,
+    private readonly attention: StationAttentionService,
+    private readonly audit: AuditLogService,
   ) {}
 
   async list(caller: AccessTokenPayload) {
@@ -55,6 +59,24 @@ export class StationsService {
     return this.get(caller, id);
   }
 
+  /**
+   * Staff checked the station: it takes bookings and check-ins again. Audit-logged.
+   * 409 when it was not flagged.
+   */
+  async clearAttention(caller: AccessTokenPayload, id: string) {
+    const machine = await this.machines.findById(id);
+    if (!machine) throw new NotFoundException({ code: 'STATION_NOT_FOUND', error: 'station not found' });
+    assertScope(caller, { branchId: machine.branchId });
+    if (!(await this.attention.clear(id))) {
+      throw new ConflictException({ code: 'STATION_NOT_FLAGGED', error: 'this station does not need attention' });
+    }
+    await this.audit.record(caller.sub, 'UPDATE', `machine:${id}`, {
+      branchId: machine.branchId,
+      metadata: { event: 'STATION_ATTENTION_CLEARED', reason: machine.attentionReason },
+    });
+    return this.get(caller, id);
+  }
+
   /** Postgres is authoritative for status; Redis carries the fresher last_seen and agent-reported state. */
   private toStation(machine: Machine, cached: CachedPresence | undefined) {
     const cachedLastSeen = cached?.lastSeen ? new Date(cached.lastSeen) : null;
@@ -72,6 +94,10 @@ export class StationsService {
       // Set only once the agent reports it (state_report); never from a LAUNCH_GAME ack.
       runningGameId: cached?.runningGameId || null,
       ip: machine.ipAddress,
+      // Flagged: the backend can't control it (no new bookings / check-ins until staff clear it).
+      needsAttention: machine.needsAttention,
+      attentionReason: machine.attentionReason,
+      attentionSince: machine.attentionSince?.toISOString() ?? null,
     };
   }
 

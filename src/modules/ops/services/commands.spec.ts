@@ -49,6 +49,7 @@ describe('CommandsService', () => {
   let tracker: CommandAckTracker;
   let sessions: Record<string, ReturnType<typeof vi.fn>>;
   let audit: { record: ReturnType<typeof vi.fn> };
+  let attention: { flag: ReturnType<typeof vi.fn>; failedCommandsThreshold: number; changes: Subject<any> };
   let service: CommandsService;
 
   const GAME = { id: '9d3c1f4e-8a55-4d1b-9a36-2f0f5c1e7b20', gameId: 'cs2', enabled: true };
@@ -85,6 +86,8 @@ describe('CommandsService', () => {
       endWhileOffline: vi.fn(async () => false),
     };
     audit = { record: vi.fn(async () => undefined) };
+    attention = { flag: vi.fn(async () => true), failedCommandsThreshold: 3, changes: new Subject() };
+    repo.lastStaffOutcomes = vi.fn(async () => []);
     const port = { current: sessions };
     service = new CommandsService(
       repo as any,
@@ -97,6 +100,7 @@ describe('CommandsService', () => {
       games as any,
       port as any,
       audit as any,
+      attention as any,
     );
   });
 
@@ -177,6 +181,49 @@ describe('CommandsService', () => {
     presence.isOnline.mockReturnValue(false);
     await expect(service.issue(caller(), 'm1', { type: 'LOCK' })).rejects.toBeInstanceOf(ConflictException);
     expect(repo.create).not.toHaveBeenCalled();
+  });
+
+  describe('stations needing attention', () => {
+    it('flags the station when its last 3 staff commands all ended FAILED or TIMEOUT', async () => {
+      repo.lastStaffOutcomes.mockResolvedValueOnce(['FAILED', 'TIMEOUT', 'FAILED']);
+      await service.finish('c1', 'TIMEOUT', 'no ack');
+      expect(repo.lastStaffOutcomes).toHaveBeenCalledWith('m1', SYSTEM_ACTOR_ID, 3);
+      expect(attention.flag).toHaveBeenCalledWith('m1', 'commands_failed');
+    });
+
+    it('does not flag while an ack breaks the run, or fewer than 3 staff commands have an outcome', async () => {
+      repo.lastStaffOutcomes.mockResolvedValueOnce(['FAILED', 'ACKED', 'FAILED']);
+      await service.finish('c1', 'FAILED', 'x');
+      repo.lastStaffOutcomes.mockResolvedValueOnce(['FAILED', 'FAILED']);
+      await service.finish('c1', 'FAILED', 'x');
+      expect(attention.flag).not.toHaveBeenCalled();
+    });
+
+    it('counts a nack that ends FAILED, never an ack', async () => {
+      repo.lastStaffOutcomes.mockResolvedValue(['FAILED', 'FAILED', 'FAILED']);
+      await service.onAgentReply('SN-1', 'c1', { kind: 'ack' });
+      expect(repo.lastStaffOutcomes).not.toHaveBeenCalled();
+      await service.onAgentReply('SN-1', 'c1', { kind: 'nack', code: 'EXEC_FAILED', reason: 'boom' });
+      expect(attention.flag).toHaveBeenCalledWith('m1', 'commands_failed');
+    });
+
+    it('ignores system sends and CATALOG_UPDATE', async () => {
+      repo.lastStaffOutcomes.mockResolvedValue(['FAILED', 'FAILED', 'FAILED']);
+      repo.transition.mockResolvedValueOnce(row({ status: 'FAILED', issuedBy: SYSTEM_ACTOR_ID, type: 'POLICY_UPDATE' }));
+      await service.finish('c1', 'FAILED', 'x');
+      repo.transition.mockResolvedValueOnce(row({ status: 'FAILED', type: 'CATALOG_UPDATE' }));
+      await service.finish('c1', 'FAILED', 'x');
+      expect(repo.lastStaffOutcomes).not.toHaveBeenCalled();
+      expect(attention.flag).not.toHaveBeenCalled();
+    });
+
+    it('relays a flag set or cleared to the branch room as station_attention', async () => {
+      service.onModuleInit();
+      attention.changes.next({ machineId: 'm1', branchId: 'b1', serialNumber: 'SN-1', needsAttention: true, reason: 'disconnects', since: 'T' });
+      expect(dashboard.publishToBranch).toHaveBeenCalledWith('b1', 'station_attention', {
+        machineId: 'm1', serialNumber: 'SN-1', needsAttention: true, reason: 'disconnects', since: 'T',
+      });
+    });
   });
 
   it('marks the session locked by staff when a LOCK goes out', async () => {

@@ -7,6 +7,7 @@ import { REDIS } from '../../../infra/redis/redis.module.js';
 import type { Machine, MachineStatus, Prisma } from '../../../generated/prisma/index.js';
 import { MachinesRepository } from '../repository/machines.repository.js';
 import type { HandshakePayload, HeartbeatPayload, Peripheral, StateReportPayload } from '../schemas/presence.schemas.js';
+import { StationAttentionService } from './station-attention.service.js';
 import type { StationPrincipal } from './station-token.service.js';
 
 export function presenceCacheKey(serialNumber: string): string {
@@ -165,6 +166,7 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
     private readonly machines: MachinesRepository,
     @Inject(REDIS) private readonly redis: Redis,
     config: ConfigService,
+    private readonly attention: StationAttentionService,
   ) {
     this.offlineAfterMs = Number(config.get('PRESENCE_OFFLINE_AFTER_MS') ?? 45_000);
     this.watchdogIntervalMs = Number(config.get('PRESENCE_WATCHDOG_INTERVAL_MS') ?? 10_000);
@@ -439,6 +441,8 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
     await this.writeCache(state);
     this.logger.log(`station ${serialNumber} OFFLINE (${reason})`);
     this.emit(state);
+    // A station that keeps dropping can't be relied on: enough drops flag it (not a backend restart's stale rows).
+    await this.attention.recordDisconnect(state.machineId);
   }
 
   /**

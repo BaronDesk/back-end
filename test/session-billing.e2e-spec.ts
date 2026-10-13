@@ -794,4 +794,47 @@ describe('session billing (e2e)', () => {
 
     agent.socket.close();
   });
+
+  it('flags a station that keeps dropping: no booking or check-in on it until staff clear it', async () => {
+    const gamer = await createGamer(100_000);
+    const machine = await createMachine();
+    const inMinutes = (m: number) => new Date(Date.now() + m * 60_000).toISOString();
+    const book = (from: number, to: number) =>
+      app.inject({
+        method: 'POST',
+        url: '/reservations',
+        headers: as(gamer.token),
+        payload: { machineId: machine.id, startTime: inMinutes(from), endTime: inMinutes(to) },
+      });
+    const earlier = await book(60, 90);
+    expect(earlier.statusCode).toBe(201);
+    const flagged = async () => (await prisma.machine.findUniqueOrThrow({ where: { id: machine.id } })).needsAttention;
+
+    // Three ONLINE -> OFFLINE drops within the window.
+    for (let drop = 1; drop <= 3; drop++) {
+      const agent = await connectAgent(machine);
+      agent.socket.close();
+      await vi.waitFor(async () => expect((await prisma.machine.findUniqueOrThrow({ where: { id: machine.id } })).status).toBe('OFFLINE'));
+      if (drop < 3) expect(await flagged()).toBe(false);
+    }
+    await vi.waitFor(async () => expect(await flagged()).toBe(true));
+    const station = (await app.inject({ method: 'GET', url: `/api/v1/stations/${machine.id}`, headers: as(staffToken) })).json();
+    expect(station).toMatchObject({ needsAttention: true, attentionReason: 'disconnects', attentionSince: expect.any(String) });
+
+    const refused = await book(120, 150);
+    expect(refused.statusCode).toBe(409);
+    expect(refused.json().code).toBe('MACHINE_UNAVAILABLE');
+    const checkIn = await app.inject({ method: 'POST', url: `/reservations/${earlier.json().id}/check-in`, headers: as(gamer.token) });
+    expect(checkIn.statusCode).toBe(409);
+    expect(checkIn.json()).toMatchObject({ code: 'STATION_NEEDS_ATTENTION', error: expect.stringContaining('ask at the desk') });
+
+    // Staff checked the PC: it takes bookings again.
+    const clear = () => app.inject({ method: 'DELETE', url: `/api/v1/stations/${machine.id}/attention`, headers: as(staffToken) });
+    const cleared = await clear();
+    expect(cleared.statusCode).toBe(200);
+    expect(cleared.json()).toMatchObject({ needsAttention: false, attentionReason: null });
+    expect((await clear()).statusCode).toBe(409);
+    expect(await prisma.auditLog.count({ where: { target: `machine:${machine.id}`, metadata: { path: ['event'], equals: 'STATION_ATTENTION_CLEARED' } } })).toBe(1);
+    expect((await book(120, 150)).statusCode).toBe(201);
+  });
 });

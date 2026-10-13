@@ -50,6 +50,28 @@ export class MachinesRepository extends BaseRepository {
     return this.prisma.machine.update({ where: { id }, data: { peripherals, peripheralsReportedAt: reportedAt } });
   }
 
+  /** Sets the attention flag unless it is already set; the machine, or null when nothing changed. */
+  async flagAttention(id: string, reason: string, since: Date) {
+    const { count } = await this.prisma.machine.updateMany({
+      where: { id, needsAttention: false },
+      data: { needsAttention: true, attentionReason: reason, attentionSince: since },
+    });
+    return count ? this.prisma.machine.findUnique({ where: { id } }) : null;
+  }
+
+  /** Clears the attention flag; the machine and the reason it had, or null when it was not set. */
+  async clearAttention(id: string) {
+    const flagged = await this.prisma.machine.findFirst({ where: { id, needsAttention: true }, select: { attentionReason: true } });
+    if (!flagged) return null;
+    const { count } = await this.prisma.machine.updateMany({
+      where: { id, needsAttention: true },
+      data: { needsAttention: false, attentionReason: null, attentionSince: null },
+    });
+    if (!count) return null;
+    const machine = await this.prisma.machine.findUnique({ where: { id } });
+    return machine ? { machine, reason: flagged.attentionReason } : null;
+  }
+
   setPolicy(id: string, policy: Prisma.InputJsonValue) {
     return this.prisma.machine.update({ where: { id }, data: { policy } });
   }

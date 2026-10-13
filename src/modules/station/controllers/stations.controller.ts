@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Patch } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch } from '@nestjs/common';
 
 import { CurrentUser } from '../../../common/decorators/current-user.decorator.js';
 import { RequireScope } from '../../../common/decorators/require-scope.decorator.js';
@@ -34,5 +34,15 @@ export class StationsController {
     @Param('id', new ZodValidationPipe(stationIdParamSchema)) id: string,
   ) {
     return this.stations.get(caller, id);
+  }
+
+  /** Staff checked a station flagged as needing attention: it takes bookings again. */
+  @RequireScope('staff')
+  @Delete(':id/attention')
+  clearAttention(
+    @CurrentUser() caller: AccessTokenPayload,
+    @Param('id', new ZodValidationPipe(stationIdParamSchema)) id: string,
+  ) {
+    return this.stations.clearAttention(caller, id);
   }
 }

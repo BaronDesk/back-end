@@ -327,6 +327,12 @@ model Machine {
   createdAt        DateTime                @default(now()) @map("created_at") @db.Timestamptz
   updatedAt        DateTime                @updatedAt @map("updated_at") @db.Timestamptz
   policy           Json?
+  // Set when the backend can't control the station (staff commands keep failing,
+  // or it keeps dropping): no new booking, walk-in or check-in until staff clear it.
+  needsAttention   Boolean                 @default(false) @map("needs_attention")
+  // "commands_failed" | "disconnects"
+  attentionReason  String?                 @map("attention_reason")
+  attentionSince   DateTime?               @map("attention_since") @db.Timestamptz
 
   branch          Branch           @relation(fields: [branchId], references: [id], onDelete: Cascade)
   machineGames    MachineGame[]

@@ -49,6 +49,7 @@ describe('assertStationAdmitted', () => {
 
 describe('PresenceService agent-reported state', () => {
   let service: PresenceService;
+  let attention: { recordDisconnect: ReturnType<typeof vi.fn> };
   let statuses: StationStatusEvent[];
   let ended: SessionEndedEvent[];
 
@@ -61,7 +62,8 @@ describe('PresenceService agent-reported state', () => {
     };
     const redis = { hset: vi.fn(async () => 1) };
     const config = { get: () => undefined };
-    service = new PresenceService(machines as any, redis as any, config as any);
+    attention = { recordDisconnect: vi.fn(async () => undefined) };
+    service = new PresenceService(machines as any, redis as any, config as any, attention as any);
     statuses = [];
     ended = [];
     service.statusChanges.subscribe((e) => statuses.push(e));
@@ -107,6 +109,13 @@ describe('PresenceService agent-reported state', () => {
     expect(ended[0]?.reason).toBe('agent_reported');
   });
 
+  it('reports every ONLINE -> OFFLINE drop for the attention count, once per drop', async () => {
+    await service.disconnect('SN-1');
+    await service.disconnect('SN-1'); // already OFFLINE: not another drop
+    expect(attention.recordDisconnect).toHaveBeenCalledTimes(1);
+    expect(attention.recordDisconnect).toHaveBeenCalledWith('m1');
+  });
+
   it('takes runningGameId from state_report only', async () => {
     await service.reportState('SN-1', { runningGameId: 'steam:730' });
     expect(statuses.at(-1)).toEqual(expect.objectContaining({ runningGameId: 'steam:730' }));
@@ -144,7 +153,7 @@ describe('PresenceService outage classification', () => {
       touchLastSeen: vi.fn(async () => undefined),
       findStaleOnline: vi.fn(async () => []),
     };
-    service = new PresenceService(machines as any, { hset: vi.fn(async () => 1) } as any, { get: () => undefined } as any);
+    service = new PresenceService(machines as any, { hset: vi.fn(async () => 1) } as any, { get: () => undefined } as any, { recordDisconnect: vi.fn() } as any);
     for (const n of [1, 2, 3, 4, 5]) await connect(n);
   });
 
@@ -178,7 +187,7 @@ describe('PresenceService outage classification', () => {
   });
 
   it('calls a station recovered OFFLINE after a backend restart a venue outage', async () => {
-    const fresh = new PresenceService(machines as any, { hset: vi.fn(async () => 1) } as any, { get: () => undefined } as any);
+    const fresh = new PresenceService(machines as any, { hset: vi.fn(async () => 1) } as any, { get: () => undefined } as any, { recordDisconnect: vi.fn() } as any);
     machines.findStaleOnline.mockResolvedValueOnce([{ ...rows.get('m1')!, lastSeen: new Date(T0 - 5 * 60_000) }]);
     await (fresh as any).sweep();
     await fresh.connect({ serialNumber: 'SN-1' }, null, PRINCIPAL);

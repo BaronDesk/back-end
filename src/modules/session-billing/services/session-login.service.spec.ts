@@ -133,6 +133,15 @@ describe('SessionLoginService', () => {
       for (const fn of Object.values(commands)) expect(fn).not.toHaveBeenCalled();
     });
 
+    it('refuses a PIN for a station that needs attention, with a clear message; staff start too', async () => {
+      repo.findReservationForStart.mockResolvedValue(reservation({ machine: { id: 'm1', branchId: 'b1', serialNumber: 'SN-1', needsAttention: true } }));
+      await expect(service.checkIn('g1', 'res-1')).rejects.toMatchObject({
+        response: { code: 'STATION_NEEDS_ATTENTION', error: expect.stringContaining('ask at the desk') },
+      });
+      await expect(service.start(caller(), 'res-1')).rejects.toMatchObject({ response: { code: 'STATION_NEEDS_ATTENTION' } });
+      expect(repo.create).not.toHaveBeenCalled();
+    });
+
     it("404s another gamer's booking", async () => {
       await expect(service.checkIn('someone-else', 'res-1')).rejects.toBeInstanceOf(NotFoundException);
       expect(repo.create).not.toHaveBeenCalled();

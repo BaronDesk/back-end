@@ -23,6 +23,7 @@ import { AgentRegistry } from '../../../infra/realtime/registry.js';
 import type { Command, CommandStatus, Prisma } from '../../../generated/prisma/index.js';
 import { GamesService, type CatalogChange } from '../../games/services/games.service.js';
 import { PresenceService, type StationRef } from '../../station/services/presence.service.js';
+import { StationAttentionService, type StationAttentionChange } from '../../station/services/station-attention.service.js';
 import { DashboardGateway } from '../dashboard.gateway.js';
 import { CommandsRepository } from '../repository/commands.repository.js';
 import { AuditLogService } from '../../../common/audit/audit-log.service.js';
@@ -116,6 +117,7 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(CommandsService.name);
   private readonly simulationsAllowed: boolean;
   private catalogSub?: Subscription;
+  private attentionSub?: Subscription;
 
   constructor(
     private readonly repo: CommandsRepository,
@@ -128,16 +130,19 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
     private readonly games: GamesService,
     private readonly sessions: StationSessionPort,
     private readonly audit: AuditLogService,
+    private readonly attention: StationAttentionService,
   ) {
     this.simulationsAllowed = config.get('NODE_ENV') !== 'production';
   }
 
   onModuleInit(): void {
     this.catalogSub = this.games.catalogChanges.subscribe((change) => void this.requestCatalogSync(change));
+    this.attentionSub = this.attention.changes.subscribe((change) => this.publishAttention(change));
   }
 
   onModuleDestroy(): void {
     this.catalogSub?.unsubscribe();
+    this.attentionSub?.unsubscribe();
   }
 
   async issue(caller: AccessTokenPayload, stationId: string, body: IssueCommandBody) {
@@ -386,8 +391,38 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
     if (row) {
       this.logger.log(`${row.type} ${row.id} -> ${row.status}${row.nackCode ? ` (${row.nackCode})` : ''}`);
       this.publish(row);
+      if (row.status === 'FAILED' || row.status === 'TIMEOUT') await this.checkStaffFailures(row);
     }
     return row;
+  }
+
+  /**
+   * A staff command failed: when the station's last ATTENTION_FAILED_COMMANDS
+   * staff commands all ended FAILED / TIMEOUT, it needs attention. Any ack in
+   * between breaks the run. Never throws: it only adds a flag.
+   */
+  private async checkStaffFailures(row: Command): Promise<void> {
+    if (row.issuedBy === SYSTEM_ACTOR_ID || row.type === 'CATALOG_UPDATE') return;
+    try {
+      const threshold = this.attention.failedCommandsThreshold;
+      const outcomes = await this.repo.lastStaffOutcomes(row.machineId, SYSTEM_ACTOR_ID, threshold);
+      if (outcomes.length === threshold && outcomes.every((s) => s === 'FAILED' || s === 'TIMEOUT')) {
+        await this.attention.flag(row.machineId, 'commands_failed');
+      }
+    } catch (err) {
+      this.logger.error(`attention check after ${row.type} ${row.id} failed: ${(err as Error).message}`);
+    }
+  }
+
+  /** STATION_ATTENTION to the branch room when a station's flag is set or cleared. */
+  private publishAttention(change: StationAttentionChange): void {
+    this.dashboard.publishToBranch(change.branchId, DASHBOARD_EVENTS.STATION_ATTENTION, {
+      machineId: change.machineId,
+      serialNumber: change.serialNumber,
+      needsAttention: change.needsAttention,
+      reason: change.reason,
+      since: change.since,
+    });
   }
 
   // TODO: Redis pub/sub if multi-instance — in-process publish only reaches

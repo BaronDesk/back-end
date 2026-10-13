@@ -13,6 +13,12 @@ export const envSchema = z.object({
   PRESENCE_OFFLINE_AFTER_MS: z.coerce.number().int().positive().default(45_000),
   PRESENCE_WATCHDOG_INTERVAL_MS: z.coerce.number().int().positive().default(10_000),
   PRESENCE_PERSIST_INTERVAL_MS: z.coerce.number().int().positive().default(15_000),
+  // A station "needs attention" (no new bookings on it until staff clear it) after
+  // ATTENTION_FAILED_COMMANDS staff commands in a row end FAILED / TIMEOUT, or
+  // ATTENTION_DISCONNECTS ONLINE -> OFFLINE drops within ATTENTION_WINDOW_MIN minutes.
+  ATTENTION_FAILED_COMMANDS: z.coerce.number().int().min(1).default(3),
+  ATTENTION_DISCONNECTS: z.coerce.number().int().min(1).default(3),
+  ATTENTION_WINDOW_MIN: z.coerce.number().positive().default(10),
   // A station's drop is a venue outage (power, network: nobody is billed for
   // it) when at least OUTAGE_PEER_COUNT other stations of its branch went
   // offline within OUTAGE_WINDOW_S of it; otherwise it is a single drop.
