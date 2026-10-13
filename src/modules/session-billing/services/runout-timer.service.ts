@@ -10,7 +10,7 @@ import {
 
 /**
  * The warn/lock timer for a session's funds: two BullMQ delayed jobs. When
- * the money runs out is SessionsService's to compute (it knows what the
+ * the money runs out is SessionRunoutService's to compute (it knows what the
  * session has already used); this only (re)places the jobs.
  */
 @Injectable()

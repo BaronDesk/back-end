@@ -3,13 +3,13 @@ import { Processor, WorkerHost } from '@nestjs/bullmq';
 import type { Job } from 'bullmq';
 
 import { RUNOUT_JOBS, RUNOUT_QUEUE, type RunoutJobData } from '../schemas/runout-timer.schemas.js';
-import { SessionsService } from './sessions.service.js';
+import { SessionRunoutService } from './session-runout.service.js';
 
 @Processor(RUNOUT_QUEUE)
 export class RunoutTimerProcessor extends WorkerHost {
   private readonly logger = new Logger(RunoutTimerProcessor.name);
 
-  constructor(private readonly sessions: SessionsService) {
+  constructor(private readonly sessions: SessionRunoutService) {
     super();
   }
 
