@@ -32,6 +32,7 @@ import {
   type CommandPayload,
   type CommandSimulation,
   type IssueCommandBody,
+  type PolicyUpdatePayload,
   type SessionUnlockPayload,
   type StationCommandType,
   type ListCommandsQuery,
@@ -178,6 +179,9 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
         branchId: station.branchId,
         metadata: { event: 'STATION_SHUTDOWN' },
       });
+    } else if (body.type === 'POLICY_UPDATE') {
+      payload = body.policy;
+      await this.presence.setPolicy(station.machineId, body.policy!);
     }
 
     // Labels the session.ended event, which fires only once the agent reports
@@ -382,6 +386,11 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
       this.presence.expectSessionEnd(station.serialNumber, reason);
       return true;
     });
+  }
+
+  /** Re-sent on every (re)connect so a policy survives a station restart. */
+  async issuePolicyUpdate(machineId: string, policy: PolicyUpdatePayload): Promise<boolean> {
+    return this.issueSystem(machineId, 'POLICY_UPDATE', 'resume', policy);
   }
 
   /** Dispatches a SYSTEM_ACTOR_ID command to an online station; false (logged) when it cannot be delivered. */

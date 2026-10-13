@@ -41,6 +41,7 @@ export class StationsService {
       leaseExpiresAt: cached?.leaseExpiresAt || null,
       peripherals: (machine.peripherals as unknown[] | null) ?? null,
       peripheralsReportedAt: machine.peripheralsReportedAt?.toISOString() ?? null,
+      policy: (machine.policy as Record<string, unknown> | null) ?? null,
     };
   }
 

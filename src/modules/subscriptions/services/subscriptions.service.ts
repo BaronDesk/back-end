@@ -13,6 +13,7 @@ import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
 import { ImagesService } from '../../uploads/services/images.service.js';
 import { WalletService } from '../../wallet/services/wallet.service.js';
 import { SubscriptionsRepository } from '../repository/subscriptions.repository.js';
+import { AuditLogService } from '../../../common/audit/audit-log.service.js';
 import {
   benefitsSchema,
   type CreateSubscriptionPlanDto,
@@ -34,6 +35,7 @@ export class SubscriptionsService {
     private readonly wallet: WalletService,
     config: ConfigService,
     private readonly images: ImagesService,
+    private readonly audit: AuditLogService,
   ) {
     this.timeZone = config.get<string>('BUSINESS_TIMEZONE') ?? 'Africa/Tunis';
   }
@@ -50,11 +52,14 @@ export class SubscriptionsService {
     }
   }
 
-  async updatePlan(id: string, dto: UpdateSubscriptionPlanDto) {
+  async updatePlan(caller: AccessTokenPayload, id: string, dto: UpdateSubscriptionPlanDto) {
     try {
       const before = await this.subscriptions.findPlan(id);
       const updated = await this.subscriptions.updatePlan(id, dto);
       await this.images.release(before?.badgeUrl);
+      await this.audit.record(caller.sub, 'UPDATE', `subscription-plan:${id}`, {
+        metadata: { event: 'PLAN_UPDATED', fields: Object.keys(dto) },
+      });
       return updated;
     } catch (error) {
       this.translatePlanError(error);

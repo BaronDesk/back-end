@@ -32,6 +32,15 @@ export type StationCommandType = (typeof STATION_COMMAND_TYPES)[number];
 export const COMMAND_SIMULATIONS = ['stale_ts', 'duplicate_send', 'invalid_payload', 'exec_failed'] as const;
 export type CommandSimulation = (typeof COMMAND_SIMULATIONS)[number];
 
+export const policyUpdatePayloadSchema = z.object({
+  cpuTempAlertThreshold: z.number().positive().optional(),
+  gpuTempAlertThreshold: z.number().positive().optional(),
+  usbDebounceWindowSeconds: z.number().int().positive().optional(),
+  telemetryCadenceSeconds: z.number().int().positive().optional(),
+}).strict();
+export type PolicyUpdatePayload = z.infer<typeof policyUpdatePayloadSchema>;
+
+
 /**
  * Session UNLOCK, sent by the backend only: after an accepted login_result,
  * or to resume a session on reconnect. The agent binds `sessionId`, takes the
@@ -58,6 +67,7 @@ export const issueCommandBodySchema = z
     payload: z.object({}).strict().optional(),
     gameId: z.string().trim().min(1).max(128).optional(),
     reason: z.string().trim().min(1).max(200).optional(),
+    policy: policyUpdatePayloadSchema.optional(),
     simulate: z.enum(COMMAND_SIMULATIONS).optional(),
   })
   .superRefine((body, ctx) => {
@@ -69,6 +79,12 @@ export const issueCommandBodySchema = z
     }
     if (body.type !== 'END_SESSION' && body.reason) {
       ctx.addIssue({ code: 'custom', message: 'reason is only accepted for END_SESSION', path: ['reason'] });
+    }
+    if (body.type === 'POLICY_UPDATE' && !body.policy) {
+      ctx.addIssue({ code: 'custom', message: 'policy is required for POLICY_UPDATE', path: ['policy'] });
+    }
+    if (body.type !== 'POLICY_UPDATE' && body.policy) {
+      ctx.addIssue({ code: 'custom', message: 'policy is only accepted for POLICY_UPDATE', path: ['policy'] });
     }
   })
   // The only accepted payload is empty: nothing of it goes on the wire.
@@ -116,7 +132,7 @@ export type LaunchGamePayload = { gameId: string };
 /** END_SESSION wire payload. `{}` makes the agent default the reason to "normal". */
 export type EndSessionPayload = { reason?: string };
 
-export type CommandPayload = SessionUnlockPayload | LaunchGamePayload | EndSessionPayload | Record<string, never>;
+export type CommandPayload = SessionUnlockPayload | LaunchGamePayload | EndSessionPayload | PolicyUpdatePayload | Record<string, never>;
 
 /** What a BullMQ `commands` job carries. */
 export interface CommandJobData {
@@ -125,13 +141,3 @@ export interface CommandJobData {
   payload?: CommandPayload;
   simulate?: CommandSimulation;
 }
-
-export const policyUpdatePayloadSchema = z.object({
-  alertThresholds: z.object({
-    cpuTempC: z.number().positive().optional(),
-    gpuTempC: z.number().positive().optional()
-  }).optional(),
-  telemetryCadenceSeconds: z.number().int().positive().optional(),
-  usbDebounceMs: z.number().int().positive().optional(),
-}).strict();
-export type PolicyUpdatePayload = z.infer<typeof policyUpdatePayloadSchema>;
