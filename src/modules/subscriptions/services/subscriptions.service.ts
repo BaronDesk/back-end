@@ -10,7 +10,7 @@ import { ConfigService } from '@nestjs/config';
 import { Prisma } from '../../../generated/prisma/index.js';
 
 import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
-import { dinarsToMillimes } from '../../../common/utils/money.js';
+import { ImagesService } from '../../uploads/services/images.service.js';
 import { WalletService } from '../../wallet/services/wallet.service.js';
 import { SubscriptionsRepository } from '../repository/subscriptions.repository.js';
 import { AuditLogService } from '../../../common/audit/audit-log.service.js';
@@ -34,6 +34,7 @@ export class SubscriptionsService {
     private readonly subscriptions: SubscriptionsRepository,
     private readonly wallet: WalletService,
     config: ConfigService,
+    private readonly images: ImagesService,
     private readonly audit: AuditLogService,
   ) {
     this.timeZone = config.get<string>('BUSINESS_TIMEZONE') ?? 'Africa/Tunis';
@@ -53,7 +54,9 @@ export class SubscriptionsService {
 
   async updatePlan(caller: AccessTokenPayload, id: string, dto: UpdateSubscriptionPlanDto) {
     try {
+      const before = await this.subscriptions.findPlan(id);
       const updated = await this.subscriptions.updatePlan(id, dto);
+      await this.images.release(before?.badgeUrl);
       await this.audit.record(caller.sub, 'UPDATE', `subscription-plan:${id}`, {
         metadata: { event: 'PLAN_UPDATED', fields: Object.keys(dto) },
       });
@@ -65,7 +68,9 @@ export class SubscriptionsService {
 
   async deletePlan(id: string) {
     try {
-      return await this.subscriptions.deletePlan(id);
+      const deleted = await this.subscriptions.deletePlan(id);
+      await this.images.release(deleted.badgeUrl);
+      return deleted;
     } catch (error) {
       this.translatePlanError(error);
     }
@@ -130,7 +135,7 @@ export class SubscriptionsService {
       throw new ConflictException({ code: 'SUBSCRIPTION_ALREADY_ACTIVE', error: 'gamer already has this pass' });
     }
 
-    const price = dinarsToMillimes(plan.price);
+    const price = plan.price;
     const ledgerKey = `subscription:${key ?? randomUUID()}`;
     if (price > 0) {
       await this.wallet.debit(gamerProfileId, {

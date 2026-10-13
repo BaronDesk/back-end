@@ -39,6 +39,13 @@ export class SessionsController {
     return this.sessions.currentForGamer(caller.sub);
   }
 
+  /** The gamer's settled sessions, latest first (Settings → Sessions History). Declared before :id. */
+  @RequireScope('self')
+  @Get('me/history')
+  history(@CurrentUser() caller: AccessTokenPayload) {
+    return this.sessions.historyForGamer(caller.sub);
+  }
+
   @RequireScope('staff')
   @Get(':id')
   get(@CurrentUser() caller: AccessTokenPayload, @Param('id', new ZodValidationPipe(idParamSchema)) id: string) {

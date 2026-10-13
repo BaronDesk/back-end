@@ -9,6 +9,9 @@ import { costAt, rateAt, secondsBetween, type Meter } from '../util/metering.js'
 import { toSessionDto, type SessionRecord } from '../util/public-session.js';
 import { notFound } from '../util/session-rules.js';
 
+/** Sessions History shows this many of the latest sessions. */
+const HISTORY_LIMIT = 50;
+
 /** Read-only views of sessions for the desk and the gamer. */
 @Injectable()
 export class SessionQueriesService {
@@ -28,8 +31,36 @@ export class SessionQueriesService {
       ...toSessionDto(s as unknown as SessionRecord),
       station: s.reservation.machine,
       gamerUsername: s.reservation.gamerProfile.user.username,
-      costSoFarCents: OPEN_SESSION_STATUSES.includes(s.status) ? costAt(s as Meter, now) : null,
+      costSoFarCoins: OPEN_SESSION_STATUSES.includes(s.status) ? costAt(s as Meter, now) : null,
     }));
+  }
+
+  /**
+   * The gamer's sessions history (Settings → Sessions History): their settled
+   * sessions, latest first, with the time played, the bill and the XP earned.
+   */
+  async historyForGamer(userId: string) {
+    const gamerProfileId = await this.repo.gamerProfileIdForUser(userId);
+    if (!gamerProfileId) throw notFound('GAMER_PROFILE_NOT_FOUND', 'gamer profile not found');
+    const sessions = await this.repo.listSettledForGamer(gamerProfileId, HISTORY_LIMIT);
+    return sessions.map((s) => {
+      const bill = (s.billingBreakdown ?? {}) as Record<string, unknown>;
+      const num = (v: unknown) => (typeof v === 'number' ? v : null);
+      return {
+        sessionId: s.id,
+        stationName: s.reservation.machine.name ?? s.reservation.machine.serialNumber,
+        branchName: s.reservation.machine.branch.name,
+        isWalkIn: s.reservation.isWalkIn,
+        startTime: s.startTime,
+        settledAt: s.settledAt,
+        meteredSeconds: s.meteredSeconds,
+        totalCoins: num(bill.totalCoins) ?? 0,
+        // A free session has no debit, so no chargedCoins on its bill.
+        chargedCoins: num(bill.chargedCoins) ?? 0,
+        // Sessions settled before XP was awarded have none on their bill.
+        xpEarned: num(bill.xpEarned),
+      };
+    });
   }
 
   /**
@@ -53,11 +84,11 @@ export class SessionQueriesService {
       station: session.reservation.machine,
       startedAt: session.startTime.toISOString(),
       endsAt: session.endTime.toISOString(),
-      rateCentsPerMinute: rateAt(meter, now),
+      rateCoinsPerHour: rateAt(meter, now),
       playedSeconds: played,
-      costSoFarCents: costAt(meter, now),
+      costSoFarCoins: costAt(meter, now),
       balance,
-      balanceAfterCents: balance - costAt(meter, now),
+      balanceAfterCoins: balance - costAt(meter, now),
     };
   }
 

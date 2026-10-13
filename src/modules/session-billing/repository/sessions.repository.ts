@@ -14,7 +14,7 @@ export interface CreateSessionInput {
   appliedMembershipId: string | null;
   startTime: Date;
   endTime: Date;
-  rateCentsPerMinute: number;
+  rateCoinsPerHour: number;
   pinHash: string;
   /** The PIN sealed by PinVault, so the gamer's app can show it again. */
   pinCipher: string;
@@ -93,6 +93,25 @@ export class SessionsRepository extends BaseRepository {
         },
       },
       orderBy: { startTime: 'desc' },
+    });
+  }
+
+  /** The gamer's settled sessions, latest first, with the PC and its branch. */
+  listSettledForGamer(gamerProfileId: string, limit: number) {
+    return this.prisma.session.findMany({
+      where: { status: 'COMPLETED', settledAt: { not: null }, reservation: { gamerProfileId } },
+      orderBy: { settledAt: 'desc' },
+      take: limit,
+      select: {
+        id: true,
+        startTime: true,
+        settledAt: true,
+        meteredSeconds: true,
+        billingBreakdown: true,
+        reservation: {
+          select: { isWalkIn: true, machine: { select: { name: true, serialNumber: true, branch: { select: { name: true } } } } },
+        },
+      },
     });
   }
 
@@ -269,10 +288,17 @@ export class SessionsRepository extends BaseRepository {
   }
 
   /**
-   * Session settles; its reservation -> COMPLETED. Only an open session is
-   * closed: false if another path (presence, force-close, sweep) closed it first.
+   * Session settles; its reservation -> COMPLETED; the gamer gets the XP the
+   * session earned. Only an open session is closed: false if another path
+   * (presence, force-close, sweep) closed it first, and then no XP is added,
+   * so a session awards its XP once.
    */
-  complete(id: string, reservationId: string, data: Prisma.SessionUpdateManyMutationInput): Promise<boolean> {
+  complete(
+    id: string,
+    reservationId: string,
+    data: Prisma.SessionUpdateManyMutationInput,
+    xp?: { gamerProfileId: string; amount: number },
+  ): Promise<boolean> {
     return this.prisma.$transaction(async (tx) => {
       const { count } = await tx.session.updateMany({ where: { id, status: { in: OPEN_SESSION_STATUSES } }, data });
       if (count === 0) return false;
@@ -280,6 +306,9 @@ export class SessionsRepository extends BaseRepository {
         where: { id: reservationId, status: { in: ['CONFIRMED', 'ACTIVE'] } },
         data: { status: 'COMPLETED' },
       });
+      if (xp && xp.amount > 0) {
+        await tx.gamerProfile.update({ where: { id: xp.gamerProfileId }, data: { xp: { increment: xp.amount } } });
+      }
       return true;
     });
   }

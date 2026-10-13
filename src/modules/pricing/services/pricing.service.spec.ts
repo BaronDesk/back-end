@@ -1,71 +1,35 @@
-import { ForbiddenException, NotFoundException } from '@nestjs/common';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
 import { PricingService } from './pricing.service.js';
 
-function caller(overrides: Partial<AccessTokenPayload> = {}): AccessTokenPayload {
-  return { sub: 'user-1', role: 'MANAGER', scope: 'admin', branchId: 'branch-a', jti: 'jti-1', ...overrides };
-}
-
 describe('PricingService', () => {
-  let repo: { findByBranchId: ReturnType<typeof vi.fn>; upsertForBranch: ReturnType<typeof vi.fn> };
+  let repo: { find: ReturnType<typeof vi.fn>; upsert: ReturnType<typeof vi.fn> };
   let service: PricingService;
 
-  const row = {
-    id: 'pricing-1', branchId: 'branch-a',
-    paygRate: 10000, bookingRate: 25000,
-    updatedAt: new Date(),
-  };
+  const row = { id: 1, paygRate: 4000, bookingRate: 4000, createdAt: new Date(), updatedAt: new Date() };
 
   beforeEach(() => {
-    repo = { findByBranchId: vi.fn().mockResolvedValue(row), upsertForBranch: vi.fn().mockResolvedValue(row) };
+    repo = { find: vi.fn().mockResolvedValue(row), upsert: vi.fn().mockResolvedValue(row) };
     service = new PricingService(repo as any);
   });
 
-  it('returns pricing for a manager reading their own branch', async () => {
-    const result = await service.getForBranch('branch-a', caller());
-    expect(result.paygRate).toBe(10000);
+  it('returns the price list', async () => {
+    await expect(service.get()).resolves.toEqual({ paygRate: 4000, bookingRate: 4000, updatedAt: row.updatedAt });
   });
 
-  it('rejects a manager reading another branch', async () => {
-    await expect(service.getForBranch('branch-b', caller())).rejects.toThrow(ForbiddenException);
+  it('404s with PRICING_NOT_SET before any price is set', async () => {
+    repo.find.mockResolvedValue(null);
+    await expect(service.get()).rejects.toMatchObject({ response: { code: 'PRICING_NOT_SET' } });
+    await expect(service.getRates()).rejects.toMatchObject({ response: { code: 'PRICING_NOT_SET' } });
   });
 
-  it('lets hq read any branch', async () => {
-    await expect(
-      service.getForBranch('branch-z', caller({ role: 'ADMIN', scope: 'hq', branchId: null })),
-    ).resolves.toBeDefined();
+  it('saves the rates', async () => {
+    const result = await service.upsert({ paygRate: 4000, bookingRate: 4000 });
+    expect(repo.upsert).toHaveBeenCalledWith({ paygRate: 4000, bookingRate: 4000 });
+    expect(result.bookingRate).toBe(4000);
   });
 
-  it('404s when no pricing row exists yet', async () => {
-    repo.findByBranchId.mockResolvedValueOnce(null);
-    await expect(service.getForBranch('branch-a', caller())).rejects.toThrow(NotFoundException);
+  it('getRates returns the raw rates', async () => {
+    await expect(service.getRates()).resolves.toEqual({ paygRate: 4000, bookingRate: 4000 });
   });
-
-  it("upserts pricing for the caller's own branch", async () => {
-    const result = await service.upsertForBranch('branch-a', { paygRate: 10000, bookingRate: 25000 }, caller());
-    expect(repo.upsertForBranch).toHaveBeenCalledWith(
-      expect.objectContaining({ branchId: 'branch-a', paygRate: 10000, bookingRate: 25000 }),
-    );
-    expect(result.bookingRate).toBe(25000);
-  });
-
-  it("rejects a manager upserting another branch's pricing", async () => {
-    await expect(
-      service.upsertForBranch('branch-b', { paygRate: 10, bookingRate: 25 }, caller()),
-    ).rejects.toThrow(ForbiddenException);
-  });
-
-  it('getRatesForBranch returns the raw payg/booking rates, with no caller or scope check', async () => {
-    const result = await service.getRatesForBranch('branch-a');
-    expect(result).toEqual({ paygRate: 10000, bookingRate: 25000 });
-    expect(repo.findByBranchId).toHaveBeenCalledWith('branch-a');
-  });
-
-  it('getRatesForBranch 404s with PRICING_NOT_SET when nothing is configured for the branch', async () => {
-    repo.findByBranchId.mockResolvedValue(null);
-    await expect(service.getRatesForBranch('branch-a')).rejects.toMatchObject({ response: { code: 'PRICING_NOT_SET' } });
-  });
-
 });

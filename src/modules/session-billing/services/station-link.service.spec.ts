@@ -50,7 +50,7 @@ describe('StationLinkService', () => {
       );
       await service.reconcile(STATION, { locked: false, sessionId: 's1' });
       expect(wallet.debitUpTo).toHaveBeenCalledWith('g1', expect.objectContaining({ amount: 1000, sessionId: 's1' }));
-      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED', meteredSeconds: 600 }));
+      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED', meteredSeconds: 600 }), { gamerProfileId: 'g1', amount: 16 });
       expect(commands.issueSystemEndSession).toHaveBeenCalledWith('m1', 'reservation_ended', 's1');
       expect(commands.issueSessionUnlock).not.toHaveBeenCalled();
     });
@@ -117,7 +117,7 @@ describe('StationLinkService', () => {
       repo.findForSettlement.mockResolvedValueOnce(sessionRow({ status: 'ACTIVE', pinUsedAt: new Date(), meteringStartedAt: new Date(Date.now() - 60_000) }));
       await service.forceClose(caller(), 's1', 'desk');
       expect(commands.issueSystemEndSession).toHaveBeenCalledWith('m1', 'desk', 's1');
-      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED' }));
+      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED' }), expect.anything());
 
       repo.findByIdWithReservation.mockResolvedValue(sessionRow({ status: 'PENDING' }));
       repo.findForSettlement.mockResolvedValueOnce(sessionRow({ status: 'PENDING' }));
@@ -174,13 +174,13 @@ describe('StationLinkService', () => {
       ]);
       await service.reconcile(STATION, { locked: true, sessionId: null });
       expect(wallet.debitUpTo).toHaveBeenCalledWith('g1', expect.objectContaining({ amount: 1000 }));
-      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ settledAt: lastSeen }));
+      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ settledAt: lastSeen }), expect.anything());
     });
 
     it('settles the session before a shutdown', async () => {
       repo.findGrantedOnMachine.mockResolvedValueOnce([sessionRow({ status: 'PAUSED', pinUsedAt: new Date(), meteredSeconds: 60 })]);
       await service.closeForShutdown(STATION);
-      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED' }));
+      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED' }), expect.anything());
     });
 
     it('unlocks for staff only into the station’s own session', async () => {
@@ -291,7 +291,7 @@ describe('StationLinkService', () => {
       expect(wallet.debitUpTo).toHaveBeenCalledWith('g1', expect.objectContaining({ amount: 1000, sessionId: 's1' }));
       expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({
         status: 'COMPLETED', meteredSeconds: 600, settledAt: lastContact, billingBreakdown: expect.objectContaining({ endReason: 'closing' }),
-      }));
+      }), { gamerProfileId: 'g1', amount: 16 });
       expect(commands.issueSystemEndSession).not.toHaveBeenCalled();
     });
 
@@ -356,8 +356,8 @@ describe('StationLinkService', () => {
       expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({
         meteredSeconds: 660,
         settledAt: pausedAt,
-        billingBreakdown: expect.objectContaining({ offlineBilledSeconds: 60, totalCents: 1100 }),
-      }));
+        billingBreakdown: expect.objectContaining({ offlineBilledSeconds: 60, totalCoins: 1100 }),
+      }), { gamerProfileId: 'g1', amount: 18 }); // 660 s played, the 60 s after the drop included
     });
 
     it('without the new state_report fields, bills nothing extra and resumes as before', async () => {
@@ -389,7 +389,7 @@ describe('StationLinkService', () => {
       presence.outageOf.mockReturnValue('venue');
       await service.reconcile(STATION, { locked: true, sessionId: 's1' });
       presence.outageOf.mockReturnValue('single');
-      repo.findForSettlement.mockResolvedValue(pausedOffline({ rateCentsPerMinute: 0 }));
+      repo.findForSettlement.mockResolvedValue(pausedOffline({ rateCoinsPerHour: 0 }));
       await service.reconcile(STATION, { locked: true, sessionId: 's1', restarted: true });
       expect(dashboard.publishToBranch).not.toHaveBeenCalled();
     });

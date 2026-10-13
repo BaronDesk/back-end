@@ -39,7 +39,7 @@ describe('SessionLoginService', () => {
       expect(result.pin).toMatch(/^\d{6}$/);
 
       const data = repo.create.mock.calls[0][0];
-      expect(data).toMatchObject({ reservationId: 'res-1', rateCentsPerMinute: 100, appliedMembershipId: null });
+      expect(data).toMatchObject({ reservationId: 'res-1', rateCoinsPerHour: 6000, appliedMembershipId: null });
       expect(data.pinHash).toMatch(/^\$argon2id\$/);
       expect(data.pinHash).not.toContain(result.pin);
       expect(JSON.stringify(result)).not.toContain(data.pinHash);
@@ -63,8 +63,8 @@ describe('SessionLoginService', () => {
     it('applies the active membership discount to the rate', async () => {
       membership.getActiveDiscountForGamer.mockResolvedValueOnce({ membershipId: 'ms1', discountPercent: 10 });
       await service.start(caller(), 'res-1');
-      // 6000c/hr * 0.9 = 5400c/hr = 90c/min
-      expect(repo.create.mock.calls[0][0]).toMatchObject({ rateCentsPerMinute: 90, appliedMembershipId: 'ms1' });
+      // 6000 coins/h, 10% off
+      expect(repo.create.mock.calls[0][0]).toMatchObject({ rateCoinsPerHour: 5400, appliedMembershipId: 'ms1' });
     });
 
     it('404s for a missing reservation, and rejects a cross-branch caller', async () => {
@@ -260,19 +260,19 @@ describe('SessionLoginService', () => {
     it('bills a booking made ahead at the booking rate, Play now at the walk-in rate', async () => {
       repo.findReservationForStart.mockResolvedValueOnce(reservation({ isWalkIn: false }));
       await service.start(caller(), 'res-1');
-      expect(repo.create.mock.calls[0][0].rateCentsPerMinute).toBe(150); // 9000/hr booking rate
+      expect(repo.create.mock.calls[0][0].rateCoinsPerHour).toBe(9000); // the booking rate
     });
 
     it('applies the better of the membership and pass discounts, without stacking them', async () => {
       membership.getActiveDiscountForGamer.mockResolvedValue({ membershipId: 'ms1', discountPercent: 10 });
       subscriptions.getWindowDiscountForGamer.mockResolvedValueOnce({ subscriptionId: 'sub1', discountPercent: 100 });
       await service.start(caller(), 'res-1');
-      expect(repo.create.mock.calls[0][0]).toMatchObject({ rateCentsPerMinute: 0, appliedMembershipId: null });
+      expect(repo.create.mock.calls[0][0]).toMatchObject({ rateCoinsPerHour: 0, appliedMembershipId: null });
 
       subscriptions.getWindowDiscountForGamer.mockResolvedValueOnce({ subscriptionId: 'sub1', discountPercent: 5 });
       repo.findOpenForReservation.mockResolvedValueOnce(sessionRow({ id: 'old', pinExpiresAt: new Date(Date.now() - 1000) }));
       await service.start(caller(), 'res-1');
-      expect(repo.create.mock.calls[1][0]).toMatchObject({ rateCentsPerMinute: 90, appliedMembershipId: 'ms1' });
+      expect(repo.create.mock.calls[1][0]).toMatchObject({ rateCoinsPerHour: 5400, appliedMembershipId: 'ms1' });
     });
 
     it('refuses the login, keeping the PIN, when the wallet no longer covers the minimum play time', async () => {
@@ -297,7 +297,7 @@ describe('SessionLoginService', () => {
       const lockedAt = new Date(Date.now() - 60_000);
       repo.findGrantedOnMachine.mockResolvedValueOnce([sessionRow({ id: 'old', status: 'PAUSED', pinUsedAt: new Date(), lockedAt, meteredSeconds: 60 })]);
       await expect(service.login(STATION, 'pin', '123456')).resolves.toMatchObject({ accepted: true, sessionId: 'new' });
-      expect(repo.complete).toHaveBeenCalledWith('old', 'res-1', expect.objectContaining({ settledAt: lockedAt }));
+      expect(repo.complete).toHaveBeenCalledWith('old', 'res-1', expect.objectContaining({ settledAt: lockedAt }), expect.anything());
       expect(commands.issueSystemEndSession).not.toHaveBeenCalled();
     });
   });

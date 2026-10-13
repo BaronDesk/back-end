@@ -53,10 +53,10 @@ export class ReservationsService {
         error: `your plan lets you book up to ${advanceDays} day(s) ahead`,
       });
     }
+    await this.assertMachine(input.machineId);
     // The wallet must cover the whole booking on top of what is already promised.
     await this.sessions.assertAffordable({
       gamerProfileId: gamer.id,
-      branchId: await this.branchOf(input.machineId),
       isWalkIn: false,
       start: input.startTime,
       minutes: minutesBetween(input.startTime, input.endTime),
@@ -68,9 +68,9 @@ export class ReservationsService {
   async walkIn(caller: AccessTokenPayload, input: WalkInDto) {
     const gamer = await this.getGamer(caller.sub);
     const startTime = new Date();
+    await this.assertMachine(input.machineId);
     await this.sessions.assertAffordable({
       gamerProfileId: gamer.id,
-      branchId: await this.branchOf(input.machineId),
       isWalkIn: true,
       start: startTime,
       minutes: input.durationMinutes,
@@ -155,11 +155,10 @@ export class ReservationsService {
     throw notCancellable();
   }
 
-  /** The branch of the PC being booked (its prices); an unknown PC can't be booked. */
-  private async branchOf(machineId: string): Promise<string> {
+  /** An unknown PC can't be booked (checked before the price, so it answers MACHINE_UNAVAILABLE). */
+  private async assertMachine(machineId: string): Promise<void> {
     const machine = await this.reservations.findMachine(machineId);
     if (!machine) throw new ConflictException({ code: 'MACHINE_UNAVAILABLE', error: 'machine is unavailable' });
-    return machine.branchId;
   }
 
   private async getGamer(userId: string) {

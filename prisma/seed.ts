@@ -1,12 +1,16 @@
 /**
 * SEED DATA SUMMARY
 * -----------------
-* Money: Decimal prices (plans) = dt. Int columns (wallet/pricing/ledger/session) = millimes (1dt = 1000).
+* Money: every money column is whole coins (1000 coins = 1 DT): wallets, ledger, plan prices, rates per hour.
 *
-* Branches (2):        CENTRE El Manar, CENTRE Lac 2 — each w/ pricing + 5 machines + full game catalog
-* Games (6):            cs2, valorant, dota2, lol, fortnite, fc25
-* Membership plans (3): Standard (free/0%), Pro (15dt/mo, 10%), Elite (30dt/mo, 20%)
-* Subscription plans:   The Night Owl (25dt/mo), The Weekend Warrior (40dt/mo)
+* Pricing:             one price list for every branch: 4000 coins/h (1 DT per 15 min) walk-in and booked
+* Branches (2):        CENTRE El Manar, CENTRE Lac 2 — each w/ 5 machines + full game catalog
+* Games (9):            notepad, cs2, valorant, dota2, lol, fortnite, fc25, brawlhalla, minecraft (lol, brawlhalla, minecraft with posters)
+* Membership plans (3): Standard (free/0%), Pro (15000 coins/mo, 10%), Elite (30000 coins/mo, 20%)
+* Subscription plans:   The Night Owl (25000 coins/mo), The Weekend Warrior (40000 coins/mo)
+* Ranks (7):           Wood 0 XP, Bronze 500, Silver 1500, Gold 4000, Diamond 8000, Master 15000, GrandMaster 25000
+* Badges:              tiers, passes and ranks get the Graphic-Charter badge (prisma/seed-assets/badges)
+*                      written to UPLOAD_DIR, unless they already have one (an admin's choice is kept)
 *
 * Staff:  2 managers, 4 employees (1 per branch pair) — login: password123
 * Gamers: 10 total, one per XP tier (Wood → Grandmaster) — login: password123
@@ -32,10 +36,14 @@
 
 
 import 'dotenv/config';
+import { access, readFile } from 'node:fs/promises';
+import path from 'node:path';
+
 import { PrismaPg } from '@prisma/adapter-pg';
 import { hash } from '@node-rs/argon2';
 
 import { PrismaClient, type TransactionType } from '../src/generated/prisma/index.js';
+import { fileOf, writeImage } from '../src/modules/uploads/util/image-files.js';
 
 // @node-rs/argon2's Algorithm is an ambient `const enum`, which isolatedModules
 // forbids referencing directly. 2 is Algorithm.Argon2id (also the library default).
@@ -46,15 +54,12 @@ const prisma = new PrismaClient({
 });
 
 /*
- n ore that every Int money column (Wal*let.balance, Pricing rates,
- Session.rateCentsPerMinute, LedgerEntry.amount) is stored in millimes
- (1 dt = 1000 millimes) — never a currency string in the DB. Decimal(10,2)
- columns (MembershipPlan.price, SubscriptionPlan.price) are stored as plain
- dt amounts (e.g. 15.00), so DT_TO_MILLIMES converts a plan price into the
- wallet-ledger unit when we debit for a purchase.
+ Every money column (Wallet.balance, LedgerEntry.amount, plan prices, Pricing
+ and Session rates per hour) is whole coins. The seed thinks in dinars, the
+ Tunisian price sheet: dt(4) is the coins worth 4 DT.
  */
-const DT_TO_MILLIMES = 1000;
-const dt = (amount: number) => Math.round(amount * DT_TO_MILLIMES);
+const COINS_PER_DT = 1000;
+const dt = (amount: number) => Math.round(amount * COINS_PER_DT);
 
 function addDays(date: Date, days: number): Date {
   const d = new Date(date);
@@ -65,6 +70,25 @@ function addDays(date: Date, days: number): Date {
 async function hashPassword(plain: string): Promise<string> {
   return hash(plain, { algorithm: ARGON2ID });
 }
+
+// Same folder as the backend (UploadsModule): /app/uploads in Docker, the `uploads` volume.
+const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR ?? 'uploads');
+const BADGES = path.join(import.meta.dirname, 'seed-assets', 'badges');
+const POSTERS = path.join(import.meta.dirname, 'seed-assets', 'games');
+
+/**
+ * Gives a row its Graphic-Charter image, unless it has one whose file is
+ * there (set by an earlier run, or by an admin since). Returns whether it wrote one.
+ */
+async function seedImage(source: string, current: string | null, save: (url: string) => Promise<unknown>) {
+  const file = current ? fileOf(UPLOAD_DIR, current) : null;
+  if (current && (!file || (await access(file).then(() => true, () => false)))) return false;
+  await save(await writeImage(UPLOAD_DIR, await readFile(source), 'image'));
+  return true;
+}
+
+const seedBadge = (folder: string, name: string, current: string | null, save: (badgeUrl: string) => Promise<unknown>) =>
+  seedImage(path.join(BADGES, folder, `${name}.webp`), current, save);
 
 interface LedgerPlan {
   amount: number; // signed + credit, - debit
@@ -111,30 +135,27 @@ async function main() {
 
   // --- Branches ---
   const branchSeeds = [
-    { name: 'CENTRE El Manar', location: 'Tunis, El Manar 2', paygRate: dt(4), bookingRate: dt(4) },
-    { name: 'CENTRE Lac 2', location: 'Tunis, Les Berges du Lac 2', paygRate: dt(4.5), bookingRate: dt(5) },
+    { name: 'CENTRE El Manar', location: 'Tunis, El Manar 2' },
+    { name: 'CENTRE Lac 2', location: 'Tunis, Les Berges du Lac 2' },
   ];
   const branches = [];
   for (const seed of branchSeeds) {
     let branch = await prisma.branch.findFirst({ where: { name: seed.name } });
     if (!branch) branch = await prisma.branch.create({ data: { name: seed.name, location: seed.location } });
-
-    const existingPricing = await prisma.pricing.findFirst({ where: { branchId: branch.id } });
-    if (!existingPricing) {
-      await prisma.pricing.create({
-        data: { branchId: branch.id, paygRate: seed.paygRate, bookingRate: seed.bookingRate },
-      });
-    }
     branches.push(branch);
   }
   const [elManar, lac2] = branches;
-  console.log(`seeded ${branches.length} branch(es) with pricing`);
+  console.log(`seeded ${branches.length} branch(es)`);
+
+  // --- Pricing: one price list for every branch, coins per hour (kept if already set) ---
+  await prisma.pricing.upsert({ where: { id: 1 }, update: {}, create: { id: 1, paygRate: dt(4), bookingRate: dt(4) } });
+  console.log('seeded pricing');
 
   // --- Membership plans ---
   const membershipPlanSeeds = [
-    { name: 'Standard', price: 0, durationDays: 36500, discountPercent: 0, bookingAdvanceDays: 0 },
-    { name: 'Pro', price: 15, durationDays: 30, discountPercent: 10, bookingAdvanceDays: 2 },
-    { name: 'Elite', price: 30, durationDays: 30, discountPercent: 20, bookingAdvanceDays: 7 },
+    { name: 'Standard', price: dt(0), durationDays: 36500, discountPercent: 0, bookingAdvanceDays: 0 },
+    { name: 'Pro', price: dt(15), durationDays: 30, discountPercent: 10, bookingAdvanceDays: 2 },
+    { name: 'Elite', price: dt(30), durationDays: 30, discountPercent: 20, bookingAdvanceDays: 7 },
   ];
   const membershipPlans: Record<string, Awaited<ReturnType<typeof prisma.membershipPlan.upsert>>> = {};
   for (const seed of membershipPlanSeeds) {
@@ -150,14 +171,14 @@ async function main() {
   const subscriptionPlanSeeds = [
     {
       name: 'The Night Owl',
-      price: 25,
+      price: dt(25),
       durationDays: 30,
       // free play every night, 00:00-06:00 local time
       benefits: { windows: [{ daysOfWeek: [0, 1, 2, 3, 4, 5, 6], startTime: '00:00', endTime: '06:00', discountPercent: 100 }] },
     },
     {
       name: 'The Weekend Warrior',
-      price: 40,
+      price: dt(40),
       durationDays: 30,
       // half price all day Saturday and Sunday (the API's benefits are time windows, no hour quotas)
       benefits: { windows: [{ daysOfWeek: [0, 6], startTime: '00:00', endTime: '00:00', discountPercent: 50 }] },
@@ -172,6 +193,37 @@ async function main() {
     });
   }
   console.log(`seeded ${Object.keys(subscriptionPlans).length} subscription plan(s)`);
+
+  // --- Ranks (XP tiers) ---
+  const rankSeeds = [
+    { name: 'Wood', minXp: 0 },
+    { name: 'Bronze', minXp: 500 },
+    { name: 'Silver', minXp: 1500 },
+    { name: 'Gold', minXp: 4000 },
+    { name: 'Diamond', minXp: 8000 },
+    { name: 'Master', minXp: 15000 },
+    { name: 'GrandMaster', minXp: 25000 },
+  ];
+  const ranks = [];
+  for (const seed of rankSeeds) {
+    ranks.push(await prisma.rank.upsert({ where: { name: seed.name }, update: {}, create: seed }));
+  }
+  console.log(`seeded ${ranks.length} rank(s)`);
+
+  // --- Badges (files in UPLOAD_DIR, links in the rows) ---
+  let badges = 0;
+  for (const plan of Object.values(membershipPlans)) {
+    const current = (await prisma.membershipPlan.findUniqueOrThrow({ where: { id: plan.id } })).badgeUrl;
+    if (await seedBadge('membership-plans', plan.name, current, (badgeUrl) => prisma.membershipPlan.update({ where: { id: plan.id }, data: { badgeUrl } }))) badges++;
+  }
+  for (const plan of Object.values(subscriptionPlans)) {
+    const current = (await prisma.subscriptionPlan.findUniqueOrThrow({ where: { id: plan.id } })).badgeUrl;
+    if (await seedBadge('subscription-plans', plan.name.replaceAll(' ', '-'), current, (badgeUrl) => prisma.subscriptionPlan.update({ where: { id: plan.id }, data: { badgeUrl } }))) badges++;
+  }
+  for (const rank of ranks) {
+    if (await seedBadge('ranks', rank.name, rank.badgeUrl, (badgeUrl) => prisma.rank.update({ where: { id: rank.id }, data: { badgeUrl } }))) badges++;
+  }
+  console.log(`seeded ${badges} badge(s) into ${UPLOAD_DIR}`);
 
   // --- Games catalog ---
   const gameSeeds = [
@@ -200,6 +252,14 @@ async function main() {
     },
     { gameId: 'fortnite', name: 'Fortnite', launchType: 'epic' as const, target: 'Fortnite', processName: 'FortniteClient-Win64-Shipping.exe' },
     { gameId: 'fc25', name: 'EA Sports FC 25', launchType: 'steam' as const, target: '2195250', processName: 'FC25.exe' },
+    { gameId: 'brawlhalla', name: 'Brawlhalla', launchType: 'steam' as const, target: '291550', processName: 'Brawlhalla.exe' },
+    {
+      gameId: 'minecraft',
+      name: 'Minecraft',
+      launchType: 'exe' as const,
+      target: 'C:\\Program Files (x86)\\Minecraft Launcher\\MinecraftLauncher.exe',
+      processName: 'javaw.exe',
+    },
   ];
   const games: Record<string, Awaited<ReturnType<typeof prisma.game.upsert>>> = {};
   for (const [i, seed] of gameSeeds.entries()) {
@@ -219,6 +279,14 @@ async function main() {
     }
   }
   console.log(`seeded ${Object.keys(games).length} game(s), assigned to every branch`);
+
+  // --- Game posters (Graphic-Charter/Games Posters; the portal's collection shows them) ---
+  let posters = 0;
+  for (const gameId of ['lol', 'brawlhalla', 'minecraft']) {
+    const game = await prisma.game.findUniqueOrThrow({ where: { gameId } });
+    if (await seedImage(path.join(POSTERS, `${gameId}.webp`), game.iconUrl, (iconUrl) => prisma.game.update({ where: { id: game.id }, data: { iconUrl } }))) posters++;
+  }
+  console.log(`seeded ${posters} game poster(s) into ${UPLOAD_DIR}`);
 
   // --- Machines ---
   const machinesByBranch: Record<string, Awaited<ReturnType<typeof prisma.machine.upsert>>[]> = {};
@@ -407,10 +475,9 @@ async function main() {
         status: 'COMPLETED',
       },
     });
-    const centsPerHour = Math.round(dt(4) * (1 - 20 / 100)); // Elite: 20% off the 4dt/h base rate
-    const rateCentsPerMinute = Math.round(centsPerHour / 60);
+    const rateCoinsPerHour = Math.round(dt(4) * (1 - 20 / 100)); // Elite: 20% off the 4dt/h base rate
     const meteredSeconds = 3600;
-    const totalCents = Math.round((meteredSeconds / 60) * rateCentsPerMinute);
+    const totalCoins = Math.round((meteredSeconds / 3600) * rateCoinsPerHour);
     const session = await prisma.session.create({
       data: {
         reservationId: reservation.id,
@@ -419,9 +486,9 @@ async function main() {
         endTime: end,
         status: 'COMPLETED',
         meteredSeconds,
-        rateCentsPerMinute,
+        rateCoinsPerHour,
         settledAt: end,
-        billingBreakdown: { rateCentsPerMinute, meteredSeconds, totalCents, appliedMembershipId: goldMembership.id },
+        billingBreakdown: { rateCoinsPerHour, meteredSeconds, totalCoins, appliedMembershipId: goldMembership.id },
       },
     });
 
@@ -429,7 +496,7 @@ async function main() {
       { amount: dt(100), type: 'CREDIT' },
                             { amount: -dt(30), type: 'PAYMENT' }, // Elite membership purchase
                             { amount: -dt(25), type: 'PAYMENT' }, // The Night Owl subscription purchase
-                            { amount: -totalCents, type: 'PAYMENT', sessionId: session.id }, // this session's settlement
+                            { amount: -totalCoins, type: 'PAYMENT', sessionId: session.id }, // this session's settlement
     ]);
   }
 
@@ -446,8 +513,7 @@ async function main() {
         status: 'ACTIVE',
       },
     });
-    const centsPerHour = Math.round(dt(4.5) * (1 - 10 / 100)); // Pro: 10% off Lac 2's 4.5dt/h base rate
-    const rateCentsPerMinute = Math.round(centsPerHour / 60);
+    const rateCoinsPerHour = Math.round(dt(4) * (1 - 10 / 100)); // Pro: 10% off the 4dt/h base rate
     await prisma.session.create({
       data: {
         reservationId: reservation.id,
@@ -456,7 +522,7 @@ async function main() {
         endTime: end,
         status: 'ACTIVE',
         meteringStartedAt: start,
-        rateCentsPerMinute,
+        rateCoinsPerHour,
       },
     });
 
@@ -515,7 +581,7 @@ async function main() {
         status: 'ACTIVE',
       },
     });
-    const rateCentsPerMinute = Math.round(dt(4) / 60); // no membership: full base rate
+    const rateCoinsPerHour = dt(4); // no membership: full base rate
     await prisma.session.create({
       data: {
         reservationId: reservation.id,
@@ -523,7 +589,7 @@ async function main() {
         endTime: end,
         status: 'PAUSED',
         meteredSeconds: 25 * 60, // 25 min accrued before it got locked
-        rateCentsPerMinute,
+        rateCoinsPerHour,
         lockedAt: new Date(now.getTime() - 15 * 60_000),
       },
     });
@@ -545,10 +611,9 @@ async function main() {
         status: 'COMPLETED',
       },
     });
-    const centsPerHour = Math.round(dt(4) * (1 - 10 / 100)); // Pro (old plan): 10% off
-    const rateCentsPerMinute = Math.round(centsPerHour / 60);
+    const rateCoinsPerHour = Math.round(dt(4) * (1 - 10 / 100)); // Pro (old plan): 10% off
     const meteredSeconds = 3600;
-    const totalCents = Math.round((meteredSeconds / 60) * rateCentsPerMinute);
+    const totalCoins = Math.round((meteredSeconds / 3600) * rateCoinsPerHour);
     const session = await prisma.session.create({
       data: {
         reservationId: reservation.id,
@@ -557,12 +622,12 @@ async function main() {
         endTime: end,
         status: 'COMPLETED',
         meteredSeconds,
-        rateCentsPerMinute,
+        rateCoinsPerHour,
         settledAt: end,
         billingBreakdown: {
-          rateCentsPerMinute,
+          rateCoinsPerHour,
           meteredSeconds,
-          totalCents,
+          totalCoins,
           appliedMembershipId: oldProMembership.id,
           note: 'membership upgraded to Elite after this session started; rate stayed pinned to Pro',
         },
@@ -572,7 +637,7 @@ async function main() {
       { amount: dt(50), type: 'CREDIT' },
                             { amount: -dt(15), type: 'PAYMENT' }, // original Pro membership purchase
                             { amount: -dt(30), type: 'PAYMENT' }, // later Elite upgrade purchase
-                            { amount: -totalCents, type: 'PAYMENT', sessionId: session.id },
+                            { amount: -totalCoins, type: 'PAYMENT', sessionId: session.id },
     ]);
   }
 
@@ -592,11 +657,10 @@ async function main() {
         status: 'COMPLETED',
       },
     });
-    const centsPerHour = Math.round(dt(4) * (1 - 20 / 100)); // Elite: 20% off, applied to the paid portion only
-    const rateCentsPerMinute = Math.round(centsPerHour / 60);
+    const rateCoinsPerHour = Math.round(dt(4) * (1 - 20 / 100)); // Elite: 20% off, applied to the paid portion only
     const freeMinutes = 30; // 05:30-06:00, covered by The Night Owl
     const paidMinutes = 30; // 06:00-06:30, outside the free window
-    const totalCents = paidMinutes * rateCentsPerMinute;
+    const totalCoins = Math.round((paidMinutes / 60) * rateCoinsPerHour);
     const session = await prisma.session.create({
       data: {
         reservationId: reservation.id,
@@ -605,20 +669,20 @@ async function main() {
         endTime: end,
         status: 'COMPLETED',
         meteredSeconds: (freeMinutes + paidMinutes) * 60,
-                                                rateCentsPerMinute,
+                                                rateCoinsPerHour,
                                                 settledAt: end,
                                                 billingBreakdown: {
-                                                  rateCentsPerMinute,
+                                                  rateCoinsPerHour,
                                                   freeMinutes,
                                                   paidMinutes,
-                                                  totalCents,
+                                                  totalCoins,
                                                   nightOwlWindow: { start: '00:00', end: '06:00' },
                                                   note: 'session ran past the Night Owl free window; only paidMinutes were billed',
                                                 },
       },
     });
     await postLedgerHistory(gamers['gamer.gold'].walletId, [
-      { amount: -totalCents, type: 'PAYMENT', sessionId: session.id },
+      { amount: -totalCoins, type: 'PAYMENT', sessionId: session.id },
     ]);
   }
 

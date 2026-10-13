@@ -25,13 +25,13 @@ export type { Quote } from './session-metering.service.js';
  * Session-billing's entry point for controllers, other modules and the agent
  * gateway (it registers itself on the StationSessionPort). Owns no logic:
  * - SessionLoginService: PINs, station login, leases.
- * - SessionMeteringService: rates, affordability, metering, settlement.
+ * - SessionMeteringService: rates (coins per hour), affordability, metering, settlement and its XP.
  * - SessionRunoutService: the funds run-out timer, lock and resume.
  * - StationLinkService: station status, offline pause, reconnect, staff controls
  *   (and staff LOCK / END_SESSION applied while the station is unreachable).
  * - SessionExtensionsService: extra time on a running booking.
  * - SessionSweepService: the periodic sweep.
- * - SessionQueriesService: lists and lookups.
+ * - SessionQueriesService: lists, lookups and the gamer's history.
  */
 @Injectable()
 export class SessionsService implements OnModuleInit, StationSessionHandler {
@@ -66,15 +66,15 @@ export class SessionsService implements OnModuleInit, StationSessionHandler {
 
   // --- money ---------------------------------------------------------------
 
-  quote(gamerProfileId: string, branchId: string, isWalkIn: boolean, start: Date, minutes: number): Promise<Quote> {
-    return this.metering.quote(gamerProfileId, branchId, isWalkIn, start, minutes);
+  quote(gamerProfileId: string, isWalkIn: boolean, start: Date, minutes: number): Promise<Quote> {
+    return this.metering.quote(gamerProfileId, isWalkIn, start, minutes);
   }
 
-  committedCents(gamerProfileId: string, now = new Date(), excludeReservationId?: string): Promise<number> {
-    return this.metering.committedCents(gamerProfileId, now, excludeReservationId);
+  committedCoins(gamerProfileId: string, now = new Date(), excludeReservationId?: string): Promise<number> {
+    return this.metering.committedCoins(gamerProfileId, now, excludeReservationId);
   }
 
-  assertAffordable(input: { gamerProfileId: string; branchId: string; isWalkIn: boolean; start: Date; minutes: number }): Promise<Quote> {
+  assertAffordable(input: { gamerProfileId: string; isWalkIn: boolean; start: Date; minutes: number }): Promise<Quote> {
     return this.metering.assertAffordable(input);
   }
 
@@ -96,6 +96,10 @@ export class SessionsService implements OnModuleInit, StationSessionHandler {
 
   currentForGamer(userId: string) {
     return this.queries.currentForGamer(userId);
+  }
+
+  historyForGamer(userId: string) {
+    return this.queries.historyForGamer(userId);
   }
 
   // --- staff ---------------------------------------------------------------

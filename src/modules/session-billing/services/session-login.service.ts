@@ -100,7 +100,7 @@ export class SessionLoginService {
     }
 
     const playStarts = new Date(Math.max(now.getTime(), reservation.startTime.getTime()));
-    const rate = await this.metering.computeRate(reservation.machine.branchId, reservation.gamerProfileId, reservation.isWalkIn, playStarts);
+    const rate = await this.metering.computeRate(reservation.gamerProfileId, reservation.isWalkIn, playStarts);
     const pin = generatePin();
     const pinHash = await hashPin(pin);
 
@@ -119,7 +119,7 @@ export class SessionLoginService {
           appliedMembershipId: rate.membershipId,
           startTime: reservation.startTime,
           endTime: reservation.endTime,
-          rateCentsPerMinute: rate.centsPerMinute,
+          rateCoinsPerHour: rate.coinsPerHour,
           pinHash,
           pinCipher: this.vault.seal(pin),
           pinExpiresAt: deadline,
@@ -170,7 +170,7 @@ export class SessionLoginService {
     }
     if (!(await verifyPin(session.pinHash, credential.trim()))) return rejected('invalid_pin');
     // Money may have been spent since the booking: play starts only with enough for the minimum play time.
-    if (!(await this.metering.coversMinimumPlay(session.reservation.gamerProfileId, session.rateCentsPerMinute ?? 0))) {
+    if (!(await this.metering.coversMinimumPlay(session.reservation.gamerProfileId, session.rateCoinsPerHour ?? 0))) {
       return rejected('insufficient_funds');
     }
     if (!(await this.repo.spendPin(session.id, now))) return rejected('pin_used');

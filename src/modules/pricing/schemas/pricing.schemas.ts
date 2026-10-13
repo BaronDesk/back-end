@@ -1,7 +1,6 @@
 import { z } from 'zod';
 
-export const branchIdParamSchema = z.string().uuid();
-
+/** Coins per hour (whole coins). */
 const rateSchema = z.number().int().positive().max(100_000_000);
 
 export const upsertPricingSchema = z.object({

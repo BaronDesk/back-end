@@ -15,6 +15,9 @@ const WALLET_ID = 'e07d3b95-4a1c-4268-9f50-b8c6a2d1e473';
 
 const tokens = { accessToken: 'eyJhbGciOiJIUzI1NiIs...', refreshToken: 'eyJhbGciOiJIUzI1NiIs...' };
 
+const BADGE_URL = '/uploads/images/9b3e5f71-2c8d-4a06-b4e9-5d1a7c0f2e68.webp';
+const AVATAR_URL = '/uploads/avatars/6d2a8e14-73fb-4c95-a0d8-1e4b9f5c3a27.webp';
+
 const publicUser = {
   id: USER_ID,
   username: 'gamer01',
@@ -23,8 +26,14 @@ const publicUser = {
   branchId: null,
   gamerProfileId: GAMER_ID,
   homeBranchId: BRANCH_ID,
+  avatarUrl: null,
+  xp: 4250,
+  rank: { id: 'f1a7c3e9-5b2d-4806-9e4f-a3c1d7b5e290', name: 'Gold', minXp: 4000, badgeUrl: BADGE_URL },
+  nextRank: { id: '0c4e8a26-9d3f-4b71-a5e2-6f1b8d3c7a94', name: 'Diamond', minXp: 8000, badgeUrl: null },
   createdAt: '2026-05-20T09:30:00.000Z',
 };
+
+const rank ={ id: 'f1a7c3e9-5b2d-4806-9e4f-a3c1d7b5e290', name: 'Gold', minXp: 4000, badgeUrl: BADGE_URL, createdAt: '2026-05-20T09:30:00.000Z', updatedAt: '2026-05-20T09:30:00.000Z' };
 
 const reservation = {
   id: RESERVATION_ID,
@@ -55,11 +64,13 @@ const walletEntry = {
   createdAt: '2026-05-31T11:45:00.000Z',
 };
 
+const pricing = { paygRate: 4000, bookingRate: 4000, updatedAt: '2026-05-31T11:45:00.000Z' };
+
 /**
  * Hand-written success bodies for the demo flow, keyed by `Controller_method`.
  * The request side comes from the Zod schemas automatically; responses are
  * plain objects returned by services, so they need an example here.
- * Amounts are in millimes/cents as stored (integers).
+ * Money is whole coins (1000 coins = 1 DT in Tunisia); rates are coins per hour.
  */
 export const RESPONSE_EXAMPLES: Record<string, ResponseExample> = {
   AuthController_login: { body: tokens },
@@ -69,6 +80,14 @@ export const RESPONSE_EXAMPLES: Record<string, ResponseExample> = {
   AuthController_me: { body: publicUser },
 
   UsersController_createGamer: { description: 'Gamer account created', body: publicUser },
+  UsersController_setAvatar: { description: 'The gamer, with the new picture', body: { ...publicUser, avatarUrl: AVATAR_URL } },
+  UsersController_removeAvatar: { body: publicUser },
+
+  UploadsController_uploadImage: { description: 'Stored; save this link as a badgeUrl or iconUrl', body: { url: BADGE_URL } },
+  RanksController_list: { body: [{ ...rank, name: 'Wood', minXp: 0 }, rank] },
+  RanksController_create: { body: rank },
+  RanksController_update: { body: rank },
+  RanksController_remove: { body: { id: rank.id, deleted: true } },
 
   ReservationsController_list: { body: [{ ...reservation, pin: null }] },
   ReservationsController_create: {
@@ -87,4 +106,7 @@ export const RESPONSE_EXAMPLES: Record<string, ResponseExample> = {
   },
   WalletController_getMyEntries: { body: [walletEntry] },
   WalletController_credit: { description: 'Top-up recorded', body: walletEntry },
+
+  PricingController_get: { description: 'Coins per hour, the same in every branch', body: pricing },
+  PricingController_upsert: { description: 'Saved for every branch', body: pricing },
 };

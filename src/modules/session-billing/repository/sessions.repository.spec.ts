@@ -45,6 +45,7 @@ describe('SessionsRepository.complete', () => {
     const tx = {
       session: { updateMany: vi.fn(async () => ({ count: sessionCount })) },
       reservation: { updateMany: vi.fn(async () => ({ count: 1 })) },
+      gamerProfile: { update: vi.fn(async () => ({})) },
     };
     const prisma = { $transaction: vi.fn(async (fn: (t: unknown) => unknown) => fn(tx)) };
     return { tx, repo: new SessionsRepository(prisma as any) };
@@ -65,8 +66,22 @@ describe('SessionsRepository.complete', () => {
 
   it('is a no-op once the session is already closed', async () => {
     const { tx, repo } = setup(0);
-    expect(await repo.complete('s1', 'r1', { status: 'COMPLETED' })).toBe(false);
+    expect(await repo.complete('s1', 'r1', { status: 'COMPLETED' }, { gamerProfileId: 'g1', amount: 25 })).toBe(false);
     expect(tx.reservation.updateMany).not.toHaveBeenCalled();
+    // Another path closed it and gave its XP already.
+    expect(tx.gamerProfile.update).not.toHaveBeenCalled();
+  });
+
+  it("adds the session's XP to the gamer in the transaction that closes it", async () => {
+    const { tx, repo } = setup(1);
+    await repo.complete('s1', 'r1', { status: 'COMPLETED' }, { gamerProfileId: 'g1', amount: 25 });
+    expect(tx.gamerProfile.update).toHaveBeenCalledWith({ where: { id: 'g1' }, data: { xp: { increment: 25 } } });
+  });
+
+  it('writes nothing to the gamer for a session that earned no XP', async () => {
+    const { tx, repo } = setup(1);
+    await repo.complete('s1', 'r1', { status: 'COMPLETED' }, { gamerProfileId: 'g1', amount: 0 });
+    expect(tx.gamerProfile.update).not.toHaveBeenCalled();
   });
 });
 

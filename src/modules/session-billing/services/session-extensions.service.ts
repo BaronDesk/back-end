@@ -30,15 +30,15 @@ export class SessionExtensionsService {
     const { session, now } = await this.extendable(gamerProfileId, reservationId);
     const [{ balance }, committed] = await Promise.all([
       this.wallet.getWalletForGamer(gamerProfileId),
-      this.metering.committedCents(gamerProfileId, now),
+      this.metering.committedCoins(gamerProfileId, now),
     ]);
     const options = [];
     for (const minutes of EXTEND_MINUTES) {
       const to = new Date(session.endTime.getTime() + minutes * 60_000);
-      const quote = await this.metering.quote(gamerProfileId, session.reservation.machine.branchId, true, session.endTime, minutes);
+      const quote = await this.metering.quote(gamerProfileId, true, session.endTime, minutes);
       const busy = await this.repo.isMachineBusy(session.reservation.machineId, session.endTime, to, reservationId);
-      const affordable = balance - committed >= quote.totalCents;
-      options.push({ minutes, costCents: quote.totalCents, available: !busy && affordable, reason: busy ? 'SLOT_TAKEN' : affordable ? null : 'INSUFFICIENT_FUNDS' });
+      const affordable = balance - committed >= quote.totalCoins;
+      options.push({ minutes, costCoins: quote.totalCoins, available: !busy && affordable, reason: busy ? 'SLOT_TAKEN' : affordable ? null : 'INSUFFICIENT_FUNDS' });
     }
     return { reservationId, endsAt: session.endTime.toISOString(), options };
   }
@@ -52,19 +52,19 @@ export class SessionExtensionsService {
     const { session, now } = await this.extendable(gamerProfileId, reservationId);
     const from = session.endTime;
     const to = new Date(from.getTime() + minutes * 60_000);
-    const quote = await this.metering.quote(gamerProfileId, session.reservation.machine.branchId, true, from, minutes);
+    const quote = await this.metering.quote(gamerProfileId, true, from, minutes);
 
     const [{ balance }, committed] = await Promise.all([
       this.wallet.getWalletForGamer(gamerProfileId),
-      this.metering.committedCents(gamerProfileId, now),
+      this.metering.committedCoins(gamerProfileId, now),
     ]);
-    if (balance - committed < quote.totalCents) {
-      throw insufficientFunds(`${minutes} more minutes cost ${quote.totalCents} millimes; your balance doesn't cover it`);
+    if (balance - committed < quote.totalCoins) {
+      throw insufficientFunds(`${minutes} more minutes cost ${quote.totalCoins} coins; your balance doesn't cover it`);
     }
 
     // The extra time bills at the walk-in rate: switch at the old end when the session bills another one.
     const current = rateAt(session as Meter, from);
-    const switchNeeded = !session.rateSwitchAt && current !== quote.centsPerMinute;
+    const switchNeeded = !session.rateSwitchAt && current !== quote.coinsPerHour;
     const result = await this.repo.extendIfFree({
       reservationId,
       sessionId: session.id,
@@ -74,7 +74,7 @@ export class SessionExtensionsService {
       to,
       session: {
         endingNoticeSentAt: null,
-        ...(switchNeeded ? { nextRateCentsPerMinute: quote.centsPerMinute, rateSwitchAt: from } : {}),
+        ...(switchNeeded ? { nextRateCoinsPerHour: quote.coinsPerHour, rateSwitchAt: from } : {}),
       },
     });
     if (result.kind === 'slot_taken') {
@@ -88,7 +88,7 @@ export class SessionExtensionsService {
     const updated = { ...session, ...result.session };
     await this.runout.scheduleRunout(updated);
     await this.notices.notify(updated, 'CLEAR');
-    return { reservationId, sessionId: session.id, endsAt: to.toISOString(), costCents: quote.totalCents };
+    return { reservationId, sessionId: session.id, endsAt: to.toISOString(), costCoins: quote.totalCoins };
   }
 
   /** The gamer's own running session on this booking, still inside its window. */

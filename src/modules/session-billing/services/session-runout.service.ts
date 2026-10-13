@@ -94,7 +94,7 @@ export class SessionRunoutService implements OnModuleInit, OnModuleDestroy {
     const others = (await this.repo.findGrantedByGamer(session.reservation.gamerProfileId))
       .filter((s) => s.id !== session.id)
       .reduce((sum, s) => sum + exactCostAt(s as Meter, now), 0);
-    const margin = (this.runoutMarginS / 60) * rateAt(meter, now);
+    const margin = (this.runoutMarginS / 3600) * rateAt(meter, now);
     return msUntilSpent(meter, now, balance - others - exactCostAt(meter, now) - margin);
   }
 

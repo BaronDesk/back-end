@@ -2,7 +2,6 @@ import { ConflictException } from '@nestjs/common';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
-import { Prisma } from '../../../generated/prisma/index.js';
 import { SubscriptionsService } from './subscriptions.service.js';
 
 const config = { get: (key: string) => ({ BUSINESS_TIMEZONE: 'Africa/Tunis' })[key] };
@@ -22,7 +21,7 @@ describe('SubscriptionsService.getWindowDiscountForGamer', () => {
         { id: 'legacy', benefitsSnapshot: { type: 'free_hours', hours: 15 } },
       ]),
     };
-     service = new SubscriptionsService(repository as any, {} as any, config as any, { record: vi.fn() } as any);
+     service = new SubscriptionsService(repository as any, {} as any, config as any, { release: vi.fn(), save: vi.fn() } as any);
   });
 
   // Africa/Tunis is UTC+1 all year.
@@ -51,7 +50,7 @@ describe('SubscriptionsService.purchase', () => {
   };
   const plan = {
     id: 'plan-1',
-    price: new Prisma.Decimal('20'),
+    price: 20000,
     durationDays: 7,
     benefits: { windows: [] },
   };
@@ -74,7 +73,7 @@ describe('SubscriptionsService.purchase', () => {
       debit: vi.fn().mockResolvedValue({ id: 'entry-1' }),
       credit: vi.fn().mockResolvedValue({ id: 'entry-2' }),
     };
-    service = new SubscriptionsService(repository as any, wallet as any, config as any, { record: vi.fn() } as any);
+    service = new SubscriptionsService(repository as any, wallet as any, config as any, { release: vi.fn(), save: vi.fn() } as any);
   });
 
   it('debits the price through WalletService with a namespaced key, then creates the subscription', async () => {

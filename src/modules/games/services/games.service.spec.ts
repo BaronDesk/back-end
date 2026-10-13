@@ -49,7 +49,7 @@ describe('GamesService', () => {
       findByTargets: vi.fn(async () => []),
     };
     presence = { resolveById: vi.fn(async () => STATION) };
-    service = new GamesService(repo as any, presence as any);
+    service = new GamesService(repo as any, presence as any, { release: vi.fn(), save: vi.fn() } as any);
     announced = [];
     service.catalogChanges.subscribe((c) => announced.push(c));
   });

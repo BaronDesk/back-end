@@ -26,6 +26,7 @@ describe('session billing (e2e)', () => {
   let adminToken: string;
   let otherToken: string;
   let membershipPlanId: string;
+  let savedPricing: { paygRate: number; bookingRate: number } | null = null;
 
   const password = 'super-secret-1';
   const usernames: string[] = [];
@@ -173,7 +174,10 @@ describe('session billing (e2e)', () => {
     staffToken = await login(staffUsername);
     otherToken = await login(otherStaffUsername);
 
-    await app.inject({ method: 'PUT', url: `/branches/${branchId}/pricing`, headers: as(adminToken), payload: { paygRate: 6000, bookingRate: 9000 } });
+    // One price list for every branch (put back in afterAll): coins per hour.
+    const existing = await prisma.pricing.findUnique({ where: { id: 1 } });
+    savedPricing = existing && { paygRate: existing.paygRate, bookingRate: existing.bookingRate };
+    await app.inject({ method: 'PUT', url: '/pricing', headers: as(adminToken), payload: { paygRate: 6000, bookingRate: 9000 } });
 
     const plan = await app.inject({
       method: 'POST',
@@ -190,6 +194,8 @@ describe('session billing (e2e)', () => {
     await prisma.user.deleteMany({ where: { username: { in: usernames } } });
     await prisma.membershipPlan.deleteMany({ where: { id: membershipPlanId } });
     await prisma.branch.deleteMany({ where: { id: { in: branchIds } } });
+    await prisma.pricing.deleteMany({});
+    if (savedPricing) await prisma.pricing.create({ data: { id: 1, ...savedPricing } });
     await app.close();
   });
 
@@ -202,7 +208,7 @@ describe('session billing (e2e)', () => {
     const res = await start(reservation.id);
     expect(res.statusCode).toBe(201);
     const body = res.json();
-    expect(body).toMatchObject({ status: 'PENDING', rateCentsPerMinute: 100, appliedMembershipId: null });
+    expect(body).toMatchObject({ status: 'PENDING', rateCoinsPerHour: 6000, appliedMembershipId: null });
     expect(body.pin).toMatch(/^\d{6}$/);
 
     const row = await prisma.session.findUniqueOrThrow({ where: { id: body.id } });
@@ -336,14 +342,57 @@ describe('session billing (e2e)', () => {
     await vi.waitFor(async () => expect((await get(sessionId)).json().status).toBe('COMPLETED'));
     const settled = (await get(sessionId)).json();
     expect(settled.meteredSeconds).toBeGreaterThanOrEqual(pausedSeconds);
-    expect(settled.billingBreakdown).toMatchObject({ rateCentsPerMinute: 100, totalCents: Math.round((settled.meteredSeconds / 60) * 100) });
-    expect(await walletBalance(gamer.profileId)).toBe(before - settled.billingBreakdown.totalCents);
+    expect(settled.billingBreakdown).toMatchObject({ rateCoinsPerHour: 6000, totalCoins: Math.round((settled.meteredSeconds / 3600) * 6000) });
+    expect(await walletBalance(gamer.profileId)).toBe(before - settled.billingBreakdown.totalCoins);
 
     expect(await reservationStatus(reservation.id)).toBe('COMPLETED');
 
     const again = await end(sessionId);
     expect(again.statusCode).toBe(409);
     expect(again.json().code).toBe('SESSION_NOT_OPEN');
+
+    agent.socket.close();
+  });
+
+  it('awards 25 XP per 15 min played when the session settles, once', async () => {
+    const gamer = await createGamer();
+    await creditWallet(gamer.profileId, 100_000);
+    const machine = await createMachine();
+    const reservation = await createConfirmedReservation(gamer.profileId, machine.id);
+    const agent = await connectAgent(machine);
+    const sessionId = await startAndLogIn(agent, reservation.id);
+
+    // Half an hour of play without waiting for it: metering started 30 min ago.
+    await prisma.session.update({ where: { id: sessionId }, data: { meteringStartedAt: new Date(Date.now() - 30 * 60_000) } });
+
+    await end(sessionId, 'closing');
+    await vi.waitFor(() => expect(agent.commands.some((c) => c.type === 'END_SESSION')).toBe(true));
+    agent.send('heartbeat', { locked: true, sessionId: null });
+    await vi.waitFor(async () => expect((await get(sessionId)).json().status).toBe('COMPLETED'));
+
+    const { meteredSeconds, billingBreakdown } = (await get(sessionId)).json();
+    expect(meteredSeconds).toBeGreaterThanOrEqual(1800);
+    expect(billingBreakdown.xpEarned).toBe(Math.floor((meteredSeconds * 25) / 900));
+    expect(billingBreakdown.xpEarned).toBeGreaterThanOrEqual(50);
+
+    const me = await app.inject({ method: 'GET', url: '/auth/me', headers: as(gamer.token) });
+    expect(me.json().xp).toBe(billingBreakdown.xpEarned);
+
+    // Sessions History lists it, with the bill and the XP.
+    const history = await app.inject({ method: 'GET', url: '/sessions/me/history', headers: as(gamer.token) });
+    expect(history.statusCode).toBe(200);
+    expect(history.json()[0]).toMatchObject({
+      sessionId,
+      meteredSeconds,
+      totalCoins: billingBreakdown.totalCoins,
+      chargedCoins: billingBreakdown.chargedCoins,
+      xpEarned: billingBreakdown.xpEarned,
+    });
+
+    // Closing it again is refused and gives no more XP.
+    expect((await end(sessionId)).statusCode).toBe(409);
+    const profile = await prisma.gamerProfile.findUniqueOrThrow({ where: { id: gamer.profileId } });
+    expect(profile.xp).toBe(billingBreakdown.xpEarned);
 
     agent.socket.close();
   });
@@ -381,8 +430,8 @@ describe('session billing (e2e)', () => {
 
     await vi.waitFor(async () => expect((await get(sessionId)).json().status).toBe('COMPLETED'));
     const breakdown = (await get(sessionId)).json().billingBreakdown;
-    expect(breakdown.totalCents).toBeGreaterThan(1);
-    expect(breakdown).toMatchObject({ chargedCents: 1, shortfallCents: breakdown.totalCents - 1 });
+    expect(breakdown.totalCoins).toBeGreaterThan(1);
+    expect(breakdown).toMatchObject({ chargedCoins: 1, shortfallCoins: breakdown.totalCoins - 1 });
     expect(await walletBalance(gamer.profileId)).toBe(0);
 
     agent.socket.close();
@@ -401,7 +450,7 @@ describe('session billing (e2e)', () => {
     const agent = await connectAgent(machine);
 
     const body = (await start(reservation.id)).json();
-    expect(body.rateCentsPerMinute).toBe(90); // 6000c/hr * 0.9 = 5400c/hr = 90c/min
+    expect(body.rateCoinsPerHour).toBe(5400); // 6000 coins/h, 10% off
     const membership = await prisma.membership.findFirstOrThrow({ where: { gamerProfileId: gamer.profileId } });
     expect(body.appliedMembershipId).toBe(membership.id);
 
@@ -482,7 +531,7 @@ describe('session billing (e2e)', () => {
   });
 
   it('refuses a booking or a walk-in the wallet cannot cover, counting the bookings already made', async () => {
-    // Branch prices: walk-in 6 DT/h (100 millimes/min), booking 9 DT/h (150 millimes/min). Wallet: 5 DT.
+    // Prices: walk-in 6000 coins/h (100/min), booking 9000 coins/h (150/min). Wallet: 5000 coins.
     const gamer = await createGamer(5_000);
     const machine = await createMachine();
     const agent = await connectAgent(machine);
@@ -495,14 +544,14 @@ describe('session billing (e2e)', () => {
         payload: { machineId: machine.id, startTime: inMinutes(from), endTime: inMinutes(to) },
       });
 
-    const hour = await book(60, 120); // 9 DT > 5 DT
+    const hour = await book(60, 120); // 9000 coins > 5000
     expect(hour.statusCode).toBe(409);
     expect(hour.json().code).toBe('INSUFFICIENT_FUNDS');
 
-    const half = await book(60, 90); // 4.5 DT: fits
+    const half = await book(60, 90); // 4500 coins: fits
     expect(half.statusCode).toBe(201);
 
-    const another = await book(180, 210); // 4.5 DT more, with only 0.5 DT left after the first booking
+    const another = await book(180, 210); // 4500 more, with only 500 left after the first booking
     expect(another.statusCode).toBe(409);
     expect(another.json().code).toBe('INSUFFICIENT_FUNDS');
 
@@ -510,7 +559,7 @@ describe('session billing (e2e)', () => {
       method: 'POST',
       url: '/reservations/walk-in',
       headers: as(gamer.token),
-      payload: { machineId: machine.id, durationMinutes: 15 }, // 1.5 DT > 0.5 DT left
+      payload: { machineId: machine.id, durationMinutes: 15 }, // 1500 coins > 500 left
     });
     expect(walkIn.statusCode).toBe(409);
     expect(walkIn.json().code).toBe('INSUFFICIENT_FUNDS');
@@ -586,7 +635,7 @@ describe('session billing (e2e)', () => {
       endTime,
     });
     const session = await prisma.session.create({
-      data: { reservationId: reservation.id, startTime: reservation.startTime, endTime, rateCentsPerMinute: 100, pinHash: 'x', pinExpiresAt: endTime },
+      data: { reservationId: reservation.id, startTime: reservation.startTime, endTime, rateCoinsPerHour: 6000, pinHash: 'x', pinExpiresAt: endTime },
     });
 
     await app.get(SessionsService).sweep();
@@ -612,7 +661,7 @@ describe('session billing (e2e)', () => {
         reservationId: late.id,
         startTime: late.startTime,
         endTime: late.endTime,
-        rateCentsPerMinute: 150,
+        rateCoinsPerHour: 9000,
         pinHash: 'x',
         pinExpiresAt: new Date(late.startTime.getTime() + 30 * 60_000),
       },
@@ -679,7 +728,7 @@ describe('session billing (e2e)', () => {
     });
     agent.socket.close();
 
-    // Locked because the money ran out, and the wallet still can't cover 5 minutes (500 millimes): refused.
+    // Locked because the money ran out, and the wallet still can't cover 5 minutes (500 coins): refused.
     const broke = await createGamer();
     const brokeMachine = await createMachine();
     const brokeAgent = await connectAgent(brokeMachine);

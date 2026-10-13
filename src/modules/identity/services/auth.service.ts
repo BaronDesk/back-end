@@ -9,6 +9,7 @@ import type { LoginDto, LogoutDto, RefreshDto } from '../schemas/auth.schemas.js
 import type { ChangePasswordDto } from '../schemas/users.schemas.js';
 import { PasswordService } from './password.service.js';
 import { TokenService } from './token.service.js';
+import { RanksService } from '../../ranks/services/ranks.service.js';
 import { toPublicUser } from '../util/public-user.js';
 
 const INVALID_CREDENTIALS = () =>
@@ -28,6 +29,7 @@ export class AuthService {
     private readonly refreshTokens: RefreshTokenRepository,
     private readonly passwords: PasswordService,
     private readonly tokens: TokenService,
+    private readonly ranks: RanksService,
   ) {}
 
   async login(dto: LoginDto) {
@@ -89,7 +91,7 @@ export class AuthService {
     const user = await this.users.findById(caller.sub);
     if (!user) throw new UnauthorizedException({ code: 'INVALID_TOKEN', error: 'user no longer exists' });
     assertActive(user);
-    return toPublicUser(user);
+    return toPublicUser(user, user.gamerProfile ? await this.ranks.list() : []);
   }
 
   private async verifyRefreshTokenOrThrow(token: string) {

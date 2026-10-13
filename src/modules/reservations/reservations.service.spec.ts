@@ -244,7 +244,7 @@ describe('ReservationsService walk-in and check-in', () => {
     };
     sessions = {
       checkIn: vi.fn(async () => pin),
-      assertAffordable: vi.fn(async () => ({ centsPerMinute: 100, totalCents: 6000, membershipId: null })),
+      assertAffordable: vi.fn(async () => ({ coinsPerHour: 6000, totalCoins: 6000, membershipId: null })),
       extend: vi.fn(async () => ({ endsAt: 'x' })),
       extendOptions: vi.fn(async () => ({ options: [] })),
     };
@@ -275,7 +275,7 @@ describe('ReservationsService walk-in and check-in', () => {
 
   it('quotes a booking at the booking rate and a walk-in at the walk-in rate, for their length', async () => {
     await service.create(GAMER, booking(2));
-    expect(sessions.assertAffordable).toHaveBeenLastCalledWith(expect.objectContaining({ gamerProfileId: 'g1', branchId: 'b1', isWalkIn: false, minutes: 60 }));
+    expect(sessions.assertAffordable).toHaveBeenLastCalledWith(expect.objectContaining({ gamerProfileId: 'g1', isWalkIn: false, minutes: 60 }));
     await service.walkIn(GAMER, { machineId: MACHINE_ID, durationMinutes: 90 });
     expect(sessions.assertAffordable).toHaveBeenLastCalledWith(expect.objectContaining({ isWalkIn: true, minutes: 90 }));
   });

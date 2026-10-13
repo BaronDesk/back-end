@@ -29,9 +29,17 @@ describe('SessionMeteringService', () => {
     it('settles on session end, moving the reservation to COMPLETED', async () => {
       presence.sessionEnded.next({ sessionId: 's1', endedAt: new Date().toISOString() });
       await flush();
-      // 5 minutes active at 100c/min = 500c
+      // 5 minutes active at 6000 coins/h = 500 coins
       expect(wallet.debitUpTo).toHaveBeenCalledWith('g1', expect.objectContaining({ amount: 500, sessionId: 's1' }));
-      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED', meteredSeconds: 300 }));
+      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED', meteredSeconds: 300 }), { gamerProfileId: 'g1', amount: 8 });
+    });
+
+    it('records the XP earned on the bill: 25 XP per 15 min played', async () => {
+      const endTime = new Date(Date.now() - 60_000);
+      await service.settle(sessionRow({ status: 'ACTIVE', meteringStartedAt: new Date(endTime.getTime() - 30 * 60_000), endTime }) as any, endTime);
+      const [, , data, xp] = repo.complete.mock.calls[0];
+      expect(data.billingBreakdown).toMatchObject({ meteredSeconds: 1800, xpEarned: 50 });
+      expect(xp).toEqual({ gamerProfileId: 'g1', amount: 50 });
     });
 
     it('still completes the session, flagged, when the settlement debit fails', async () => {
@@ -42,6 +50,8 @@ describe('SessionMeteringService', () => {
         's1',
         'res-1',
         expect.objectContaining({ status: 'COMPLETED', billingBreakdown: expect.objectContaining({ debitFailed: true }) }),
+        // The XP is for time played: a failed debit doesn't take it away.
+        expect.objectContaining({ gamerProfileId: 'g1' }),
       );
     });
   });
@@ -51,7 +61,7 @@ describe('SessionMeteringService', () => {
       wallet.debitUpTo.mockResolvedValueOnce(320);
       presence.sessionEnded.next({ sessionId: 's1', endedAt: new Date().toISOString() });
       await vi.waitFor(() => expect(repo.complete).toHaveBeenCalled());
-      expect(repo.complete.mock.calls[0][2].billingBreakdown).toMatchObject({ totalCents: 500, chargedCents: 320, shortfallCents: 180 });
+      expect(repo.complete.mock.calls[0][2].billingBreakdown).toMatchObject({ totalCoins: 500, chargedCoins: 320, shortfallCoins: 180 });
     });
   });
 
@@ -64,11 +74,11 @@ describe('SessionMeteringService', () => {
         { id: 'r9', startTime: start, endTime: new Date(start.getTime() + HOUR), isWalkIn: false, machine: { branchId: 'b1' } },
       ]);
       await expect(
-        service.assertAffordable({ gamerProfileId: 'g1', branchId: 'b1', isWalkIn: true, start: new Date(), minutes: 30 }),
+        service.assertAffordable({ gamerProfileId: 'g1', isWalkIn: true, start: new Date(), minutes: 30 }),
       ).rejects.toMatchObject({ response: { code: 'INSUFFICIENT_FUNDS' } });
       await expect(
-        service.assertAffordable({ gamerProfileId: 'g1', branchId: 'b1', isWalkIn: true, start: new Date(), minutes: 10 }),
-      ).resolves.toMatchObject({ totalCents: 1000 });
+        service.assertAffordable({ gamerProfileId: 'g1', isWalkIn: true, start: new Date(), minutes: 10 }),
+      ).resolves.toMatchObject({ totalCoins: 1000 });
     });
   });
 

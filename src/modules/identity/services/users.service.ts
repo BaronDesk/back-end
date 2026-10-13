@@ -6,8 +6,10 @@ import { Prisma, type UserRole } from '../../../generated/prisma/index.js';
 import { RefreshTokenRepository } from '../repository/refresh-token.repository.js';
 import { UsersRepository } from '../repository/users.repository.js';
 import { AuditLogService } from '../../../common/audit/audit-log.service.js';
+import { ImagesService } from '../../uploads/services/images.service.js';
 import type { CreateEmployeeDto, CreateGamerDto, ListUsersQuery, UpdateRoleDto } from '../schemas/users.schemas.js';
-import { toPublicUser } from '../util/public-user.js';
+import { RanksService } from '../../ranks/services/ranks.service.js';
+import { needsRanks, toPublicUser, type UserWithProfiles } from '../util/public-user.js';
 import { PasswordService } from './password.service.js';
 
 const ELEVATED_ROLES: readonly UserRole[] = ['MANAGER', 'ADMIN'];
@@ -27,7 +29,19 @@ export class UsersService {
     private readonly passwords: PasswordService,
     private readonly refreshTokens: RefreshTokenRepository,
     private readonly audit: AuditLogService,
+    private readonly images: ImagesService,
+    private readonly ranks: RanksService,
   ) {}
+
+  /** The public shape, with a gamer's rank placed from the current ranks. */
+  private async publish(user: UserWithProfiles) {
+    return (await this.publishAll([user]))[0];
+  }
+
+  private async publishAll(users: UserWithProfiles[]) {
+    const ranks = needsRanks(users) ? await this.ranks.list() : [];
+    return users.map((user) => toPublicUser(user, ranks));
+  }
 
   /** Sign-up: every gamer picks the branch they play at. */
   async createGamer(dto: CreateGamerDto) {
@@ -36,7 +50,7 @@ export class UsersService {
     const user = await this.usersRepo
       .createGamer({ username: dto.username, passwordHash, homeBranchId: dto.branchId })
       .catch(usernameTaken);
-    return toPublicUser(user);
+    return this.publish(user);
   }
 
   /** A gamer changes the branch they play at (their booking page follows). */
@@ -46,7 +60,39 @@ export class UsersService {
       throw new ForbiddenException({ code: 'NOT_A_GAMER', error: 'only gamers have a home branch' });
     }
     await this.assertBranchExists(branchId);
-    return toPublicUser(await this.usersRepo.setHomeBranch(caller.sub, branchId));
+    return this.publish(await this.usersRepo.setHomeBranch(caller.sub, branchId));
+  }
+
+  /** A gamer's profile picture: stored as a 256×256 WebP, the previous one deleted. */
+  async setAvatar(caller: AccessTokenPayload, picture: Buffer) {
+    const before = await this.requireGamer(caller);
+    const url = await this.images.save(picture, 'avatar');
+    let user: UserWithProfiles;
+    try {
+      user = await this.usersRepo.setAvatar(caller.sub, url);
+      await this.images.release(before);
+    } catch (error) {
+      await this.images.release(url);
+      throw error;
+    }
+    // Outside the try: the new picture is saved, so a failure here must not delete it.
+    return this.publish(user);
+  }
+
+  async removeAvatar(caller: AccessTokenPayload) {
+    const before = await this.requireGamer(caller);
+    const user = await this.usersRepo.setAvatar(caller.sub, null);
+    await this.images.release(before);
+    return this.publish(user);
+  }
+
+  /** The caller's current avatar link; 403 NOT_A_GAMER for staff (only gamers have a profile picture). */
+  private async requireGamer(caller: AccessTokenPayload): Promise<string | null> {
+    const user = await this.usersRepo.findById(caller.sub);
+    if (!user?.gamerProfile) {
+      throw new ForbiddenException({ code: 'NOT_A_GAMER', error: 'only gamers have a profile picture' });
+    }
+    return user.gamerProfile.avatarUrl;
   }
 
   /**
@@ -57,13 +103,13 @@ export class UsersService {
     const visibleBranchId = caller.scope === 'hq' ? null : caller.branchId;
     if (caller.scope !== 'hq' && !visibleBranchId) return [];
     const users = await this.usersRepo.list({ ...query, visibleBranchId });
-    return users.map(toPublicUser);
+    return this.publishAll(users);
   }
 
   /** The desk finds a gamer by username (top-ups, help): no member code to copy. */
   async searchGamers(q: string) {
     const users = await this.usersRepo.list({ q, role: 'GAMER', visibleBranchId: null, limit: 20 });
-    return users.map(toPublicUser);
+    return this.publishAll(users);
   }
 
   /**
@@ -123,7 +169,7 @@ export class UsersService {
     await this.audit.record(caller.sub, 'UPDATE', `user:${targetId}`, {
       metadata: { event: status === 'ACTIVE' ? 'USER_REACTIVATED' : 'USER_SUSPENDED' },
     });
-    return toPublicUser(user);
+    return this.publish(user);
   }
 
   async createEmployee(caller: AccessTokenPayload, dto: CreateEmployeeDto) {
@@ -138,7 +184,7 @@ export class UsersService {
         branchId: dto.branchId,
       })
       .catch(usernameTaken);
-    return toPublicUser(user);
+    return this.publish(user);
   }
 
   async updateRole(caller: AccessTokenPayload, targetId: string, dto: UpdateRoleDto) {
@@ -157,7 +203,7 @@ export class UsersService {
     await this.audit.record(caller.sub, 'UPDATE', `user:${targetId}`, {
       metadata: { event: 'ROLE_CHANGED', to: dto.role, branchId: dto.branchId ?? null },
     });
-    return toPublicUser(user);
+    return this.publish(user);
   }
 
   async getUser(caller: AccessTokenPayload, id: string) {
@@ -165,7 +211,7 @@ export class UsersService {
     if (!user) throw new NotFoundException({ code: 'USER_NOT_FOUND', error: 'user not found' });
 
     assertScope(caller, { userId: user.id, branchId: user.employeeProfile?.managedBranchId ?? null });
-    return toPublicUser(user);
+    return this.publish(user);
   }
 
   /**

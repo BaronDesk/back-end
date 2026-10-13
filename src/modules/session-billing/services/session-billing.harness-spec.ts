@@ -42,10 +42,10 @@ export function reservation(overrides: Record<string, unknown> = {}) {
 export function sessionRow(overrides: Record<string, unknown> = {}) {
   return {
     id: 's1', reservationId: 'res-1', appliedMembershipId: null, status: 'PENDING',
-    rateCentsPerMinute: 100, meteredSeconds: 0, meteringStartedAt: null, lockedAt: null,
+    rateCoinsPerHour: 6000, meteredSeconds: 0, meteringStartedAt: null, lockedAt: null,
     settledAt: null, billingBreakdown: null, createdAt: new Date(),
     pinHash: null, pinExpiresAt: null, pinUsedAt: null, pinAttempts: 0,
-    accruedCents: 0, nextRateCentsPerMinute: null, rateSwitchAt: null, endingNoticeSentAt: null, lockReason: null,
+    accruedCoins: 0, nextRateCoinsPerHour: null, rateSwitchAt: null, endingNoticeSentAt: null, lockReason: null,
     ...window(),
     reservation: { gamerProfileId: 'g1', machineId: 'm1', isWalkIn: true, machine: { id: 'm1', branchId: 'b1', serialNumber: 'SN-1' } },
     ...overrides,
@@ -108,7 +108,7 @@ export function createHarness() {
   };
   const agents: { sendControl: ReturnType<typeof vi.fn> } = { sendControl: vi.fn(() => true) };
   const dashboard: { publishToBranch: ReturnType<typeof vi.fn>; publishToUser: ReturnType<typeof vi.fn> } = { publishToBranch: vi.fn(), publishToUser: vi.fn() };
-  const pricing: { getRatesForBranch: ReturnType<typeof vi.fn> } = { getRatesForBranch: vi.fn(async () => ({ paygRate: 6000, bookingRate: 9000 })) }; // 6000c/hr = 100c/min
+  const pricing: { getRates: ReturnType<typeof vi.fn> } = { getRates: vi.fn(async () => ({ paygRate: 6000, bookingRate: 9000 })) }; // coins per hour: 100/min walk-in, 150/min booked
   const membership: { getActiveDiscountForGamer: ReturnType<typeof vi.fn> } = { getActiveDiscountForGamer: vi.fn(async () => null) };
   const subscriptions: { getWindowDiscountForGamer: ReturnType<typeof vi.fn> } = { getWindowDiscountForGamer: vi.fn(async () => null) };
   const wallet: Record<string, any> = {

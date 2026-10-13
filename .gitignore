@@ -7,3 +7,6 @@ src/generated/
 *.local
 caddy-root.crt
 *.tsbuildinfo
+
+# uploaded images (the `uploads` volume in Docker)
+/uploads/

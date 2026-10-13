@@ -5,6 +5,8 @@ FROM node:24-bookworm-slim AS base
 RUN apt-get update -y && apt-get install -y openssl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+# Mount point of the `uploads` volume: a new volume takes this owner, so `node` can write.
+RUN mkdir -p /app/uploads && chown node:node /app/uploads
 
 # ---- deps ----
 FROM base AS deps

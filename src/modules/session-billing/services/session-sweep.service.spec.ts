@@ -48,7 +48,7 @@ describe('SessionSweepService', () => {
         sessionRow({ status: 'PAUSED', meteredSeconds: 120, endTime, startTime: new Date(endTime.getTime() - HOUR) }),
       ]);
       await service.sweep();
-      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED', meteredSeconds: 120 }));
+      expect(repo.complete).toHaveBeenCalledWith('s1', 'res-1', expect.objectContaining({ status: 'COMPLETED', meteredSeconds: 120 }), { gamerProfileId: 'g1', amount: 3 });
       expect(commands.issueSystemEndSession).toHaveBeenCalledWith('m1', 'reservation_ended', 's1');
       expect(repo.cancelPending).not.toHaveBeenCalled();
     });

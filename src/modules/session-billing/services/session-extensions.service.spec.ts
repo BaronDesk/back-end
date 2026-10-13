@@ -24,7 +24,7 @@ describe('SessionExtensionsService', () => {
 
   describe('extend', () => {
     const runningBooking = (overrides: Record<string, unknown> = {}) =>
-      sessionRow({ status: 'ACTIVE', pinUsedAt: new Date(), meteringStartedAt: new Date(), rateCentsPerMinute: 150, ...overrides });
+      sessionRow({ status: 'ACTIVE', pinUsedAt: new Date(), meteringStartedAt: new Date(), rateCoinsPerHour: 9000, ...overrides });
 
     beforeEach(() => {
       repo.findActiveForReservation.mockResolvedValue({ id: 's1' });
@@ -35,8 +35,8 @@ describe('SessionExtensionsService', () => {
       const result = await service.extend('g1', 'res-1', 30);
       const input = repo.extendIfFree.mock.calls[0][0];
       expect(input.to.getTime() - input.from.getTime()).toBe(30 * 60_000);
-      expect(input.session).toMatchObject({ nextRateCentsPerMinute: 100, rateSwitchAt: input.from, endingNoticeSentAt: null });
-      expect(result).toMatchObject({ costCents: 3000 });
+      expect(input.session).toMatchObject({ nextRateCoinsPerHour: 6000, rateSwitchAt: input.from, endingNoticeSentAt: null });
+      expect(result).toMatchObject({ costCoins: 3000 });
       expect(agents.sendControl).toHaveBeenCalledWith('SN-1', 'session_notice', expect.objectContaining({ kind: 'CLEAR' }));
     });
 

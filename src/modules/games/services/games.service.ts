@@ -15,6 +15,7 @@ import { SCOPE_RANK } from '../../../common/utils/scope.js';
 import type { AccessTokenPayload } from '../../../common/types/jwt-payload.js';
 import type { Game, MachineGame } from '../../../generated/prisma/index.js';
 import { PresenceService, type StationRef } from '../../station/services/presence.service.js';
+import { ImagesService } from '../../uploads/services/images.service.js';
 import { GamesRepository, type GameWithAssignments, type InstalledGameRow } from '../repository/games.repository.js';
 import {
   installedGameSchema,
@@ -119,6 +120,7 @@ export class GamesService implements OnModuleDestroy {
   constructor(
     private readonly repo: GamesRepository,
     private readonly presence: PresenceService,
+    private readonly images: ImagesService,
   ) {}
 
   onModuleDestroy(): void {
@@ -164,6 +166,7 @@ export class GamesService implements OnModuleDestroy {
     // Existing per-machine overrides are not re-checked against a new launch
     // type: the agent rejects a bad one and reports it in catalog_status.
     this.announce(await this.repo.assignments(id), caller);
+    await this.images.release(existing.iconUrl);
     return toGameDto(updated);
   }
 
@@ -173,6 +176,7 @@ export class GamesService implements OnModuleDestroy {
     const assignments = await this.repo.assignments(id);
     await this.repo.delete(id, game.gameId);
     this.announce(assignments, caller);
+    await this.images.release(game.iconUrl);
     return { id, deleted: true };
   }
 

@@ -48,6 +48,7 @@
     "test:int": "npm run dc -- exec backend npx vitest run --config ./vitest.config.e2e.ts"
   },
   "dependencies": {
+    "@fastify/multipart": "^10.1.3",
     "@fastify/static": "^10.1.3",
     "@nestjs/bullmq": "^12.0.0",
     "@nestjs/common": "^12.0.1",
@@ -70,6 +71,7 @@
     "pg": "^8.23.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
+    "sharp": "^0.35.5",
     "socket.io": "^4.8.3",
     "ws": "^8.21.3",
     "zod": "^4.6.5"
