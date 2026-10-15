@@ -206,6 +206,14 @@ describe('PresenceService outage classification', () => {
     expect(fresh.unreachableSince('SN-2')).toEqual(new Date(T0 + 100_000));
   });
 
+  it('calls a drop the caller knows was venue-wide a venue outage, even alone', async () => {
+    vi.setSystemTime(T0 + 10_000);
+    await service.disconnect('SN-1', 'venue');
+    vi.setSystemTime(T0 + 10 * 60_000);
+    await connect(1);
+    expect(service.outageOf('SN-1')).toBe('venue');
+  });
+
   it('calls a station recovered OFFLINE after a backend restart a venue outage', async () => {
     const fresh = new PresenceService(machines as any, { hset: vi.fn(async () => 1) } as any, { get: () => undefined } as any, { recordDisconnect: vi.fn() } as any);
     machines.findStaleOnline.mockResolvedValueOnce([{ ...rows.get('m1')!, lastSeen: new Date(T0 - 5 * 60_000) }]);

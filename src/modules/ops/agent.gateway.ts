@@ -49,6 +49,7 @@ import {
   telemetryPayloadSchema,
 } from './schemas/telemetry.schemas.js';
 import { CommandsService } from './services/commands.service.js';
+import { NetworkSimulationService } from './services/network-simulation.service.js';
 import { StationSessionPort, type LoginDecision, type StationLease } from './services/station-session.port.js';
 import { TelemetryService } from './services/telemetry.service.js';
 
@@ -140,6 +141,7 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     private readonly games: GamesService,
     private readonly stationAuth: StationAuthService,
     private readonly sessions: StationSessionPort,
+    private readonly simulation: NetworkSimulationService,
   ) {}
 
   onModuleInit(): void {
@@ -182,7 +184,15 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     done: (result: boolean, code?: number, message?: string) => void,
   ): Promise<void> {
     try {
-      this.principals.set(request, await this.stationAuth.authenticateAgent(request.headers.authorization));
+      const principal = await this.stationAuth.authenticateAgent(request.headers.authorization);
+      // Dev-only simulated outage: the station can't get through until it ends, like with no network.
+      const refusal = this.simulation.refusal(principal);
+      if (refusal) {
+        this.logger.log(`agent-ws reconnect of ${principal.serialNumber} refused: ${refusal}`);
+        done(false, 503, 'Service Unavailable');
+        return;
+      }
+      this.principals.set(request, principal);
       done(true);
     } catch (err) {
       const rejected = admissionRejection(err);
@@ -236,11 +246,12 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     if (!serial) return;
     this.logger.log(`agent disconnected: ${serial}`);
 
+    const venueOutage = this.simulation.takeVenueCut(serial);
     // A newer connection for the same station already replaced this one.
     if (!this.registry.deregister(serial, socket)) return;
 
     try {
-      await this.presence.disconnect(serial);
+      await this.presence.disconnect(serial, venueOutage ? 'venue' : undefined);
     } catch (err) {
       this.logger.error(`failed to mark ${serial} offline: ${(err as Error).message}`);
     }

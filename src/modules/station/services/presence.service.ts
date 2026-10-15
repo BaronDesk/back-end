@@ -54,12 +54,17 @@ const DROP_LOG_RETENTION_MS = 6 * 60 * 60_000;
  */
 export type OutageKind = 'venue' | 'single';
 
-/** A station going OFFLINE, at its last heartbeat; `stale` when recovered from a previous backend run. */
+/**
+ * A station going OFFLINE, at its last heartbeat; `stale` when recovered from a
+ * previous backend run, `venue` when the caller already knows the whole venue
+ * went (a simulated branch outage).
+ */
 interface StationDrop {
   serialNumber: string;
   branchId: string;
   at: Date;
   stale: boolean;
+  venue: boolean;
 }
 
 /** What other modules may know about a station: identity and branch, nothing more. */
@@ -302,7 +307,7 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
     const state = this.states.get(serialNumber);
     const drop = state?.reconnectedFrom;
     if (!state || !drop) return null;
-    if (drop.stale) return 'venue';
+    if (drop.stale || drop.venue) return 'venue';
     const peers = new Set(
       this.drops
         .filter((d) => d.branchId === drop.branchId && d.serialNumber !== serialNumber)
@@ -358,9 +363,9 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
     this.pendingSessionEnds.set(serialNumber, { reason, at: Date.now() });
   }
 
-  /** socket close/error. */
-  async disconnect(serialNumber: string): Promise<void> {
-    await this.markOffline(serialNumber, 'socket closed');
+  /** socket close/error. `outage: 'venue'` when the whole venue is known to be down (a simulated branch outage). */
+  async disconnect(serialNumber: string, outage?: 'venue'): Promise<void> {
+    await this.markOffline(serialNumber, outage ? 'socket closed, venue outage' : 'socket closed', outage === 'venue');
   }
 
   /** Resolves a connected (or recently seen) station by serial, from memory. */
@@ -436,13 +441,13 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private async markOffline(serialNumber: string, reason: string): Promise<void> {
+  private async markOffline(serialNumber: string, reason: string, venue = false): Promise<void> {
     const state = this.states.get(serialNumber);
     if (!state || state.status === 'OFFLINE') return;
 
     state.status = 'OFFLINE';
     state.lastPersistedAt = Date.now();
-    state.drop = this.recordDrop(state, false);
+    state.drop = this.recordDrop(state, false, venue);
     await this.machines.setStatus(state.machineId, 'OFFLINE', state.lastSeen);
     await this.writeCache(state);
     this.logger.log(`station ${serialNumber} OFFLINE (${reason})`);
@@ -498,8 +503,8 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  private recordDrop(state: PresenceState, stale: boolean): StationDrop {
-    const drop: StationDrop = { serialNumber: state.serialNumber, branchId: state.branchId, at: state.lastSeen, stale };
+  private recordDrop(state: PresenceState, stale: boolean, venue = false): StationDrop {
+    const drop: StationDrop = { serialNumber: state.serialNumber, branchId: state.branchId, at: state.lastSeen, stale, venue };
     const cutoff = Date.now() - DROP_LOG_RETENTION_MS;
     this.drops = this.drops.filter((d) => d.at.getTime() >= cutoff);
     this.drops.push(drop);

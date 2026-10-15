@@ -81,6 +81,7 @@ describe('AgentGateway session login and lease', () => {
       {} as any,
       { renewalFor: vi.fn(() => null) } as any,
       port,
+      { refusal: vi.fn(() => null), takeVenueCut: vi.fn(() => false) } as any,
     );
 
     socket = new FakeSocket();
