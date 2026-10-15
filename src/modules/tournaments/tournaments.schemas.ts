@@ -1,13 +1,28 @@
 import { z } from 'zod';
+import { uploadedImageUrlSchema } from '../uploads/schemas/image-url.schema.js';
+
+const isPowerOfTwo = (value: number) => (value & (value - 1)) === 0;
 
 export const idSchema = z.string().uuid();
 export const createTournamentSchema = z
   .object({
-    branchId: idSchema,
+    name: z.string().trim().min(1).max(100),
+    coverImageUrl: uploadedImageUrlSchema.refine(
+      (value) => value !== null,
+      'cover image is required',
+    ),
+    branchId: idSchema.optional(),
     gameId: idSchema,
     entryFeePerPlayer: z.number().int().min(0).max(2_147_483_647),
     teamSize: z.number().int().min(1).max(16).default(1),
-    maxEntrants: z.number().int().min(2).max(256),
+    maxEntrants: z
+      .number()
+      .int()
+      .min(2)
+      .max(256)
+      .refine(isPowerOfTwo, 'number of teams must be a power of two'),
+    eventStartsAt: z.coerce.date(),
+    eventEndsAt: z.coerce.date(),
     registrationClosesAt: z.coerce.date(),
     checkInOpensAt: z.coerce.date(),
     checkInClosesAt: z.coerce.date(),
@@ -24,8 +39,11 @@ export const createTournamentSchema = z
   .refine(
     (x) =>
       x.registrationClosesAt < x.checkInOpensAt &&
-      x.checkInOpensAt < x.checkInClosesAt,
-    'deadlines must be ordered',
+      x.checkInOpensAt < x.checkInClosesAt &&
+      x.checkInClosesAt < x.eventStartsAt &&
+      x.eventStartsAt < x.eventEndsAt &&
+      x.eventEndsAt.getTime() - x.eventStartsAt.getTime() >= 120 * 60_000,
+    'registration, check-in, and event dates must be ordered',
   );
 export const entrantSchema = z.object({
   name: z.string().trim().min(1).max(80),
@@ -36,7 +54,14 @@ export const inviteSchema = z.object({
 export const resultSchema = z.object({
   version: z.number().int().positive(),
   winnerEntrantId: idSchema,
-  scores: z.array(z.number().int().min(0)).min(2).max(8),
+  scores: z.array(z.number().int().min(0)).min(2).max(8).optional(),
+});
+export const joinTeamSchema = z.object({
+  pin: z
+    .string()
+    .trim()
+    .toUpperCase()
+    .regex(/^[A-HJ-NP-Z2-9]{10}$/),
 });
 
 export type CreateTournamentDto = z.infer<typeof createTournamentSchema>;

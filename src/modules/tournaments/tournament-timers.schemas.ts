@@ -3,6 +3,7 @@ export const TOURNAMENT_JOBS = {
   CLOSE_REGISTRATION: 'close-registration',
   OPEN_CHECK_IN: 'open-check-in',
   CLOSE_CHECK_IN: 'close-check-in',
+  OPEN_MATCHES: 'open-matches',
 } as const;
 export type TournamentJobName =
   (typeof TOURNAMENT_JOBS)[keyof typeof TOURNAMENT_JOBS];

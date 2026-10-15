@@ -20,5 +20,7 @@ export class TournamentTimersProcessor extends WorkerHost {
       return this.tournaments.onCheckInOpen(job.data.tournamentId);
     if (job.name === TOURNAMENT_JOBS.CLOSE_CHECK_IN)
       return this.tournaments.onCheckInDeadline(job.data.tournamentId);
+    if (job.name === TOURNAMENT_JOBS.OPEN_MATCHES)
+      return this.tournaments.onMatchWindowOpen(job.data.tournamentId);
   }
 }

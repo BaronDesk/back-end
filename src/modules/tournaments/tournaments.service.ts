@@ -6,6 +6,7 @@ import {
   type OnModuleDestroy,
   type OnModuleInit,
 } from '@nestjs/common';
+import { createHash, randomBytes } from 'node:crypto';
 import { InjectQueue } from '@nestjs/bullmq';
 import type { Queue } from 'bullmq';
 import type { Subscription } from 'rxjs';
@@ -90,11 +91,22 @@ export class TournamentsService implements OnModuleInit, OnModuleDestroy {
         code: 'TOURNAMENT_NOT_FOUND',
         error: 'tournament not found',
       });
-    return row;
+    return {
+      ...row,
+      entrants: row.entrants.map(
+        ({ joinPinHash: _joinPinHash, ...entrant }) => entrant,
+      ),
+    };
   }
 
   async create(caller: AccessTokenPayload, dto: CreateTournamentDto) {
-    if (caller.scope === 'admin' && caller.branchId !== dto.branchId)
+    const branchId = caller.scope === 'hq' ? dto.branchId : caller.branchId;
+    if (!branchId)
+      throw new ConflictException({
+        code: 'BRANCH_REQUIRED',
+        error: 'select a branch when creating a tournament',
+      });
+    if (caller.scope !== 'hq' && dto.branchId && caller.branchId !== dto.branchId)
       throw new ConflictException({
         code: 'BRANCH_SCOPE',
         error: 'tournament branch is outside your scope',
@@ -108,7 +120,7 @@ export class TournamentsService implements OnModuleInit, OnModuleDestroy {
       where: {
         id: dto.gameId,
         enabled: true,
-        gameBranches: { some: { branchId: dto.branchId } },
+        gameBranches: { some: { branchId } },
       },
       select: { id: true },
     });
@@ -119,11 +131,15 @@ export class TournamentsService implements OnModuleInit, OnModuleDestroy {
       });
     return this.prisma.tournament.create({
       data: {
-        branchId: dto.branchId,
+        name: dto.name,
+        coverImageUrl: dto.coverImageUrl,
+        branchId,
         gameId: dto.gameId,
         entryFeePerPlayer: dto.entryFeePerPlayer,
         teamSize: dto.teamSize,
         maxEntrants: dto.maxEntrants,
+        eventStartsAt: dto.eventStartsAt,
+        eventEndsAt: dto.eventEndsAt,
         registrationClosesAt: dto.registrationClosesAt,
         checkInOpensAt: dto.checkInOpensAt,
         checkInClosesAt: dto.checkInClosesAt,
@@ -161,6 +177,7 @@ export class TournamentsService implements OnModuleInit, OnModuleDestroy {
     kind: 'SOLO' | 'TEAM',
     name: string,
   ) {
+    const joinPin = kind === 'TEAM' ? this.generateJoinPin() : undefined;
     const gamer = await this.prisma.gamerProfile.findUnique({
       where: { userId: caller.sub },
       select: { id: true },
@@ -209,6 +226,7 @@ export class TournamentsService implements OnModuleInit, OnModuleDestroy {
           tournamentId,
           kind,
           name,
+          ...(joinPin ? { joinPinHash: this.hashJoinPin(joinPin) } : {}),
           status: 'FORMING',
           members: {
             create: {
@@ -225,7 +243,119 @@ export class TournamentsService implements OnModuleInit, OnModuleDestroy {
     });
     const member = entrant.members[0];
     if (kind === 'SOLO') await this.payMember(member.id, gamer.id);
-    return this.get(tournamentId);
+    return {
+      ...(await this.get(tournamentId)),
+      createdEntrantId: entrant.id,
+      ...(joinPin ? { joinPin } : {}),
+    };
+  }
+
+  async joinTeam(
+    caller: AccessTokenPayload,
+    tournamentId: string,
+    pin: string,
+  ) {
+    const gamer = await this.prisma.gamerProfile.findUnique({
+      where: { userId: caller.sub },
+      select: { id: true },
+    });
+    if (!gamer)
+      throw new NotFoundException({
+        code: 'GAMER_PROFILE_NOT_FOUND',
+        error: 'gamer profile not found',
+      });
+
+    const candidate = await this.prisma.tournamentEntrant.findFirst({
+      where: { tournamentId, joinPinHash: this.hashJoinPin(pin) },
+      select: { id: true },
+    });
+    if (!candidate)
+      throw new NotFoundException({
+        code: 'TEAM_PIN_INVALID',
+        error: 'team PIN is invalid for this tournament',
+      });
+
+    const memberId = await this.prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`entrant:${candidate.id}`}))`;
+      const entrant = await tx.tournamentEntrant.findUnique({
+        where: { id: candidate.id },
+        include: { tournament: true },
+      });
+      if (
+        !entrant ||
+        entrant.kind !== 'TEAM' ||
+        entrant.status !== 'FORMING' ||
+        entrant.tournament.status !== 'REGISTRATION_OPEN' ||
+        entrant.tournament.registrationClosesAt <= new Date()
+      )
+        throw new ConflictException({
+          code: 'TEAM_UNAVAILABLE',
+          error: 'team is no longer accepting players',
+        });
+
+      const currentMembers = await tx.tournamentMember.count({
+        where: { entrantId: entrant.id, status: { not: 'REMOVED' } },
+      });
+      if (currentMembers >= entrant.tournament.teamSize)
+        throw new ConflictException({
+          code: 'TEAM_FULL',
+          error: 'team roster is full',
+        });
+
+      const existingMember = await tx.tournamentMember.findUnique({
+        where: {
+          tournamentId_gamerProfileId: {
+            tournamentId,
+            gamerProfileId: gamer.id,
+          },
+        },
+      });
+      if (
+        existingMember?.entrantId === entrant.id &&
+        existingMember.status === 'INVITED'
+      ) {
+        await tx.tournamentMember.update({
+          where: { id: existingMember.id },
+          data: { status: 'PAYMENT_PENDING' },
+        });
+        return existingMember.id;
+      }
+      if (
+        existingMember?.entrantId === entrant.id &&
+        ['PAYMENT_PENDING', 'PAID'].includes(existingMember.status)
+      )
+        return existingMember.id;
+      if (existingMember)
+        throw new ConflictException({
+          code: 'ALREADY_REGISTERED',
+          error: 'you already have a place in this tournament',
+        });
+
+      const member = await tx.tournamentMember.create({
+        data: {
+          entrantId: entrant.id,
+          tournamentId,
+          gamerProfileId: gamer.id,
+          role: 'MEMBER',
+          status: 'PAYMENT_PENDING',
+          amountDue: entrant.tournament.entryFeePerPlayer,
+        },
+      });
+      return member.id;
+    });
+    return this.payMember(memberId, gamer.id);
+  }
+
+  private generateJoinPin(): string {
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    return Array.from(
+      randomBytes(10),
+      (byte) => alphabet[byte % alphabet.length],
+    ).join('');
+  }
+
+  private hashJoinPin(pin: string): string {
+    return createHash('sha256').update(pin.trim().toUpperCase()).digest('hex');
   }
 
   async invite(
@@ -530,6 +660,10 @@ export class TournamentsService implements OnModuleInit, OnModuleDestroy {
     this.emit(tournament.branchId, id);
   }
 
+  async onMatchWindowOpen(id: string): Promise<void> {
+    await this.seatReadyMatches(id);
+  }
+
   private async expireFormingEntrants(tournamentId: string): Promise<void> {
     await this.prisma.tournamentEntrant.updateMany({
       where: { tournamentId, status: 'FORMING' },
@@ -820,7 +954,7 @@ export class TournamentsService implements OnModuleInit, OnModuleDestroy {
   async reportResult(
     caller: AccessTokenPayload,
     matchId: string,
-    body: { version: number; winnerEntrantId: string; scores: number[] },
+    body: { version: number; winnerEntrantId: string; scores?: number[] },
   ) {
     const result = await this.prisma.$transaction(async (tx) => {
       const match = await tx.tournamentMatch.findUnique({
@@ -851,7 +985,7 @@ export class TournamentsService implements OnModuleInit, OnModuleDestroy {
         data: {
           status: 'COMPLETED',
           winnerEntrantId: body.winnerEntrantId,
-          scoresJson: body.scores,
+          ...(body.scores ? { scoresJson: body.scores } : {}),
           version: { increment: 1 },
         },
       });
@@ -927,6 +1061,29 @@ export class TournamentsService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async seatReadyMatches(tournamentId: string): Promise<void> {
+    const tournament = await this.prisma.tournament.findUnique({
+      where: { id: tournamentId },
+      select: { status: true, eventStartsAt: true, eventEndsAt: true },
+    });
+    if (!tournament || tournament.status !== 'IN_PROGRESS') return;
+    const now = new Date();
+    if (now < tournament.eventStartsAt) {
+      await this.queue.add(
+        TOURNAMENT_JOBS.OPEN_MATCHES,
+        { tournamentId },
+        {
+          jobId: `${TOURNAMENT_JOBS.OPEN_MATCHES}-${tournamentId}-${tournament.eventStartsAt.getTime()}`,
+          delay: tournament.eventStartsAt.getTime() - now.getTime(),
+          attempts: 8,
+          backoff: { type: 'exponential', delay: 1_000 },
+          removeOnComplete: true,
+          removeOnFail: false,
+        },
+      );
+      return;
+    }
+    if (now.getTime() + this.matchDurationMs > tournament.eventEndsAt.getTime())
+      return;
     const matches = await this.prisma.tournamentMatch.findMany({
       where: { tournamentId, status: 'READY', reservations: { none: {} } },
       select: { id: true },
@@ -997,6 +1154,13 @@ export class TournamentsService implements OnModuleInit, OnModuleDestroy {
       !match.entrant2
     )
       return;
+    const now = new Date();
+    if (
+      now < match.tournament.eventStartsAt ||
+      now.getTime() + this.matchDurationMs >
+        match.tournament.eventEndsAt.getTime()
+    )
+      return;
     const members = [...match.entrant1.members, ...match.entrant2.members];
     if (members.length !== match.tournament.teamSize * 2) {
       this.logger.warn(
@@ -1021,7 +1185,6 @@ export class TournamentsService implements OnModuleInit, OnModuleDestroy {
     });
     if (candidates.length < members.length) return;
 
-    const now = new Date();
     const endTime = new Date(now.getTime() + this.matchDurationMs);
     const created = await this.prisma.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`tournament-match:${match.id}`}))`;

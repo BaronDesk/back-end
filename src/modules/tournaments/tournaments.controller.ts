@@ -9,6 +9,7 @@ import {
   entrantSchema,
   idSchema,
   inviteSchema,
+  joinTeamSchema,
   resultSchema,
 } from './tournaments.schemas.js';
 
@@ -16,14 +17,18 @@ import {
 export class TournamentsController {
   constructor(private readonly tournaments: TournamentsService) {}
 
-  @Get() list() {
+  @RequireScope('self')
+  @Get()
+  list() {
     return this.tournaments.list();
   }
-  @Get(':id') get(@Param('id', new ZodValidationPipe(idSchema)) id: string) {
+  @RequireScope('self')
+  @Get(':id')
+  get(@Param('id', new ZodValidationPipe(idSchema)) id: string) {
     return this.tournaments.get(id);
   }
 
-  @RequireScope('admin')
+  @RequireScope('staff')
   @Post()
   create(
     @CurrentUser() caller: AccessTokenPayload,
@@ -32,7 +37,7 @@ export class TournamentsController {
     return this.tournaments.create(caller, body);
   }
 
-  @RequireScope('admin')
+  @RequireScope('staff')
   @Post(':id/publish')
   publish(
     @CurrentUser() caller: AccessTokenPayload,
@@ -59,6 +64,16 @@ export class TournamentsController {
     @Body(new ZodValidationPipe(entrantSchema)) body: any,
   ) {
     return this.tournaments.createEntrant(caller, id, 'TEAM', body.name);
+  }
+
+  @RequireScope('self')
+  @Post(':id/teams/join')
+  joinTeam(
+    @CurrentUser() caller: AccessTokenPayload,
+    @Param('id', new ZodValidationPipe(idSchema)) id: string,
+    @Body(new ZodValidationPipe(joinTeamSchema)) body: any,
+  ) {
+    return this.tournaments.joinTeam(caller, id, body.pin);
   }
 
   @RequireScope('self')

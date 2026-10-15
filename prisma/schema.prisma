@@ -616,12 +616,16 @@ model Reservation {
 
 model Tournament {
   id                   String           @id @default(uuid()) @db.Uuid
+  name                 String
+  coverImageUrl        String?          @map("cover_image_url")
   branchId             String           @map("branch_id") @db.Uuid
   gameId               String           @map("game_id") @db.Uuid
   status               TournamentStatus @default(DRAFT)
   entryFeePerPlayer    Int              @map("entry_fee_per_player")
   teamSize             Int              @default(1) @map("team_size")
   maxEntrants          Int              @map("max_entrants")
+  eventStartsAt        DateTime         @map("event_starts_at") @db.Timestamptz
+  eventEndsAt          DateTime         @map("event_ends_at") @db.Timestamptz
   registrationClosesAt DateTime         @map("registration_closes_at") @db.Timestamptz
   checkInOpensAt       DateTime         @map("check_in_opens_at") @db.Timestamptz
   checkInClosesAt      DateTime         @map("check_in_closes_at") @db.Timestamptz
@@ -645,6 +649,7 @@ model TournamentEntrant {
   tournamentId String @map("tournament_id") @db.Uuid
   kind TournamentEntrantKind
   name String
+  joinPinHash String? @unique @map("join_pin_hash")
   seed Int?
   checkedInAt DateTime? @map("checked_in_at") @db.Timestamptz
   status TournamentEntrantStatus @default(FORMING)
