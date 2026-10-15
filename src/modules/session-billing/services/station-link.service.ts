@@ -1,5 +1,7 @@
 import { ConflictException, Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { InjectQueue } from '@nestjs/bullmq';
+import type { JobsOptions, Queue } from 'bullmq';
 import type { Subscription } from 'rxjs';
 
 import { assertScope } from '../../../common/utils/assert-scope.js';
@@ -30,6 +32,14 @@ import {
   STAFF_LOCK,
   type SettlementSession,
 } from '../util/session-rules.js';
+
+import {
+  settleJobId,
+  STATION_EVENT_JOBS,
+  STATION_EVENTS_QUEUE,
+  statusJobId,
+  type StationEventJobData,
+} from '../schemas/station-events.schemas.js';
 
 import { RunoutTimerService } from './runout-timer.service.js';
 import { SessionMeteringService } from './session-metering.service.js';
@@ -63,6 +73,7 @@ export class StationLinkService implements OnModuleInit, OnModuleDestroy {
     private readonly metering: SessionMeteringService,
     private readonly runout: SessionRunoutService,
     private readonly dashboard: DashboardGateway,
+    @InjectQueue(STATION_EVENTS_QUEUE) private readonly events: Queue<StationEventJobData>,
     config: ConfigService,
   ) {
     const settings = sessionConfig(config);
@@ -70,15 +81,46 @@ export class StationLinkService implements OnModuleInit, OnModuleDestroy {
     this.offlineBillCapSeconds = settings.leaseCapSeconds + settings.stationLeaseGraceS;
   }
 
+  /**
+   * Presence events only enqueue their billing follow-up (Redis, deterministic
+   * job id); StationEventsProcessor runs it. A crash between the event and its
+   * handling no longer loses it: the job runs when a worker is back.
+   */
   onModuleInit(): void {
     this.subs.push(
-      this.presence.statusChanges.subscribe((event) => void this.onStationStatus(event)),
-      this.presence.sessionEnded.subscribe((event) => void this.onSessionEnded(event)),
+      this.presence.statusChanges.subscribe((event) => void this.enqueueStationStatus(event, new Date())),
+      this.presence.sessionEnded.subscribe((event) => void this.enqueueSessionEnded(event)),
     );
   }
 
   onModuleDestroy(): void {
     for (const sub of this.subs) sub.unsubscribe();
+  }
+
+  /** Queues the settlement of a session the station ended (once per session while it waits). */
+  async enqueueSessionEnded(event: SessionEndedEvent): Promise<void> {
+    await this.enqueue(STATION_EVENT_JOBS.SETTLE, { event }, settleJobId(event.sessionId), () => this.handleSessionEnded(event));
+  }
+
+  /** Queues a lock-state / online change, stamped with when it was seen. */
+  async enqueueStationStatus(event: StationStatusEvent, at: Date): Promise<void> {
+    await this.enqueue(STATION_EVENT_JOBS.STATUS, { event, at: at.toISOString() }, statusJobId(event, at), () =>
+      this.handleStationStatus(event, at),
+    );
+  }
+
+  /** Never throws. With Redis unreachable the follow-up runs here and now, as before the queue. */
+  private async enqueue(name: string, data: StationEventJobData, jobId: string, inline: () => Promise<void>): Promise<void> {
+    try {
+      await this.events.add(name, data, STATION_EVENT_JOB_OPTIONS(jobId));
+    } catch (err) {
+      this.logger.error(`could not queue ${jobId} (${(err as Error).message}): handling it in-process`);
+      try {
+        await inline();
+      } catch (inlineErr) {
+        this.logger.error(`${jobId} failed: ${(inlineErr as Error).message}`);
+      }
+    }
   }
 
   // --- staff ---------------------------------------------------------------
@@ -316,39 +358,43 @@ export class StationLinkService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  private async onStationStatus(event: StationStatusEvent): Promise<void> {
-    try {
-      if (event.status === 'OFFLINE') {
-        await this.pauseForOffline(event);
+  /**
+   * The billing follow-up of a lock-state / online change seen `at`: metering
+   * starts or stops then. Idempotent, and a change already superseded (the
+   * station has since reported otherwise) is skipped. Throws so the queue retries.
+   */
+  async handleStationStatus(event: StationStatusEvent, at: Date): Promise<void> {
+    if (event.status === 'OFFLINE') {
+      // Back online since: reconnect handling owns that session now.
+      if (this.presence.isOnline(event.serialNumber)) return;
+      await this.pauseForOffline(event);
+      return;
+    }
+    if (!event.sessionId) return;
+    const live = this.presence.agentStateOf(event.serialNumber);
+    if (live && live.sessionId === event.sessionId && live.locked !== null && live.locked !== event.locked) return;
+    const found = await this.repo.findForSettlement(event.sessionId);
+    if (!found || !OPEN_SESSION_STATUSES.includes(found.status)) return;
+    const session = await this.metering.foldRateSwitch(found, at);
+
+    if (event.locked === false && session.status !== 'ACTIVE') {
+      // The agent binds a session only from an UNLOCK, which only follows an accepted login.
+      if (session.status === 'PENDING' && !session.pinUsedAt) return;
+      // Every UNLOCK that lifts a staff or funds lock clears its reason first: a station
+      // still unlocked from before (a reconnect) does not resume it; reconcile locks it.
+      if (session.status === 'PAUSED' && isHeldLock(session.lockReason)) {
+        this.logger.warn(`station ${event.serialNumber} reports session ${session.id} unlocked, but it is locked (${session.lockReason})`);
         return;
       }
-      if (!event.sessionId) return;
-      const found = await this.repo.findForSettlement(event.sessionId);
-      if (!found || !OPEN_SESSION_STATUSES.includes(found.status)) return;
-      const session = await this.metering.foldRateSwitch(found, new Date());
-
-      if (event.locked === false && session.status !== 'ACTIVE') {
-        // The agent binds a session only from an UNLOCK, which only follows an accepted login.
-        if (session.status === 'PENDING' && !session.pinUsedAt) return;
-        // Every UNLOCK that lifts a staff or funds lock clears its reason first: a station
-        // still unlocked from before (a reconnect) does not resume it; reconcile locks it.
-        if (session.status === 'PAUSED' && isHeldLock(session.lockReason)) {
-          this.logger.warn(`station ${event.serialNumber} reports session ${session.id} unlocked, but it is locked (${session.lockReason})`);
-          return;
-        }
-        const now = new Date();
-        await this.repo.activate(session.id, session.reservationId, {
-          status: 'ACTIVE',
-          meteringStartedAt: now,
-          lockedAt: null,
-          lockReason: null,
-        });
-        await this.runout.scheduleRunout({ ...session, status: 'ACTIVE', meteringStartedAt: now, lockedAt: null, lockReason: null });
-      } else if (event.locked === true && session.status === 'ACTIVE') {
-        await this.metering.pause(session, new Date(), session.lockReason);
-      }
-    } catch (err) {
-      this.logger.error(`station status handling failed for ${event.serialNumber}: ${(err as Error).message}`);
+      await this.repo.activate(session.id, session.reservationId, {
+        status: 'ACTIVE',
+        meteringStartedAt: at,
+        lockedAt: null,
+        lockReason: null,
+      });
+      await this.runout.scheduleRunout({ ...session, status: 'ACTIVE', meteringStartedAt: at, lockedAt: null, lockReason: null });
+    } else if (event.locked === true && session.status === 'ACTIVE') {
+      await this.metering.pause(session, at, session.lockReason);
     }
   }
 
@@ -366,9 +412,23 @@ export class StationLinkService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private async onSessionEnded(event: SessionEndedEvent): Promise<void> {
+  /**
+   * Settles a session the station ended, at its end time. Idempotent: a
+   * session already closed is skipped, the debit key is shared, and the XP is
+   * added in the transaction that closes it, so a retried job awards nothing.
+   */
+  async handleSessionEnded(event: SessionEndedEvent): Promise<void> {
     const session = await this.repo.findForSettlement(event.sessionId);
     if (!session || !OPEN_SESSION_STATUSES.includes(session.status)) return;
     await this.metering.settle(session, new Date(event.endedAt), event.reason);
   }
 }
+
+/** Retried with backoff on failure; done jobs are dropped (the session row is the record), failed ones kept for a look. */
+const STATION_EVENT_JOB_OPTIONS = (jobId: string): JobsOptions => ({
+  jobId,
+  attempts: 5,
+  backoff: { type: 'exponential', delay: 1_000 },
+  removeOnComplete: true,
+  removeOnFail: 1_000,
+});

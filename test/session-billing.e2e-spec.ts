@@ -12,6 +12,9 @@ import { REDIS } from '../src/infra/redis/redis.module.js';
 import { makeFrame } from '../src/infra/realtime/frame.js';
 import type { OutboundEnvelope } from '../src/infra/realtime/envelope.js';
 import { CommandsService, SYSTEM_ACTOR_ID } from '../src/modules/ops/services/commands.service.js';
+import { getQueueToken } from '@nestjs/bullmq';
+import type { Queue } from 'bullmq';
+import { STATION_EVENTS_QUEUE, settleJobId } from '../src/modules/session-billing/schemas/station-events.schemas.js';
 import { SessionsService } from '../src/modules/session-billing/services/sessions.service.js';
 import { mintStationToken } from './station-token.js';
 
@@ -198,6 +201,8 @@ describe('session billing (e2e)', () => {
   afterAll(async () => {
     // An open agent socket keeps app.close() waiting.
     for (const socket of agentSockets) socket.close();
+    // Never leave the station-events queue paused for the next run (the crash test pauses it).
+    await app.get<Queue>(getQueueToken(STATION_EVENTS_QUEUE)).resume();
     const machines = await prisma.machine.findMany({ where: { branchId: { in: branchIds } } });
     if (machines.length) await redis.del(...machines.map((m) => `node:${m.serialNumber}`));
     await prisma.user.deleteMany({ where: { username: { in: usernames } } });
@@ -846,5 +851,42 @@ describe('session billing (e2e)', () => {
     expect((await clear()).statusCode).toBe(409);
     expect(await prisma.auditLog.count({ where: { target: `machine:${machine.id}`, metadata: { path: ['event'], equals: 'STATION_ATTENTION_CLEARED' } } })).toBe(1);
     expect((await book(120, 150)).statusCode).toBe(201);
+  });
+
+  it('settles a session end queued while no worker ran once one runs: one debit, XP once, a re-run adds nothing', async () => {
+    const queue = app.get<Queue>(getQueueToken(STATION_EVENTS_QUEUE));
+    const gamer = await createGamer(100_000);
+    const machine = await createMachine();
+    const agent = await connectAgent(machine);
+    const sessionId = await startAndLogIn(agent, (await createConfirmedReservation(gamer.profileId, machine.id)).id);
+    // 30 minutes played: 50 XP (25 per 15 minutes).
+    await prisma.session.update({ where: { id: sessionId }, data: { meteringStartedAt: new Date(Date.now() - 30 * 60_000) } });
+    const xpBefore = (await prisma.gamerProfile.findUniqueOrThrow({ where: { id: gamer.profileId } })).xp;
+    const payments = () => prisma.ledgerEntry.count({ where: { sessionId, type: 'PAYMENT' } });
+
+    // The process "died": no worker takes jobs. A paused queue parks new jobs (pausing one
+    // worker is not enough: a fetch already in flight can still hand it the next job).
+    await queue.pause();
+    try {
+      agent.send('heartbeat', { locked: true, sessionId: null }); // the station ends the session
+      await vi.waitFor(async () => expect(await queue.getJob(settleJobId(sessionId))).toBeTruthy());
+      await new Promise((r) => setTimeout(r, 300));
+      expect((await get(sessionId)).json().status).not.toBe('COMPLETED');
+      expect(await payments()).toBe(0);
+    } finally {
+      await queue.resume(); // a worker is back
+    }
+    await vi.waitFor(async () => expect((await get(sessionId)).json().status).toBe('COMPLETED'), { timeout: 10_000 });
+    expect(await payments()).toBe(1);
+    const xpAfter = (await prisma.gamerProfile.findUniqueOrThrow({ where: { id: gamer.profileId } })).xp;
+    expect(xpAfter - xpBefore).toBe(50);
+    expect((await get(sessionId)).json().billingBreakdown).toMatchObject({ xpEarned: 50, chargedCoins: expect.any(Number) });
+
+    // The same job once more (a retry after a crash past the commit): nothing changes.
+    const rerun = await queue.add('settle', { event: { sessionId, machineId: machine.id, branchId: machine.branchId, serialNumber: machine.serialNumber, reason: 'agent_reported', endedAt: new Date().toISOString() } }, { jobId: settleJobId(sessionId) });
+    await vi.waitFor(async () => expect(await rerun.isCompleted()).toBe(true), { timeout: 10_000 });
+    expect(await payments()).toBe(1);
+    expect((await prisma.gamerProfile.findUniqueOrThrow({ where: { id: gamer.profileId } })).xp).toBe(xpAfter);
+    agent.socket.close();
   });
 });

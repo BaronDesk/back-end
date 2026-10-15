@@ -394,4 +394,88 @@ describe('StationLinkService', () => {
       expect(dashboard.publishToBranch).not.toHaveBeenCalled();
     });
   });
+
+  describe('durable station events (queued, run by the worker)', () => {
+    let events: Harness['events'];
+    let jobs: Harness['jobs'];
+    let processor: Harness['processor'];
+
+    beforeEach(() => ({ events, jobs, processor } = harness));
+
+    const ended = (sessionId = 's1') => ({ machineId: 'm1', branchId: 'b1', serialNumber: 'SN-1', sessionId, reason: 'normal', endedAt: new Date().toISOString() });
+
+    it('queues a session end as settle-<sessionId>, retried with backoff', async () => {
+      events.autoRun = false;
+      presence.sessionEnded.next(ended());
+      await flush();
+      expect(events.add).toHaveBeenCalledWith('settle', { event: expect.objectContaining({ sessionId: 's1' }) }, expect.objectContaining({
+        jobId: 'settle-s1', attempts: 5, backoff: { type: 'exponential', delay: 1_000 }, removeOnComplete: true,
+      }));
+      expect(repo.complete).not.toHaveBeenCalled();
+    });
+
+    it('queues a lock-state change stamped with when it was seen, under an id derived from the change', async () => {
+      events.autoRun = false;
+      presence.statusChanges.next({ ...STATION, status: 'ONLINE', lastSeen: new Date().toISOString(), sessionId: 's1', locked: true, branchId: 'b1' });
+      await flush();
+      const [{ name, data, opts }] = jobs;
+      expect(name).toBe('status');
+      expect(opts.jobId).toBe(`status-SN-1-ONLINE-s1-true-${Date.parse(data.at)}`);
+      expect(opts.jobId).not.toContain(':');
+    });
+
+    it('settles an end whose worker never ran once a worker runs it: one debit, XP once, a retry changes nothing', async () => {
+      events.autoRun = false; // the process died before handling it
+      presence.sessionEnded.next(ended());
+      await flush();
+      expect(wallet.debitUpTo).not.toHaveBeenCalled();
+
+      // The worker comes back and runs the waiting job; the session is then closed.
+      repo.complete.mockImplementationOnce(async () => {
+        repo.findForSettlement.mockResolvedValue(sessionRow({ status: 'COMPLETED' }));
+        return true;
+      });
+      await processor.process({ name: jobs[0].name, data: jobs[0].data } as any);
+      expect(wallet.debitUpTo).toHaveBeenCalledTimes(1);
+      expect(wallet.debitUpTo).toHaveBeenCalledWith('g1', expect.objectContaining({ idempotencyKey: 'session-settlement:s1' }));
+      expect(repo.complete).toHaveBeenCalledTimes(1);
+      expect(repo.complete.mock.calls[0][3]).toEqual({ gamerProfileId: 'g1', amount: 8 });
+
+      // The same job again (a retry after a crash past the commit): nothing more.
+      await processor.process({ name: jobs[0].name, data: jobs[0].data } as any);
+      expect(wallet.debitUpTo).toHaveBeenCalledTimes(1);
+      expect(repo.complete).toHaveBeenCalledTimes(1);
+    });
+
+    it('stops metering when the station locked, not when the job finally runs', async () => {
+      events.autoRun = false;
+      const startedAt = new Date(Date.now() - 10 * 60_000);
+      repo.findForSettlement.mockResolvedValue(sessionRow({ status: 'ACTIVE', pinUsedAt: new Date(), meteringStartedAt: startedAt }));
+      const seen = new Date(Date.now() - 5 * 60_000);
+      await service.enqueueStationStatus({ ...STATION, status: 'ONLINE', lastSeen: seen.toISOString(), sessionId: 's1', locked: true, branchId: 'b1' } as any, seen);
+      await processor.process({ name: jobs[0].name, data: jobs[0].data } as any);
+      expect(repo.update).toHaveBeenCalledWith('s1', expect.objectContaining({ status: 'PAUSED', meteredSeconds: 300, lockedAt: seen }));
+    });
+
+    it('skips a change the station has since reported otherwise, and an OFFLINE it is back from', async () => {
+      presence.agentStateOf.mockReturnValue({ locked: false, sessionId: 's1', runningGameId: null });
+      repo.findForSettlement.mockResolvedValue(sessionRow({ status: 'ACTIVE', pinUsedAt: new Date(), meteringStartedAt: new Date() }));
+      await service.handleStationStatus({ ...STATION, status: 'ONLINE', lastSeen: '', sessionId: 's1', locked: true, branchId: 'b1' } as any, new Date());
+      presence.isOnline.mockReturnValue(true);
+      repo.findGrantedOnMachine.mockResolvedValue([sessionRow({ status: 'ACTIVE', pinUsedAt: new Date(), meteringStartedAt: new Date() })]);
+      await service.handleStationStatus({ ...STATION, status: 'OFFLINE', lastSeen: new Date().toISOString(), sessionId: 's1', locked: false } as any, new Date());
+      expect(repo.update).not.toHaveBeenCalled();
+    });
+
+    it('handles the event in-process when the queue is unreachable', async () => {
+      events.add.mockRejectedValueOnce(new Error('ECONNREFUSED'));
+      await service.enqueueSessionEnded(ended());
+      expect(repo.complete).toHaveBeenCalledTimes(1);
+    });
+
+    it('lets a failed handler throw so the queue retries it', async () => {
+      repo.findForSettlement.mockRejectedValueOnce(new Error('db down'));
+      await expect(service.handleSessionEnded(ended())).rejects.toThrow('db down');
+    });
+  });
 });
