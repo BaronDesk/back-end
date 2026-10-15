@@ -160,6 +160,10 @@ export class SessionsService implements OnModuleInit, StationSessionHandler {
     return this.loginService.lease(station, sessionId);
   }
 
+  reconnected(station: StationRef): Promise<void> {
+    return this.stationLink.reconnected(station);
+  }
+
   reconcile(station: StationRef, report: StateReportPayload): Promise<void> {
     return this.stationLink.reconcile(station, report);
   }

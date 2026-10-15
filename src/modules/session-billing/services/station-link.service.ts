@@ -272,6 +272,25 @@ export class StationLinkService implements OnModuleInit, OnModuleDestroy {
   // --- station -------------------------------------------------------------
 
   /**
+   * At the handshake, before the station reports anything: a session still
+   * ACTIVE although the station was unreachable past the offline timeout was
+   * never paused (the backend restarted and the station reconnected before
+   * the watchdog marked its stale row OFFLINE). It is paused at the last
+   * contact, as the OFFLINE handling would have: the time the station could
+   * not reach us is not billed, and reconcile then resumes it.
+   */
+  async reconnected(station: StationRef): Promise<void> {
+    const lastContact = this.presence.unreachableSince(station.serialNumber);
+    if (!lastContact) return;
+    for (const found of await this.repo.findGrantedOnMachine(station.machineId)) {
+      if (found.status !== 'ACTIVE') continue;
+      const session = await this.metering.foldRateSwitch(found, lastContact);
+      await this.metering.pause(session, lastContact, isHeldLock(session.lockReason) ? session.lockReason : OFFLINE_LOCK);
+      this.logger.warn(`session ${session.id} paused at ${lastContact.toISOString()}: station ${station.serialNumber} was unreachable but never marked offline`);
+    }
+  }
+
+  /**
    * state_report on (re)connect. A session still open and in its window is
    * resumed with a fresh UNLOCK + lease; metering picks up again once presence
    * sees locked=false. A session that ran past its window meanwhile is settled

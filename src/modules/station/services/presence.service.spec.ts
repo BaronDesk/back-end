@@ -186,6 +186,26 @@ describe('PresenceService outage classification', () => {
     expect(service.outageOf('SN-1')).toBe('single');
   });
 
+  it('knows when a reconnecting station was unreachable past the offline timeout (45 s), even across a backend restart', async () => {
+    // A drop shorter than the timeout: not unreachable.
+    await dropAt(1, 10);
+    vi.setSystemTime(T0 + 10_000 + 45_000);
+    await connect(1);
+    expect(service.unreachableSince('SN-1')).toBeNull();
+
+    // Longer: unreachable since its last heartbeat.
+    await dropAt(1, 100);
+    vi.setSystemTime(T0 + 100_000 + 46_000);
+    await connect(1);
+    expect(service.unreachableSince('SN-1')).toEqual(new Date(T0 + 100_000));
+
+    // A new process that never saw the station: its row's last seen counts.
+    const fresh = new PresenceService(machines as any, { hset: vi.fn(async () => 1) } as any, { get: () => undefined } as any, { recordDisconnect: vi.fn() } as any);
+    machines.findById.mockResolvedValueOnce({ ...rows.get('m2')!, lastSeen: new Date(T0 + 100_000) });
+    await fresh.connect({ serialNumber: 'SN-2' }, null, { ...PRINCIPAL, machineId: 'm2', serialNumber: 'SN-2' });
+    expect(fresh.unreachableSince('SN-2')).toEqual(new Date(T0 + 100_000));
+  });
+
   it('calls a station recovered OFFLINE after a backend restart a venue outage', async () => {
     const fresh = new PresenceService(machines as any, { hset: vi.fn(async () => 1) } as any, { get: () => undefined } as any, { recordDisconnect: vi.fn() } as any);
     machines.findStaleOnline.mockResolvedValueOnce([{ ...rows.get('m1')!, lastSeen: new Date(T0 - 5 * 60_000) }]);

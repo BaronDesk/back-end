@@ -275,6 +275,16 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
     return this.states.get(serialNumber)?.lastSeenBeforeConnect ?? null;
   }
 
+  /**
+   * At a (re)connect: when the station was last heard from, if that is longer
+   * ago than the offline timeout (it was unreachable, whether or not this
+   * process saw it go OFFLINE, e.g. across a backend restart). Null otherwise.
+   */
+  unreachableSince(serialNumber: string): Date | null {
+    const lastSeen = this.lastSeenBeforeConnect(serialNumber);
+    return lastSeen && Date.now() - lastSeen.getTime() > this.offlineAfterMs ? lastSeen : null;
+  }
+
   /** The station's last heartbeat (or connect): the last moment it is known to have been in use. */
   lastContactOf(serialNumber: string): Date | null {
     return this.states.get(serialNumber)?.lastSeen ?? null;

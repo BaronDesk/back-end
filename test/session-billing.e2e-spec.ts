@@ -20,6 +20,8 @@ import { SessionMeteringService } from '../src/modules/session-billing/services/
 import { SessionsRepository } from '../src/modules/session-billing/repository/sessions.repository.js';
 import { costAt, type Meter } from '../src/modules/session-billing/util/metering.js';
 import { WalletService } from '../src/modules/wallet/services/wallet.service.js';
+import { PresenceService } from '../src/modules/station/services/presence.service.js';
+import { xpForSeconds } from '../src/modules/session-billing/util/xp.js';
 import { mintStationToken } from './station-token.js';
 
 describe('session billing (e2e)', () => {
@@ -929,5 +931,200 @@ describe('session billing (e2e)', () => {
     expect(await walletBalance(gamer.profileId)).toBe(0);
     expect(await prisma.ledgerEntry.count({ where: { sessionId, type: 'PAYMENT' } })).toBe(1);
     agent.socket.close();
+  });
+
+  describe('station and backend disagree after a disconnect: the backend wins', () => {
+    const payments = (sessionId: string) => prisma.ledgerEntry.findMany({ where: { sessionId, type: 'PAYMENT' } });
+    const sessionRow = (id: string) => prisma.session.findUniqueOrThrow({ where: { id } });
+    const machineRow = (id: string) => prisma.machine.findUniqueOrThrow({ where: { id } });
+    const coinsFor = (seconds: number) => Math.round((seconds / 3600) * 6000);
+    const xpOf = async (gamerProfileId: string) => (await prisma.gamerProfile.findUniqueOrThrow({ where: { id: gamerProfileId } })).xp;
+
+    /** A gamer playing on a fresh station for `minutes` already (metering backdated). */
+    async function playing(minutes: number) {
+      const gamer = await createGamer();
+      const machine = await createMachine();
+      const agent = await connectAgent(machine);
+      const sessionId = await startAndLogIn(agent, (await createConfirmedReservation(gamer.profileId, machine.id)).id);
+      await prisma.session.update({ where: { id: sessionId }, data: { meteringStartedAt: new Date(Date.now() - minutes * 60_000) } });
+      return { gamer, machine, agent, sessionId };
+    }
+
+    /** The socket drops: presence marks the station OFFLINE and metering stops at its last heartbeat. */
+    async function dropped(agent: Agent, machineId: string, sessionId: string) {
+      agent.socket.close();
+      await vi.waitFor(async () => expect((await machineRow(machineId)).status).toBe('OFFLINE'));
+      await vi.waitFor(async () => expect((await sessionRow(sessionId)).status).toBe('PAUSED'));
+      return sessionRow(sessionId);
+    }
+
+    it('staff ended the session while the station was offline: billed to the last contact, END_SESSION on reconnect', async () => {
+      const { gamer, machine, agent, sessionId } = await playing(10);
+      const before = await walletBalance(gamer.profileId);
+      const paused = await dropped(agent, machine.id, sessionId);
+      expect(paused.lockReason).toBe('offline');
+      await new Promise((r) => setTimeout(r, 1100)); // time passes offline: none of it may be billed
+
+      const ended = await end(sessionId);
+      expect(ended.statusCode).toBe(202);
+      expect(ended.json()).toMatchObject({ type: 'END_SESSION', status: 'APPLIED_ON_RECONNECT' });
+      const closed = await sessionRow(sessionId);
+      expect(closed).toMatchObject({ status: 'COMPLETED', meteredSeconds: paused.meteredSeconds, settledAt: paused.lockedAt });
+      const bill = coinsFor(paused.meteredSeconds);
+      expect(closed.billingBreakdown).toMatchObject({ totalCoins: bill, chargedCoins: bill });
+      expect(await walletBalance(gamer.profileId)).toBe(before - bill);
+
+      // The station comes back still holding the session: it is told to end it, never unlocked.
+      const back = await connectAgent(machine);
+      back.send('state_report', { locked: true, sessionId, runningGameId: null, leaseExpiresAt: null });
+      await vi.waitFor(() => expect(back.commands.some((c) => c.type === 'END_SESSION')).toBe(true));
+      back.send('heartbeat', { locked: true, sessionId: null }); // the station ends it
+      await new Promise((r) => setTimeout(r, 300));
+      expect(back.commands.some((c) => c.type === 'UNLOCK')).toBe(false);
+      expect(await payments(sessionId)).toHaveLength(1);
+      expect(await walletBalance(gamer.profileId)).toBe(before - bill);
+      back.socket.close();
+    });
+
+    it('the booking ran out while the station was offline: settled with nothing billed after the last contact, END_SESSION on reconnect', async () => {
+      const { gamer, machine, agent, sessionId } = await playing(10);
+      const before = await walletBalance(gamer.profileId);
+      const paused = await dropped(agent, machine.id, sessionId);
+      await new Promise((r) => setTimeout(r, 1100));
+      // The window closes while the station is away.
+      const endTime = new Date();
+      await prisma.session.update({ where: { id: sessionId }, data: { endTime } });
+      await prisma.reservation.update({ where: { id: paused.reservationId }, data: { endTime } });
+
+      const back = await connectAgent(machine);
+      back.send('state_report', { locked: true, sessionId, runningGameId: null, leaseExpiresAt: null });
+      await vi.waitFor(() => expect(back.commands.some((c) => c.type === 'END_SESSION')).toBe(true));
+      await vi.waitFor(async () => expect((await sessionRow(sessionId)).status).toBe('COMPLETED'));
+
+      const closed = await sessionRow(sessionId);
+      const bill = coinsFor(paused.meteredSeconds);
+      expect(closed.meteredSeconds).toBe(paused.meteredSeconds);
+      expect(closed.billingBreakdown).toMatchObject({ totalCoins: bill, chargedCoins: bill });
+      expect(closed.billingBreakdown).not.toHaveProperty('shortfallCoins');
+      expect(await payments(sessionId)).toHaveLength(1);
+      expect(await walletBalance(gamer.profileId)).toBe(before - bill);
+      expect(back.commands.some((c) => c.type === 'UNLOCK')).toBe(false);
+      expect(await reservationStatus(closed.reservationId)).toBe('COMPLETED');
+      back.socket.close();
+    });
+
+    it('a session locked for lack of money stays locked through a reconnect; only a top-up unlocks it', async () => {
+      const { gamer, machine, agent, sessionId } = await playing(1);
+      await app.get(WalletService).debitUpTo(gamer.profileId, { amount: await walletBalance(gamer.profileId) });
+      await app.get(SessionsService).lockForRunout(sessionId);
+      await vi.waitFor(() => expect(agent.commands.some((c) => c.type === 'LOCK')).toBe(true));
+      agent.send('heartbeat', { locked: true, sessionId });
+      await vi.waitFor(async () => expect(await sessionRow(sessionId)).toMatchObject({ status: 'PAUSED', lockReason: 'runout' }));
+      await dropped(agent, machine.id, sessionId);
+      expect((await sessionRow(sessionId)).lockReason).toBe('runout');
+
+      // It comes back unlocked (e.g. a stale agent state): it is locked again, and gets no lease.
+      const back = await connectAgent(machine);
+      back.send('state_report', { locked: false, sessionId, runningGameId: null, leaseExpiresAt: null });
+      await vi.waitFor(() => expect(back.commands.some((c) => c.type === 'LOCK')).toBe(true));
+      back.send('heartbeat', { locked: false, sessionId });
+      await vi.waitFor(() => expect(back.heartbeatAcks.length).toBeGreaterThan(0));
+      expect(back.heartbeatAcks.at(-1)!.payload!.leaseSeconds).toBe(0);
+      back.send('heartbeat', { locked: true, sessionId });
+      await new Promise((r) => setTimeout(r, 300));
+      expect(back.commands.some((c) => c.type === 'UNLOCK')).toBe(false);
+      expect(await sessionRow(sessionId)).toMatchObject({ status: 'PAUSED', lockReason: 'runout' });
+
+      // Staff can't lift it while the wallet is empty; the top-up does.
+      const staffUnlock = await app.inject({ method: 'POST', url: `/api/v1/stations/${machine.id}/commands`, headers: as(staffToken), payload: { type: 'UNLOCK' } });
+      expect(staffUnlock.json().code).toBe('INSUFFICIENT_FUNDS');
+      await creditWallet(gamer.profileId, 5_000);
+      await vi.waitFor(() => expect(back.commands.some((c) => c.type === 'UNLOCK')).toBe(true));
+      expect(back.commands.find((c) => c.type === 'UNLOCK')).toMatchObject({ payload: { sessionId } });
+      back.send('heartbeat', { locked: false, sessionId });
+      await vi.waitFor(async () => expect(await sessionRow(sessionId)).toMatchObject({ status: 'ACTIVE', lockReason: null }));
+      back.socket.close();
+    });
+
+    /**
+     * The backend crashes mid-session: no close is handled, the machine row stays
+     * ONLINE with the last heartbeat it persisted, and the new process knows
+     * nothing of the station. Simulated by dropping presence's memory of the
+     * station before its socket closes (so the close changes nothing), then
+     * backdating the row by the downtime.
+     */
+    async function crashed(agent: Agent, machineId: string, serialNumber: string, downMinutes: number) {
+      (app.get(PresenceService) as any).states.delete(serialNumber);
+      agent.socket.close();
+      await new Promise((r) => setTimeout(r, 100));
+      const lastContact = new Date(Date.now() - downMinutes * 60_000);
+      await prisma.machine.update({ where: { id: machineId }, data: { status: 'ONLINE', lastSeen: lastContact } });
+      return lastContact;
+    }
+
+    /** The station ends the session: one debit, the XP once, and a re-run settle job changes nothing. */
+    async function settlesOnce(machine: { id: string; serialNumber: string; branchId: string }, back: Agent, sessionId: string, gamerProfileId: string, xpBefore: number) {
+      back.send('heartbeat', { locked: true, sessionId: null });
+      await vi.waitFor(async () => expect((await sessionRow(sessionId)).status).toBe('COMPLETED'), { timeout: 10_000 });
+      const closed = await sessionRow(sessionId);
+      expect(await payments(sessionId)).toHaveLength(1);
+      expect(closed.billingBreakdown).toMatchObject({ chargedCoins: coinsFor(closed.meteredSeconds) });
+      expect((await xpOf(gamerProfileId)) - xpBefore).toBe(xpForSeconds(closed.meteredSeconds));
+
+      const queue = app.get<Queue>(getQueueToken(STATION_EVENTS_QUEUE));
+      const event = { sessionId, machineId: machine.id, branchId: machine.branchId, serialNumber: machine.serialNumber, reason: 'agent_reported', endedAt: new Date().toISOString() };
+      const rerun = await queue.add('settle', { event }, { jobId: settleJobId(sessionId) });
+      await vi.waitFor(async () => expect(await rerun.isCompleted()).toBe(true), { timeout: 10_000 });
+      expect(await payments(sessionId)).toHaveLength(1);
+      expect(await xpOf(gamerProfileId)).toBe(xpBefore + xpForSeconds(closed.meteredSeconds));
+      return closed;
+    }
+
+    it('a backend restart: the station is marked offline, the session pauses at the last contact, resumes on reconnect, settles once', async () => {
+      const { gamer, machine, agent, sessionId } = await playing(20);
+      const xpBefore = await xpOf(gamer.profileId);
+      const lastContact = await crashed(agent, machine.id, machine.serialNumber, 2);
+
+      // The new process's watchdog finds a row it never saw a heartbeat for.
+      await vi.waitFor(async () => expect((await machineRow(machine.id)).status).toBe('OFFLINE'));
+      await vi.waitFor(async () => expect((await sessionRow(sessionId)).status).toBe('PAUSED'));
+      expect(await sessionRow(sessionId)).toMatchObject({ lockedAt: lastContact, lockReason: 'offline', meteredSeconds: 18 * 60 });
+
+      const back = await connectAgent(machine);
+      back.send('state_report', { locked: true, sessionId, runningGameId: null, leaseExpiresAt: null });
+      await vi.waitFor(() => expect(back.commands.some((c) => c.type === 'UNLOCK')).toBe(true));
+      back.send('heartbeat', { locked: false, sessionId });
+      await vi.waitFor(async () => expect((await sessionRow(sessionId)).status).toBe('ACTIVE'));
+
+      const closed = await settlesOnce(machine, back, sessionId, gamer.profileId, xpBefore);
+      expect(closed.meteredSeconds).toBeGreaterThanOrEqual(18 * 60);
+      expect(closed.meteredSeconds).toBeLessThan(18 * 60 + 30); // the 2 minutes down are not billed
+      back.socket.close();
+    });
+
+    it('a backend restart the station reconnects to before the watchdog runs: the downtime is still not billed', async () => {
+      const presence = app.get(PresenceService);
+      const { gamer, machine, agent, sessionId } = await playing(20);
+      const xpBefore = await xpOf(gamer.profileId);
+      // The new process has not run its first watchdog pass yet.
+      clearInterval((presence as any).watchdog);
+      let back: Agent;
+      try {
+        const lastContact = await crashed(agent, machine.id, machine.serialNumber, 2);
+        back = await connectAgent(machine);
+        // Its lease ran out while the backend was down: the agent locked itself.
+        back.send('state_report', { locked: true, sessionId, runningGameId: null, leaseExpiresAt: null });
+        await vi.waitFor(() => expect(back.commands.some((c) => c.type === 'UNLOCK')).toBe(true));
+        expect(await sessionRow(sessionId)).toMatchObject({ status: 'PAUSED', lockedAt: lastContact, meteredSeconds: 18 * 60 });
+      } finally {
+        presence.onModuleInit(); // the watchdog runs again
+      }
+      back.send('heartbeat', { locked: false, sessionId });
+      await vi.waitFor(async () => expect((await sessionRow(sessionId)).status).toBe('ACTIVE'));
+
+      const closed = await settlesOnce(machine, back, sessionId, gamer.profileId, xpBefore);
+      expect(closed.meteredSeconds).toBeLessThan(18 * 60 + 30);
+      back.socket.close();
+    });
   });
 });

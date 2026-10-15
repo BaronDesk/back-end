@@ -14,7 +14,7 @@ import {
 } from '../../infra/realtime/constants.js';
 import { makeFrame, OutboundSequencer, parseFrame } from '../../infra/realtime/frame.js';
 import { AgentRegistry } from '../../infra/realtime/registry.js';
-import { SeqGuard } from '../../infra/realtime/seq-guard.js';
+import { describeDrop, SeqGuard } from '../../infra/realtime/seq-guard.js';
 import type { Envelope } from '../../infra/realtime/envelope.js';
 import {
   handshakePayloadSchema,
@@ -263,8 +263,9 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     const guard = TELEMETRY_STREAM_TYPES.has(envelope.type) ? conn.telemetrySeqGuard : conn.seqGuard;
     const result = guard.check(envelope);
     if (!result.ok) {
+      const detail = describeDrop(result);
       this.logger.warn(
-        `dropped ${envelope.type} from ${conn.serialNumber ?? conn.ip}: ${result.reason} (seq ${envelope.seq})`,
+        `dropped ${envelope.type} from ${conn.serialNumber ?? conn.ip}: ${result.reason} (seq ${envelope.seq}${detail ? `, ${detail}` : ''})`,
       );
       return;
     }
@@ -345,7 +346,13 @@ export class AgentGateway implements OnModuleInit, OnModuleDestroy {
     }
 
     const ready = this.presence.connect(handshake, conn.ip, conn.principal).then(
-      () => true,
+      async () => {
+        // Every later frame waits on `ready`: a session left metering while the station was unreachable stops at its last contact first.
+        await this.sessions.current
+          ?.reconnected(stationOf(conn))
+          .catch((err: Error) => this.logger.error(`reconnect check for ${handshake.serialNumber} failed: ${err.message}`));
+        return true;
+      },
       (err: Error) => {
         // Admission is re-checked at handshake: enrollment may change after the upgrade.
         const rejected = admissionRejection(err);

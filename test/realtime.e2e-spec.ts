@@ -196,6 +196,28 @@ describe('realtime gateways (e2e)', () => {
     agent.socket.close();
   });
 
+  it('accepts frames whose ts is off by less than the 30 s replay window, and drops those off by more', async () => {
+    const serialNumber = `STATION-${randomUUID()}`;
+    const machine = await createMachine(serialNumber);
+    const agent = await openAgent(mintStationToken(app, machine));
+    const skewed = (seq: number, skewMs: number) =>
+      makeFrame({ ...envelope('heartbeat', seq, { locked: true, sessionId: null }), ts: new Date(Date.now() + skewMs).toISOString() });
+
+    agent.socket.send(makeFrame(envelope('handshake', 1, { serialNumber })));
+    expect((await agent.next()).type).toBe('handshake_ack');
+
+    agent.socket.send(skewed(2, -45_000)); // behind: dropped
+    agent.socket.send(skewed(3, 40_000)); // ahead: dropped
+    agent.socket.send(skewed(4, -20_000)); // inside: handled
+    agent.socket.send(skewed(5, 20_000)); // inside: handled
+
+    const acks = [await agent.next(), await agent.next()];
+    expect(acks.map((f) => f.type)).toEqual(['heartbeat_ack', 'heartbeat_ack']);
+    await new Promise((r) => setTimeout(r, 200));
+    expect(agent.frames.filter((f) => f.type === 'heartbeat_ack')).toHaveLength(2);
+    agent.socket.close();
+  });
+
   it('watchdog marks a silent station OFFLINE while the socket stays open', async () => {
     const serialNumber = `STATION-${randomUUID()}`;
     const machine = await createMachine(serialNumber);

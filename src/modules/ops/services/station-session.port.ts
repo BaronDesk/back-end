@@ -22,6 +22,11 @@ export interface StationSessionHandler {
   login(station: StationRef, method: string, credential: string): Promise<LoginDecision>;
   /** The lease for a heartbeat_ack, for the session the station reports (or none). */
   lease(station: StationRef, sessionId: string | null): Promise<StationLease>;
+  /**
+   * Handshake, before any later frame is handled: a session still metering
+   * although the station was unreachable is paused at its last contact.
+   */
+  reconnected(station: StationRef): Promise<void>;
   /** state_report on (re)connect: resume or close out the reported session. */
   reconcile(station: StationRef, report: StateReportPayload): Promise<void>;
   /**

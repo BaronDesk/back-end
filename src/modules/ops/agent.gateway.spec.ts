@@ -61,6 +61,7 @@ describe('AgentGateway session login and lease', () => {
     handler = {
       login: vi.fn(async () => ({ accepted: true, sessionId: 'sess-1', lease: { leaseSeconds: 120, serverTime: new Date().toISOString() } })),
       lease: vi.fn(async () => ({ leaseSeconds: 90, serverTime: new Date().toISOString() })),
+      reconnected: vi.fn(async () => undefined),
       reconcile: vi.fn(async () => undefined),
       unlockFor: vi.fn(),
       closeForShutdown: vi.fn(async () => undefined),
@@ -198,5 +199,63 @@ describe('AgentGateway session login and lease', () => {
     expect(presence.reportState).toHaveBeenCalledWith('SN-1', report);
     expect(handler.reconcile).toHaveBeenCalledWith({ machineId: 'm1', branchId: 'b1', serialNumber: 'SN-1' }, report);
     expect(presence.reportState.mock.invocationCallOrder[0]).toBeLessThan(handler.reconcile.mock.invocationCallOrder[0]);
+  });
+
+  it('runs the reconnect check at the handshake, before any later frame is handled', async () => {
+    expect(handler.reconnected).toHaveBeenCalledWith({ machineId: 'm1', branchId: 'b1', serialNumber: 'SN-1' });
+
+    let finish!: () => void;
+    handler.reconnected.mockImplementationOnce(() => new Promise<void>((resolve) => (finish = resolve)));
+    const fresh = new FakeSocket();
+    const request = { headers: {}, socket: { remoteAddress: '127.0.0.1' } };
+    (gateway as any).principals.set(request, PRINCIPAL);
+    (gateway as any).handleConnection(fresh, request);
+    socket = fresh;
+    seq = 0;
+    const handshake = receive('handshake', { serialNumber: 'SN-1' });
+    const report = receive('state_report', { locked: true, sessionId: 'sess-1' });
+    await new Promise((r) => setImmediate(r));
+    expect(handler.reconcile).not.toHaveBeenCalled();
+    finish();
+    await Promise.all([handshake, report]);
+    expect(handler.reconcile).toHaveBeenCalledTimes(1);
+    expect(handler.reconnected.mock.invocationCallOrder[1]).toBeLessThan(handler.reconcile.mock.invocationCallOrder[0]);
+  });
+
+  it('still admits the station when the reconnect check fails', async () => {
+    handler.reconnected.mockRejectedValueOnce(new Error('db down'));
+    const fresh = new FakeSocket();
+    const request = { headers: {}, socket: { remoteAddress: '127.0.0.1' } };
+    (gateway as any).principals.set(request, PRINCIPAL);
+    (gateway as any).handleConnection(fresh, request);
+    socket = fresh;
+    seq = 0;
+    await receive('handshake', { serialNumber: 'SN-1' });
+    expect(sentOf('handshake_ack')).toHaveLength(1);
+  });
+
+  describe('replay window (30 s) on frame timestamps', () => {
+    const heartbeatAt = (skewMs: number) =>
+      (gateway as any).handleMessage(
+        socket,
+        Buffer.from(JSON.stringify({ type: 'heartbeat', id: randomUUID(), ts: new Date(Date.now() + skewMs).toISOString(), seq: ++seq, payload: { locked: true, sessionId: null } })),
+      ) as Promise<void>;
+
+    it('handles a frame off by less than the window, either way', async () => {
+      await heartbeatAt(-25_000);
+      await heartbeatAt(25_000);
+      expect(sentOf('heartbeat_ack')).toHaveLength(2);
+    });
+
+    it('drops a frame off by more than the window, with a log line naming the skew and the window', async () => {
+      const warn = vi.spyOn((gateway as any).logger, 'warn').mockImplementation(() => undefined);
+      await heartbeatAt(-45_000);
+      await heartbeatAt(40_000);
+      expect(sentOf('heartbeat_ack')).toHaveLength(0);
+      expect(presence.touch).not.toHaveBeenCalled();
+      const lines = warn.mock.calls.map(([line]) => line);
+      expect(lines[0]).toMatch(/^dropped heartbeat from SN-1: ts_out_of_window \(seq \d+, ts 45\.\ds behind server time, window ±30s\)$/);
+      expect(lines[1]).toMatch(/^dropped heartbeat from SN-1: ts_out_of_window \(seq \d+, ts 40\.\ds ahead of server time, window ±30s\)$/);
+    });
   });
 });

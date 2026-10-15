@@ -109,6 +109,7 @@ export function createHarness() {
     sessionOf: vi.fn(() => 's1'),
     lastSeenBeforeConnect: vi.fn(() => null),
     lastContactOf: vi.fn(() => null),
+    unreachableSince: vi.fn(() => null),
     outageOf: vi.fn(() => null),
   };
   const agents: { sendControl: ReturnType<typeof vi.fn> } = { sendControl: vi.fn(() => true) };

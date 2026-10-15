@@ -262,6 +262,42 @@ describe('StationLinkService', () => {
     });
   });
 
+  describe('handshake after the station was unreachable (e.g. across a backend restart)', () => {
+    const lastContact = new Date(Date.now() - 2 * 60_000);
+
+    it('pauses a session still ACTIVE at the last contact, before reconcile resumes it', async () => {
+      presence.unreachableSince.mockReturnValue(lastContact);
+      repo.findGrantedOnMachine.mockResolvedValueOnce([
+        sessionRow({ status: 'ACTIVE', pinUsedAt: new Date(), meteringStartedAt: new Date(lastContact.getTime() - 18 * 60_000) }),
+      ]);
+      await service.reconnected(STATION);
+      expect(repo.update).toHaveBeenCalledWith('s1', expect.objectContaining({ status: 'PAUSED', meteredSeconds: 1080, lockedAt: lastContact, lockReason: 'offline' }));
+      expect(runoutTimer.cancel).toHaveBeenCalledWith('s1');
+
+      repo.findForSettlement.mockResolvedValueOnce(sessionRow({ status: 'PAUSED', pinUsedAt: new Date(), lockedAt: lastContact, lockReason: 'offline', meteredSeconds: 1080 }));
+      await service.reconcile(STATION, { locked: true, sessionId: 's1' });
+      expect(commands.issueSessionUnlock).toHaveBeenCalledWith('m1', expect.objectContaining({ sessionId: 's1' }), 'resume');
+    });
+
+    it('keeps a staff or funds lock it was paused under', async () => {
+      presence.unreachableSince.mockReturnValue(lastContact);
+      repo.findGrantedOnMachine.mockResolvedValueOnce([sessionRow({ status: 'ACTIVE', pinUsedAt: new Date(), lockReason: 'runout', meteringStartedAt: new Date(lastContact.getTime() - 60_000) })]);
+      await service.reconnected(STATION);
+      expect(repo.update).toHaveBeenCalledWith('s1', expect.objectContaining({ status: 'PAUSED', lockReason: 'runout' }));
+    });
+
+    it('changes nothing after a short drop, or for a session already paused', async () => {
+      repo.findGrantedOnMachine.mockResolvedValue([sessionRow({ status: 'ACTIVE', pinUsedAt: new Date(), meteringStartedAt: new Date() })]);
+      await service.reconnected(STATION); // unreachableSince: null
+      expect(repo.findGrantedOnMachine).not.toHaveBeenCalled();
+
+      presence.unreachableSince.mockReturnValue(lastContact);
+      repo.findGrantedOnMachine.mockResolvedValue([sessionRow({ status: 'PAUSED', pinUsedAt: new Date(), lockReason: 'offline' })]);
+      await service.reconnected(STATION);
+      expect(repo.update).not.toHaveBeenCalled();
+    });
+  });
+
   describe('staff orders to an unreachable station', () => {
     const lastContact = new Date(Date.now() - 2 * 60_000);
 
