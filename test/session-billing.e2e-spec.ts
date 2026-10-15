@@ -16,6 +16,10 @@ import { getQueueToken } from '@nestjs/bullmq';
 import type { Queue } from 'bullmq';
 import { STATION_EVENTS_QUEUE, settleJobId } from '../src/modules/session-billing/schemas/station-events.schemas.js';
 import { SessionsService } from '../src/modules/session-billing/services/sessions.service.js';
+import { SessionMeteringService } from '../src/modules/session-billing/services/session-metering.service.js';
+import { SessionsRepository } from '../src/modules/session-billing/repository/sessions.repository.js';
+import { costAt, type Meter } from '../src/modules/session-billing/util/metering.js';
+import { WalletService } from '../src/modules/wallet/services/wallet.service.js';
 import { mintStationToken } from './station-token.js';
 
 describe('session billing (e2e)', () => {
@@ -887,6 +891,43 @@ describe('session billing (e2e)', () => {
     await vi.waitFor(async () => expect(await rerun.isCompleted()).toBe(true), { timeout: 10_000 });
     expect(await payments()).toBe(1);
     expect((await prisma.gamerProfile.findUniqueOrThrow({ where: { id: gamer.profileId } })).xp).toBe(xpAfter);
+    agent.socket.close();
+  });
+
+  it('a settlement replayed after its debit emptied the wallet, but before the session closed, keeps the real charge', async () => {
+    const repo = app.get(SessionsRepository);
+    const metering = app.get(SessionMeteringService);
+    const gamer = await createGamer(100_000);
+    const machine = await createMachine();
+    const agent = await connectAgent(machine);
+    const sessionId = await startAndLogIn(agent, (await createConfirmedReservation(gamer.profileId, machine.id)).id);
+    await prisma.session.update({ where: { id: sessionId }, data: { meteringStartedAt: new Date(Date.now() - 30 * 60_000) } });
+    const endedAt = new Date();
+    const found = (await repo.findForSettlement(sessionId))!;
+    const bill = costAt(found as unknown as Meter, endedAt);
+    expect(bill).toBeGreaterThan(0);
+    // The wallet holds the bill exactly: the first debit takes it to 0.
+    await app.get(WalletService).debitUpTo(gamer.profileId, { amount: (await walletBalance(gamer.profileId)) - bill });
+    expect(await walletBalance(gamer.profileId)).toBe(bill);
+
+    // The first attempt "crashes" after the debit, before the session is closed.
+    const complete = vi.spyOn(repo, 'complete').mockRejectedValueOnce(new Error('process died'));
+    try {
+      await expect(metering.settle(found, endedAt)).rejects.toThrow('process died');
+    } finally {
+      complete.mockRestore();
+    }
+    expect(await walletBalance(gamer.profileId)).toBe(0);
+    expect((await get(sessionId)).json().status).not.toBe('COMPLETED');
+
+    // The retried job settles the same session at the same end.
+    expect(await metering.settle(found, endedAt)).toBe(true);
+    const settled = (await get(sessionId)).json();
+    expect(settled.status).toBe('COMPLETED');
+    expect(settled.billingBreakdown).toMatchObject({ totalCoins: bill, chargedCoins: bill });
+    expect(settled.billingBreakdown).not.toHaveProperty('shortfallCoins');
+    expect(await walletBalance(gamer.profileId)).toBe(0);
+    expect(await prisma.ledgerEntry.count({ where: { sessionId, type: 'PAYMENT' } })).toBe(1);
     agent.socket.close();
   });
 });

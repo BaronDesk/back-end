@@ -6,6 +6,7 @@ import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify
 
 import { AppModule } from '../src/app.module.js';
 import { PrismaService } from '../src/infra/prisma/prisma.service.js';
+import { WalletService } from '../src/modules/wallet/services/wallet.service.js';
 
 describe('wallet ledger (e2e)', () => {
   let app: NestFastifyApplication;
@@ -20,6 +21,7 @@ describe('wallet ledger (e2e)', () => {
   const gamerUsername = `gamer-${randomUUID()}`;
   const adminUsername = `admin-${randomUUID()}`;
   const employeeUsername = `employee-${randomUUID()}`;
+  const drainedUsername = `gamer-drained-${randomUUID()}`;
 
   beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -64,7 +66,7 @@ describe('wallet ledger (e2e)', () => {
   }, 30_000);
 
   afterAll(async () => {
-    await prisma.user.deleteMany({ where: { username: { in: [gamerUsername, adminUsername, employeeUsername] } } });
+    await prisma.user.deleteMany({ where: { username: { in: [gamerUsername, adminUsername, employeeUsername, drainedUsername] } } });
     await prisma.branch.deleteMany({ where: { id: branchId } });
     await app.close();
   });
@@ -239,5 +241,63 @@ describe('wallet ledger (e2e)', () => {
     expect(entries.length).toBeGreaterThan(0);
     const timestamps = entries.map((e: { createdAt: string }) => new Date(e.createdAt).getTime());
     expect(timestamps).toEqual([...timestamps].sort((x, y) => y - x));
+  });
+
+  describe('a replayed idempotencyKey after the first post emptied the wallet', () => {
+    let profileId: string;
+    let walletId: string;
+
+    beforeAll(async () => {
+      await app.inject({ method: 'POST', url: '/users', payload: { username: drainedUsername, password, branchId } });
+      profileId = (await prisma.user.findUniqueOrThrow({ where: { username: drainedUsername }, include: { gamerProfile: true } })).gamerProfile!.id;
+      walletId = (await app.get(WalletService).getOrCreateWallet(profileId)).id;
+    });
+
+    const fund = (amount: number) =>
+      app.inject({ method: 'POST', url: `/wallets/${profileId}/credit`, headers: { authorization: `Bearer ${adminToken}` }, payload: { amount } });
+    const balance = async () => (await prisma.wallet.findUniqueOrThrow({ where: { id: walletId } })).balance;
+    const rows = (idempotencyKey: string) => prisma.ledgerEntry.count({ where: { walletId, idempotencyKey } });
+
+    it('a capped debit returns the original entry and amount, not 0', async () => {
+      const wallet = app.get(WalletService);
+      await fund(400);
+      const before = await balance();
+      const idempotencyKey = `capped-${randomUUID()}`;
+      const charge = { amount: before, type: 'PAYMENT' as const, idempotencyKey };
+
+      expect(await wallet.debitUpTo(profileId, charge)).toBe(before);
+      const first = await prisma.ledgerEntry.findUniqueOrThrow({ where: { walletId_idempotencyKey: { walletId, idempotencyKey } } });
+      expect(first).toMatchObject({ amount: -before, balanceAfter: 0 });
+      expect(await balance()).toBe(0);
+
+      expect(await wallet.debitUpTo(profileId, charge)).toBe(before);
+      const again = await prisma.ledgerEntry.findMany({ where: { walletId, idempotencyKey } });
+      expect(again).toEqual([first]);
+      expect(await balance()).toBe(0);
+      expect(await rows(idempotencyKey)).toBe(1);
+    });
+
+    it('a debit returns the original entry, not a 409', async () => {
+      await fund(300);
+      const before = await balance();
+      const idempotencyKey = `debit-${randomUUID()}`;
+      const debit = () =>
+        app.inject({
+          method: 'POST',
+          url: `/wallets/${profileId}/debit`,
+          headers: { authorization: `Bearer ${adminToken}` },
+          payload: { amount: before, idempotencyKey },
+        });
+
+      const first = await debit();
+      expect(first.statusCode).toBe(201);
+      expect(first.json()).toMatchObject({ amount: -before, balanceAfter: 0 });
+
+      const second = await debit();
+      expect(second.statusCode).toBe(201);
+      expect(second.json()).toEqual(first.json());
+      expect(await balance()).toBe(0);
+      expect(await rows(idempotencyKey)).toBe(1);
+    });
   });
 });

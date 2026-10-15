@@ -79,6 +79,11 @@ export class WalletService {
    */
   async debit(gamerProfileId: string, dto: DebitDto) {
     const wallet = await this.getOrCreateWallet(gamerProfileId);
+    // A replay answers with its first entry: the funds checks below see the balance that entry already spent.
+    if (dto.idempotencyKey) {
+      const replayed = await this.wallets.findEntryByIdempotencyKey(wallet.id, dto.idempotencyKey);
+      if (replayed) return toPublicEntry(replayed);
+    }
     const reserved = this.reserve ? await this.reserve(gamerProfileId) : 0;
     if (reserved > 0 && wallet.balance - reserved < dto.amount) {
       throw new ConflictException({

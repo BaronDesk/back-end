@@ -61,6 +61,9 @@ export class WalletRepository extends BaseRepository {
         const [locked] = await tx.$queryRaw<{ balance: number }[]>`
           SELECT balance FROM wallets WHERE id = ${input.walletId}::uuid FOR UPDATE
         `;
+        // A replay finds its entry before the balance check: a first post that emptied the wallet still answers.
+        const replayed = await this.findReplayed(tx, input);
+        if (replayed) return replayed;
         const taken = Math.min(locked?.balance ?? 0, input.maxAmount);
         if (taken <= 0) return null;
 
@@ -95,6 +98,12 @@ export class WalletRepository extends BaseRepository {
   async postEntry(input: PostEntryInput) {
     try {
       return await this.prisma.$transaction(async (tx) => {
+        if (input.idempotencyKey) {
+          // Same order as postCappedDebit: lock, then the replay check, then the balance guard.
+          await tx.$queryRaw`SELECT 1 FROM wallets WHERE id = ${input.walletId}::uuid FOR UPDATE`;
+          const replayed = await this.findReplayed(tx, input);
+          if (replayed) return replayed;
+        }
         const [row] = await tx.$queryRaw<{ balance: number }[]>`
           UPDATE wallets
           SET balance = balance + ${input.amount}::integer, updated_at = now()
@@ -127,5 +136,17 @@ export class WalletRepository extends BaseRepository {
       }
       throw err;
     }
+  }
+
+  /** The entry an earlier post with this idempotencyKey left, if any. Run under the wallet row lock. */
+  private findReplayed(tx: Prisma.TransactionClient, input: PostEntryInput) {
+    if (!input.idempotencyKey) return null;
+    return tx.ledgerEntry.findUnique({
+      where: { walletId_idempotencyKey: { walletId: input.walletId, idempotencyKey: input.idempotencyKey } },
+    });
+  }
+
+  findEntryByIdempotencyKey(walletId: string, idempotencyKey: string) {
+    return this.prisma.ledgerEntry.findUnique({ where: { walletId_idempotencyKey: { walletId, idempotencyKey } } });
   }
 }
