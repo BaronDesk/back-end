@@ -4,6 +4,7 @@ import { PresenceService } from '../station/services/presence.service.js';
 import { BranchesRepository } from './branches.repository.js';
 import { AuditLogService } from '../../common/audit/audit-log.service.js';
 import type { AccessTokenPayload } from '../../common/types/jwt-payload.js';
+import type { Prisma } from '../../generated/prisma/index.js';
 
 /** How far ahead the station list shows bookings (what a gamer can book is limited separately). */
 const LOOKAHEAD_MS = 7 * 24 * 60 * 60_000;
@@ -39,7 +40,7 @@ export class BranchesService {
     return toBranchDto(branch);
   }
 
-  async update(caller: AccessTokenPayload, id: string, data: { name?: string; location?: string; stationPolicy?: Record<string, unknown> }) {
+  async update(caller: AccessTokenPayload, id: string, data: { name?: string; location?: string; stationPolicy?: Prisma.InputJsonValue }) {
     if (!(await this.repo.findById(id))) throw notFound();
     const updated = await this.repo.update(id, data);
     await this.audit.record(caller.sub, 'UPDATE', `branch:${id}`, {
