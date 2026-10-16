@@ -63,6 +63,12 @@ export class UsersService {
     return this.publish(await this.usersRepo.setHomeBranch(caller.sub, branchId));
   }
 
+  /** A user renames their own account; usernames stay unique. */
+  async setUsername(caller: AccessTokenPayload, username: string) {
+    const user = await this.usersRepo.setUsername(caller.sub, username).catch(usernameTaken);
+    return this.publish(user);
+  }
+
   /** A gamer's profile picture: stored as a 256×256 WebP, the previous one deleted. */
   async setAvatar(caller: AccessTokenPayload, picture: Buffer) {
     const before = await this.requireGamer(caller);
