@@ -30,11 +30,16 @@ export class BranchesService {
     return (await this.repo.list()).map(toBranchDto);
   }
 
-  async create(data: { name: string; location: string }) {
-    return toBranchDto(await this.repo.create(data));
+  async create(caller: AccessTokenPayload, data: { name: string; location: string }) {
+    const branch = await this.repo.create(data);
+    await this.audit.record(caller.sub, 'CREATE', `branch:${branch.id}`, {
+      branchId: branch.id,
+      metadata: { event: 'BRANCH_CREATED', name: branch.name },
+    });
+    return toBranchDto(branch);
   }
 
-  async update(caller: AccessTokenPayload, id: string, data: { name?: string; location?: string }) {
+  async update(caller: AccessTokenPayload, id: string, data: { name?: string; location?: string; stationPolicy?: Record<string, unknown> }) {
     if (!(await this.repo.findById(id))) throw notFound();
     const updated = await this.repo.update(id, data);
     await this.audit.record(caller.sub, 'UPDATE', `branch:${id}`, {

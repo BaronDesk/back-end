@@ -32,6 +32,12 @@ export class WalletRepository extends BaseRepository {
       .then((p) => p?.id ?? null);
   }
 
+  findHomeBranchId(gamerProfileId: string) {
+    return this.prisma.gamerProfile
+      .findUnique({ where: { id: gamerProfileId }, select: { homeBranchId: true } })
+      .then((p) => p?.homeBranchId ?? undefined);
+  }
+
   listEntries(walletId: string, take: number, cursor?: string) {
     return this.prisma.ledgerEntry.findMany({
       where: { walletId },

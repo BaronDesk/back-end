@@ -135,7 +135,10 @@ export class UsersService {
     }
     await this.usersRepo.setPasswordHash(targetId, await this.passwords.hash(newPassword));
     await this.refreshTokens.revokeAllForUser(targetId);
-     await this.audit.record(caller.sub, 'UPDATE', `user:${targetId}`, { metadata: { event: 'PASSWORD_RESET' } });
+    await this.audit.record(caller.sub, 'UPDATE', `user:${targetId}`, {
+      branchId: target.employeeProfile?.managedBranchId ?? target.gamerProfile?.homeBranchId ?? undefined,
+      metadata: { event: 'PASSWORD_RESET' },
+    });
     return { id: targetId, reset: true };
   }
 
@@ -167,6 +170,7 @@ export class UsersService {
     const user = await this.usersRepo.setStatus(targetId, status);
     if (status !== 'ACTIVE') await this.refreshTokens.revokeAllForUser(targetId);
     await this.audit.record(caller.sub, 'UPDATE', `user:${targetId}`, {
+      branchId: target.employeeProfile?.managedBranchId ?? target.gamerProfile?.homeBranchId ?? undefined,
       metadata: { event: status === 'ACTIVE' ? 'USER_REACTIVATED' : 'USER_SUSPENDED' },
     });
     return this.publish(user);
@@ -201,6 +205,7 @@ export class UsersService {
 
     const user = await this.usersRepo.updateRole(targetId, dto.role, dto.branchId);
     await this.audit.record(caller.sub, 'UPDATE', `user:${targetId}`, {
+      branchId: dto.branchId ?? target.employeeProfile?.managedBranchId ?? target.gamerProfile?.homeBranchId ?? undefined,
       metadata: { event: 'ROLE_CHANGED', to: dto.role, branchId: dto.branchId ?? null },
     });
     return this.publish(user);

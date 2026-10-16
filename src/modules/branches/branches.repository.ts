@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 
 import { BaseRepository } from '../../common/repository/base.repository.js';
 import { PrismaService } from '../../infra/prisma/prisma.service.js';
+import type { Prisma } from '../../generated/prisma/index.js';
 
 /** Reservations that hold their slot (ACTIVE = a session runs on it). */
 const HOLDING = ['PENDING', 'CONFIRMED', 'ACTIVE'] as const;
@@ -24,7 +25,7 @@ export class BranchesRepository extends BaseRepository {
     return this.prisma.branch.create({ data });
   }
 
-  update(id: string, data: { name?: string; location?: string }) {
+  update(id: string, data: { name?: string; location?: string; stationPolicy?: Prisma.InputJsonValue }) {
     return this.prisma.branch.update({ where: { id }, data });
   }
 

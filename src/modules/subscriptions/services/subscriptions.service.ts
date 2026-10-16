@@ -44,9 +44,13 @@ export class SubscriptionsService {
     return this.subscriptions.listPlans();
   }
 
-  async createPlan(dto: CreateSubscriptionPlanDto) {
+  async createPlan(caller: AccessTokenPayload, dto: CreateSubscriptionPlanDto) {
     try {
-      return await this.subscriptions.createPlan(dto);
+      const plan = await this.subscriptions.createPlan(dto);
+      await this.audit.record(caller.sub, 'CREATE', `subscription-plan:${plan.id}`, {
+        metadata: { event: 'SUBSCRIPTION_PLAN_CREATED', name: plan.name },
+      });
+      return plan;
     } catch (error) {
       this.translatePlanError(error);
     }
@@ -66,10 +70,13 @@ export class SubscriptionsService {
     }
   }
 
-  async deletePlan(id: string) {
+  async deletePlan(caller: AccessTokenPayload, id: string) {
     try {
       const deleted = await this.subscriptions.deletePlan(id);
       await this.images.release(deleted.badgeUrl);
+      await this.audit.record(caller.sub, 'DELETE', `subscription-plan:${id}`, {
+        metadata: { event: 'SUBSCRIPTION_PLAN_DELETED', name: deleted.name },
+      });
       return deleted;
     } catch (error) {
       this.translatePlanError(error);

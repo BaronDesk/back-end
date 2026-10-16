@@ -56,9 +56,13 @@ export class MembershipService {
     return this.memberships.listPlans();
   }
 
-  async createPlan(dto: CreateMembershipPlanDto) {
+  async createPlan(caller: AccessTokenPayload, dto: CreateMembershipPlanDto) {
     try {
-      return await this.memberships.createPlan(dto);
+      const plan = await this.memberships.createPlan(dto);
+      await this.audit.record(caller.sub, 'CREATE', `membership-plan:${plan.id}`, {
+        metadata: { event: 'MEMBERSHIP_PLAN_CREATED', name: plan.name },
+      });
+      return plan;
     } catch (error) {
       if (
         error instanceof Prisma.PrismaClientKnownRequestError &&
@@ -87,10 +91,13 @@ export class MembershipService {
     }
   }
 
-  async deletePlan(id: string) {
+  async deletePlan(caller: AccessTokenPayload, id: string) {
     try {
       const deleted = await this.memberships.deletePlan(id);
       await this.images.release(deleted.badgeUrl);
+      await this.audit.record(caller.sub, 'DELETE', `membership-plan:${id}`, {
+        metadata: { event: 'MEMBERSHIP_PLAN_DELETED', name: deleted.name },
+      });
       return deleted;
     } catch (error) {
       this.translatePlanError(error);

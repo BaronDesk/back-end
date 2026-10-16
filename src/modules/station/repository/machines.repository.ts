@@ -18,6 +18,13 @@ export class MachinesRepository extends BaseRepository {
     return this.prisma.machine.findUnique({ where: { id } });
   }
 
+  findByIdWithBranchPolicy(id: string) {
+    return this.prisma.machine.findUnique({
+      where: { id },
+      select: { policy: true, branch: { select: { stationPolicy: true } } },
+    });
+  }
+
   /** `branchId: null` means every branch (hq). */
   list(branchId: string | null) {
     return this.prisma.machine.findMany({

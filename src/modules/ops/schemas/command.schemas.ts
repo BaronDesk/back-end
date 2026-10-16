@@ -37,6 +37,17 @@ export const policyUpdatePayloadSchema = z.object({
   gpuTempAlertThreshold: z.number().positive().optional(),
   usbDebounceWindowSeconds: z.number().int().positive().optional(),
   telemetryCadenceSeconds: z.number().int().positive().optional(),
+
+  // refer to desktop agent at
+  // ServiceCore/Policy/StationPolicy.cs
+  heartbeatIntervalSeconds: z.number().positive().optional(),
+  defaultLeaseDurationSeconds: z.number().positive().optional(),
+  leaseGracePeriodSeconds: z.number().positive().optional(),
+  cpuLoadAlertThreshold: z.number().positive().optional(),
+  ramLoadAlertThreshold: z.number().positive().optional(),
+  hardwareAlertCooldownSeconds: z.number().positive().optional(),
+  enableAntiTheftAlerts: z.boolean().optional(),
+  stopGameOnLock: z.boolean().optional(),
 }).strict();
 export type PolicyUpdatePayload = z.infer<typeof policyUpdatePayloadSchema>;
 

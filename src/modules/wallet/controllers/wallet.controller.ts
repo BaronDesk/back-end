@@ -63,6 +63,7 @@ export class WalletController {
     const entry = await this.wallet.credit(gamerProfileId, dto);
     if (dto.type === 'REFUND' || dto.type === 'ADJUSTMENT') {
       await this.audit.record(caller.sub, 'UPDATE', `wallet:${gamerProfileId}`, {
+          branchId: await this.wallet.getGamerBranchId(gamerProfileId),
           metadata: { event: dto.type === 'REFUND' ? 'WALLET_REFUND' : 'WALLET_ADJUSTMENT_CREDIT', amount: dto.amount },
         });
     }
@@ -79,6 +80,7 @@ export class WalletController {
   ) {
     const entry = await this.wallet.debit(gamerProfileId, dto);
     await this.audit.record(caller.sub, 'UPDATE', `wallet:${gamerProfileId}`, {
+        branchId: await this.wallet.getGamerBranchId(gamerProfileId),
         metadata: { event: 'WALLET_ADJUSTMENT_DEBIT', amount: dto.amount, type: dto.type ?? 'DEBIT' },
       });
     return entry;
