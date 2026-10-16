@@ -36,10 +36,11 @@ export class MembershipController {
   @RequireScope('admin')
   @Post('membership-plans')
   createPlan(
+    @CurrentUser() caller: AccessTokenPayload,
     @Body(new ZodValidationPipe(createMembershipPlanSchema))
     dto: CreateMembershipPlanDto,
   ) {
-    return this.memberships.createPlan(dto);
+    return this.memberships.createPlan(caller, dto);
   }
 
   @RequireScope('admin')
@@ -55,8 +56,11 @@ export class MembershipController {
 
   @RequireScope('admin')
   @Delete('membership-plans/:id')
-  deletePlan(@Param('id', new ZodValidationPipe(idParamSchema)) id: string) {
-    return this.memberships.deletePlan(id);
+  deletePlan(
+    @CurrentUser() caller: AccessTokenPayload,
+    @Param('id', new ZodValidationPipe(idParamSchema)) id: string,
+  ) {
+    return this.memberships.deletePlan(caller, id);
   }
 
   @RequireScope('self')

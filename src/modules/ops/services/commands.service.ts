@@ -116,6 +116,7 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(CommandsService.name);
   private readonly simulationsAllowed: boolean;
   private catalogSub?: Subscription;
+  private readonly pendingPolicyUpdates = new Map<string, { machineId: string; policy: Record<string, unknown> }>();
 
   constructor(
     private readonly repo: CommandsRepository,
@@ -147,6 +148,10 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
     }
     if (body.simulate && !this.simulationsAllowed) {
       throw new BadRequestException({ code: 'SIMULATION_DISABLED', error: 'simulate is dev-only' });
+    }
+
+    if (body.type === 'POLICY_UPDATE' && SCOPE_RANK[caller.scope] < SCOPE_RANK.admin) {
+      throw new ForbiddenException({ code: 'INSUFFICIENT_SCOPE', error: 'POLICY_UPDATE requires admin scope' });
     }
 
     const station = await this.resolveStation(caller, stationId);
@@ -194,7 +199,10 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
       });
     } else if (body.type === 'POLICY_UPDATE') {
       payload = body.policy;
-      await this.presence.setPolicy(station.machineId, body.policy!);
+      await this.audit.record(caller.sub, 'UPDATE', `machine:${station.machineId}`, {
+        branchId: station.branchId,
+        metadata: { event: 'STATION_POLICY_UPDATED', policy: body.policy },
+      });
     } else if (body.type === 'LOCK' && !body.simulate) {
       // Locked by staff: a reconnect must not lift it, only a staff UNLOCK.
       await this.sessions.current?.markStaffLock(station);
@@ -248,12 +256,18 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
     this.logger.log(`${row.type} ${row.id} issued for ${station.serialNumber} by ${issuedBy}`);
     this.publish(row);
 
+    // POLICY_UPDATE is not saved as the station's policy until the agent acks it (onAgentReply).
+    if (type === 'POLICY_UPDATE' && options.payload) {
+      this.pendingPolicyUpdates.set(row.id, { machineId: station.machineId, policy: options.payload as Record<string, unknown> });
+    }
+
     try {
       await this.enqueue({ commandId: row.id, payload: options.payload, simulate: options.simulate });
     } catch (err) {
       const reason = `enqueue failed: ${(err as Error).message}`;
       this.logger.error(`${row.type} ${row.id}: ${reason}`);
       const failed = await this.fail(row.id, reason);
+      this.pendingPolicyUpdates.delete(row.id);
       return toCommandDto(failed ?? row);
     }
     return toCommandDto(row);
@@ -304,6 +318,14 @@ export class CommandsService implements OnModuleInit, OnModuleDestroy {
     if (!updated) {
       this.logger.debug(`${reply.kind} for ${commandId} ignored: already ${row.status}`);
     }
+
+    // The station accepted it: only now does it become the station's saved policy.
+    const pendingPolicy = this.pendingPolicyUpdates.get(commandId);
+    if (pendingPolicy) {
+      this.pendingPolicyUpdates.delete(commandId);
+      if (reply.kind === 'ack') await this.presence.setPolicy(pendingPolicy.machineId, pendingPolicy.policy as Prisma.InputJsonValue);
+    }
+    
     // Wake the worker last, so it only ever sees the persisted outcome.
     this.tracker.settle(commandId, reply);
   }

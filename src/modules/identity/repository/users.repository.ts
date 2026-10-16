@@ -80,6 +80,10 @@ export class UsersRepository extends BaseRepository {
     });
   }
 
+  setUsername(id: string, username: string) {
+    return this.prisma.user.update({ where: { id }, data: { username }, include: withProfiles });
+  }
+
   setAvatar(userId: string, avatarUrl: string | null) {
     return this.prisma.user.update({
       where: { id: userId },

@@ -7,13 +7,17 @@ import { RequireScope } from '../../common/decorators/require-scope.decorator.js
 import { ZodValidationPipe } from '../../common/pipes/zod-validation.pipe.js';
 import type { AccessTokenPayload } from '../../common/types/jwt-payload.js';
 import { BranchesService } from './branches.service.js';
+import { policyUpdatePayloadSchema } from '../ops/schemas/command.schemas.js';
 
 const idParamSchema = z.string().uuid();
 const createBranchSchema = z.object({
   name: z.string().trim().min(1).max(100),
   location: z.string().trim().min(1).max(200),
 });
-const updateBranchSchema = createBranchSchema.partial().refine((v) => Object.keys(v).length > 0, 'nothing to update');
+const updateBranchSchema = createBranchSchema
+  .extend({ stationPolicy: policyUpdatePayloadSchema.optional() })
+  .partial()
+  .refine((v) => Object.keys(v).length > 0, 'nothing to update');
 
 @Controller('branches')
 export class BranchesController {
@@ -28,8 +32,11 @@ export class BranchesController {
 
   @RequireScope('hq')
   @Post()
-  create(@Body(new ZodValidationPipe(createBranchSchema)) dto: z.infer<typeof createBranchSchema>) {
-    return this.branches.create(dto);
+  create(
+    @CurrentUser() caller: AccessTokenPayload,
+    @Body(new ZodValidationPipe(createBranchSchema)) dto: z.infer<typeof createBranchSchema>,
+  ) {
+    return this.branches.create(caller, dto);
   }
 
   @RequireScope('hq')

@@ -11,4 +11,18 @@ export class AuditLogService {
       data: { userId, action, target, branchId: opts?.branchId, metadata: opts?.metadata ?? {} },
     });
   }
+
+  list(filter: { branchId?: string; from?: Date; action?: string; q?: string; limit: number }) {
+    return this.prisma.auditLog.findMany({
+      where: {
+        ...(filter.branchId ? { branchId: filter.branchId } : {}),
+        ...(filter.from ? { timestamp: { gte: filter.from } } : {}),
+        ...(filter.action ? { metadata: { path: ['event'], equals: filter.action } } : {}),
+        ...(filter.q ? { user: { username: { contains: filter.q, mode: 'insensitive' } } } : {}),
+      },
+      include: { user: { select: { username: true } } },
+      orderBy: { timestamp: 'desc' },
+      take: filter.limit,
+    });
+  }
 }

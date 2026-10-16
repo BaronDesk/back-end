@@ -17,6 +17,7 @@ interface Frame {
   payload: Record<string, unknown>;
 }
 
+
 /** Just enough of a `ws` socket: records what the gateway sends. */
 class FakeSocket extends EventEmitter {
   readyState = 1; // WebSocket.OPEN
@@ -56,6 +57,7 @@ describe('AgentGateway session login and lease', () => {
       touch: vi.fn(async () => undefined),
       reportState: vi.fn(async () => undefined),
       sessionOf: vi.fn(() => 'sess-1'),
+      getStoredPolicy: vi.fn(async () => null),
     };
     commands = { issueSessionUnlock: vi.fn(async () => true) };
     handler = {

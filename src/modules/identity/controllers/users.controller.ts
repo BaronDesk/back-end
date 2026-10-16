@@ -21,6 +21,7 @@ import {
   searchGamersQuerySchema,
   updateRoleSchema,
   updateStatusSchema,
+  usernameSchema,
   type CreateEmployeeDto,
   type CreateGamerDto,
   type HomeBranchDto,
@@ -29,6 +30,7 @@ import {
   type SearchGamersQuery,
   type UpdateRoleDto,
   type UpdateStatusDto,
+  type UsernameDto,
 } from '../schemas/users.schemas.js';
 import { IMAGE_UPLOAD_BODY } from '../../uploads/controllers/uploads.controller.js';
 import { readUpload } from '../../uploads/util/read-upload.js';
@@ -97,6 +99,16 @@ export class UsersController {
     @Body(new ZodValidationPipe(homeBranchSchema)) dto: HomeBranchDto,
   ) {
     return this.users.setHomeBranch(caller, dto.branchId);
+  }
+
+  /** A user renames their own account. */
+  @RequireScope('self')
+  @Patch('users/me/username')
+  setUsername(
+    @CurrentUser() caller: AccessTokenPayload,
+    @Body(new ZodValidationPipe(usernameSchema)) dto: UsernameDto,
+  ) {
+    return this.users.setUsername(caller, dto.username);
   }
 
   /** A gamer's profile picture (PNG, JPEG or WebP, at most 2 MB), cropped to a 256×256 square. */

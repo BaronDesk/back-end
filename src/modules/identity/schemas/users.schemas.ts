@@ -32,6 +32,9 @@ export type UpdateStatusDto = z.infer<typeof updateStatusSchema>;
 export const homeBranchSchema = z.object({ branchId: z.string().uuid() });
 export type HomeBranchDto = z.infer<typeof homeBranchSchema>;
 
+export const usernameSchema = z.object({ username: z.string().trim().min(3).max(64) });
+export type UsernameDto = z.infer<typeof usernameSchema>;
+
 export const listUsersQuerySchema = z.object({
   q: z.string().trim().min(1).max(64).optional(),
   role: z.enum(['GAMER', 'EMPLOYEE', 'MANAGER', 'ADMIN']).optional(),

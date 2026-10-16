@@ -313,12 +313,18 @@ export class PresenceService implements OnModuleInit, OnModuleDestroy {
   }
 
   async setPolicy(machineId: string, policy: Prisma.InputJsonValue): Promise<void> {
-    await this.machines.setPolicy(machineId, policy);
+    const machine = await this.machines.findById(machineId);
+    const merged = { ...(machine?.policy as Record<string, unknown> ?? {}), ...(policy as Record<string, unknown>) };
+    await this.machines.setPolicy(machineId, merged as Prisma.InputJsonValue);
   }
 
   async getStoredPolicy(machineId: string): Promise<Record<string, unknown> | null> {
-    const machine = await this.machines.findById(machineId);
-    return (machine?.policy as Record<string, unknown> | null) ?? null;
+    const machine = await this.machines.findByIdWithBranchPolicy(machineId);
+    return (
+      (machine?.policy as Record<string, unknown> | null) ??
+      (machine?.branch.stationPolicy as Record<string, unknown> | null) ??
+      null
+    );
   }
 
   /** A staff rename: the live state (and dashboards) show it at once. */

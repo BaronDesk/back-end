@@ -44,6 +44,7 @@ describe('UsersService', () => {
       setStatus: vi.fn(async (id, accountStatus) => user({ id, accountStatus })),
       setPasswordHash: vi.fn(async (id) => user({ id })),
       setHomeBranch: vi.fn(async (id, homeBranchId) => user({ id, role: 'GAMER', employeeProfile: null, gamerProfile: { id: 'gp', homeBranchId } })),
+      setUsername: vi.fn(async (id, username) => user({ id, username })),
       branchExists: vi.fn(async () => true),
       list: vi.fn(async () => [user()]),
     };
@@ -124,6 +125,18 @@ describe('UsersService', () => {
       await expect(service.setHomeBranch(caller({ scope: 'self', role: 'GAMER' }), 'branch-b')).resolves.toMatchObject({ homeBranchId: 'branch-b' });
       repo.findById.mockResolvedValueOnce(user());
       await expect(service.setHomeBranch(caller({}), 'branch-b')).rejects.toMatchObject({ response: { code: 'NOT_A_GAMER' } });
+    });
+  });
+
+  describe('username', () => {
+    it('lets a user change their own username', async () => {
+      await expect(service.setUsername(caller({ scope: 'self', role: 'GAMER' }), 'newname')).resolves.toMatchObject({ username: 'newname' });
+      expect(repo.setUsername).toHaveBeenCalledWith('caller-id', 'newname');
+    });
+
+    it('answers a taken username with 409 USERNAME_TAKEN', async () => {
+      repo.setUsername.mockRejectedValueOnce(new Prisma.PrismaClientKnownRequestError('unique', { code: 'P2002', clientVersion: 't' }));
+      await expect(service.setUsername(caller({}), 'taken')).rejects.toMatchObject({ response: { code: 'USERNAME_TAKEN' } });
     });
   });
 

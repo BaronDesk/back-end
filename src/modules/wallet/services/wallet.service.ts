@@ -25,6 +25,10 @@ export class WalletService {
     this.reserve = provider;
   }
 
+  getGamerBranchId(gamerProfileId: string): Promise<string | undefined> {
+    return this.wallets.findHomeBranchId(gamerProfileId);
+  }
+
   async getOrCreateWallet(gamerProfileId: string) {
     const existing = await this.wallets.findByGamerProfileId(gamerProfileId);
     if (existing) return existing;

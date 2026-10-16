@@ -28,7 +28,7 @@ export class PricingController {
   @Put()
   async upsert(@CurrentUser() caller: AccessTokenPayload, @Body(new ZodValidationPipe(upsertPricingSchema)) dto: UpsertPricingDto) {
     const saved = await this.pricing.upsert(dto);
-    await this.audit.record(caller.sub, 'UPDATE', 'pricing', { metadata: { paygRate: dto.paygRate, bookingRate: dto.bookingRate } });
+    await this.audit.record(caller.sub, 'UPDATE', 'pricing', { metadata: { event: 'PRICING_UPDATED', paygRate: dto.paygRate, bookingRate: dto.bookingRate } });
     return saved;
   }
 }
